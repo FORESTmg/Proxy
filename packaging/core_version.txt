@@ -1,0 +1,3 @@
+# Пин официального релиза ядра Xray-core для Windows (только github.com/XTLS).
+# Меняется вручную вместе с core.lock.json (см. fetch_core.py --print-lock).
+v26.3.27

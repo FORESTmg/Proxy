@@ -504,18 +504,34 @@ def _update_loop(cfg: dict, stop: threading.Event):
     if os.environ.get("FOREST_NO_CYCLE"):
         lg.info("supervisor: цикл обновления отключён (FOREST_NO_CYCLE)")
         return
+    import tray_menu as TM          # потребитель триггера «Обновить серверы сейчас»
+    cycle_every_s = 30 * 60         # штатный интервал планового цикла
+    poll_s = 5.0                    # как часто проверяем state/refresh.flag
+    next_due = 0.0
     while not stop.is_set():
+        triggered = False
         try:
-            if acquire_lock("cycle", stale_s=3 * 3600, cfg=cfg):
-                try:
-                    run_cycle(cfg, dry=False)
-                finally:
-                    release_lock(cfg)
-            else:
-                lg.warn("supervisor: другой цикл уже выполняется — пропускаю")
+            triggered = bool(TM.consume_refresh_trigger(cfg))
         except Exception as e:
-            lg.error(f"supervisor: цикл исключение: {e}")
-        stop.wait(30 * 60)
+            lg.warn(f"supervisor: проверка state/refresh.flag: {e}")
+        if triggered:
+            lg.info("supervisor: запрос из трея «обновить серверы сейчас» — "
+                    "запускаю полный цикл обновления")
+        if triggered or time.time() >= next_due:
+            # Тот же штатный путь, что и плановый цикл: run_cycle под общим
+            # lock-ом (не чаще одного цикла одновременно), без окон консоли.
+            try:
+                if acquire_lock("cycle", stale_s=3 * 3600, cfg=cfg):
+                    try:
+                        run_cycle(cfg, dry=False)
+                    finally:
+                        release_lock(cfg)
+                else:
+                    lg.warn("supervisor: другой цикл уже выполняется — пропускаю")
+            except Exception as e:
+                lg.error(f"supervisor: цикл исключение: {e}")
+            next_due = time.time() + cycle_every_s
+        stop.wait(poll_s)
 
 
 def run_supervisor(cfg: dict) -> int:
