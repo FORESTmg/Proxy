@@ -1,0 +1,349 @@
+"""Мгновенный локальный сторож связи (GPL-3.0).
+
+FOREST's Proxy Auto-updater. Работает как поток супервизора (или отдельным
+процессом через ``--watch``). Держит на клиентском порту ОДНО ядро xray с
+пулом серверов внутри (observatory + balancer): xray сам направляет новые
+соединения на живой/быстрый сервер, поэтому при отказе одного узла связь не
+рвётся — перезапуска ядра при смене сервера нет.
+
+Страж проверяет, что ядро живо и везёт данные, ставит системный прокси,
+следит за скоростью и YouTube-канарейкой; при полном отказе — просит полный
+цикл (callback ``full_cycle``).
+"""
+from __future__ import annotations
+
+import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import clientwrite as CW
+import config as CFG
+import log
+import tray_status as TS
+
+
+def _acquire_singleton(cfg: dict) -> bool:
+    """Не даём запуститься ВТОРОМУ стражу-процессу (в супервизоре не нужен)."""
+    p = os.path.join(cfg["paths"]["state_dir"], "watch.pid")
+    try:
+        if os.path.isfile(p):
+            old = open(p, encoding="utf-8").read().strip()
+            if old.isdigit() and int(old) != os.getpid() and CW._pid_alive(int(old)):
+                return False
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(str(os.getpid()))
+        return True
+    except Exception:
+        return True
+
+
+def _tip(state: str, pool_n: int = 10) -> str:
+    return f"FOREST {state} | {pool_n} серверов | watch OK"[:63]
+
+
+def _tray_ok(cfg: dict, rtt=None) -> None:
+    try:
+        TS.write_status(cfg, state="ok", drop_proc=True, tip=_tip("связь OK"), rtt=rtt)
+    except Exception:
+        pass
+
+
+def _tray_settle(cfg: dict, client: dict, proc, lg, rtt=None) -> None:
+    """Закрыть индикацию по ФАКТУ: связь есть -> финал-успех, иначе финал-провал."""
+    ok = False
+    try:
+        ok = bool(CW.port_works(int(client.get("socks_port", 10808)), timeout=8))
+    except Exception:
+        ok = False
+    try:
+        if ok:
+            TS.finish_proc(cfg, proc, "ok", tip=_tip("связь OK"))
+            TS.write_status(cfg, state="ok", rtt=rtt)
+        else:
+            TS.fail_proc(cfg, proc, "down", _tip("НЕТ СВЯЗИ"),
+                         reason="серверы пула не отвечают")
+    except Exception as e:
+        lg.error(f"Watch: финал индикации: {e}")
+
+
+def run_watch(cfg: dict, stop_event=None, full_cycle=None, once: bool = False,
+              client: dict = None) -> int:
+    """Основной цикл сторожа. ``stop_event`` — threading.Event для остановки."""
+    lg = log.get_logger()
+    client = client or CFG.find_client(cfg)
+    if not client.get("core"):
+        lg.error("Watch: ядро xray не найдено — сторож остановлен")
+        return 2
+
+    wc = cfg.get("watch", {})
+    interval = float(wc.get("check_interval_s", 10))
+    probe_timeout = float(wc.get("probe_timeout_s", 4))
+    max_strikes = int(wc.get("max_strikes", 3))
+    bal_n = int(wc.get("balancer_pool_n", 10))
+    spd_min = float(wc.get("speed_min_kbps", 900))
+    spd_every_ticks = max(3, int(float(wc.get("speed_check_every_s", 300)) / max(1.0, interval)))
+    pool_every_ticks = max(3, int(float(wc.get("pool_refresh_s", 600)) / max(1.0, interval)))
+    yt_every_ticks = max(3, int(float(wc.get("youtube_check_every_s", 300)) / max(1, int(interval))))
+    strict_every_ticks = max(3, int(float(wc.get("strict_check_every_s", 300)) / max(1.0, interval)))
+    yt_fails = 0
+    port = int(client.get("socks_port", 10808))
+
+    def _stopped() -> bool:
+        return stop_event is not None and stop_event.is_set()
+
+    def _sleep(sec: float) -> None:
+        if stop_event is not None:
+            stop_event.wait(sec)
+        else:
+            time.sleep(sec)
+
+    lg.info(f"Watch: сторож-балансировщик запущен (интервал {interval:.0f}s, "
+            f"probe {probe_timeout:.0f}s, пул {bal_n} серверов)")
+    try:
+        CW.ensure_balancer(client, cfg, n=bal_n)
+    except Exception as e:
+        lg.error(f"Watch: стартовый ensure_balancer: {e}")
+    try:
+        TS.write_status(cfg, state="ok", drop_proc=True, tip=_tip("связь OK"))
+    except Exception:
+        pass
+
+    strikes = 0
+    ticks = 0
+    slow_hits = 0
+    last_ok_mark = 0.0
+    last_off_beat = 0.0
+    while not _stopped():
+        try:
+            if CW.proxy_off(cfg):
+                if time.time() - last_off_beat > 15:
+                    last_off_beat = time.time()
+                    try:
+                        TS.beat(cfg, "off", tip="Прокси выключен вручную")
+                    except Exception:
+                        pass
+                ticks += 1
+                _sleep(max(1.0, interval))
+                if once:
+                    break
+                continue
+            ok, rtt = False, 0
+            strict_now = bool(strict_every_ticks and ticks % strict_every_ticks == 0)
+            port_dead = False
+            try:
+                port_dead = not CW.port_listening(port, timeout=0.5)
+            except Exception:
+                pass
+            for attempt in (() if port_dead else range(int(wc.get("probe_retries", 2)) + 1)):
+                ok, rtt = CW.probe_client(client, timeout=probe_timeout,
+                                          strict=strict_now, alt=bool(attempt))
+                if ok:
+                    break
+                try:
+                    if not CW.port_listening(port, timeout=0.5):
+                        break
+                except Exception:
+                    pass
+                if attempt < int(wc.get("probe_retries", 2)):
+                    _sleep(2)
+        except Exception as e:
+            lg.error(f"Watch: ошибка probe: {e}")
+            ok, rtt = False, 0
+
+        if ticks % 6 == 0:
+            try:
+                CW.ensure_system_proxy(client, cfg)
+            except Exception as e:
+                lg.error(f"Watch: системный прокси: {e}")
+
+        if ok:
+            strikes = 0
+            ticks += 1
+            try:
+                if time.time() - last_ok_mark > 2:
+                    last_ok_mark = time.time()
+                    st_m = CW.StateStore(cfg)
+                    st_m.data["last_probe_ok_ts"] = time.time()
+                    st_m.data["last_probe_fail_ts"] = 0
+                    st_m.save()
+                    _tray_ok(cfg, rtt)
+            except Exception:
+                pass
+            if pool_every_ticks and ticks % pool_every_ticks == 0:
+                try:
+                    CW.ensure_balancer(client, cfg, n=bal_n)
+                except Exception as e:
+                    lg.error(f"Watch: обновление пула: {e}")
+            if yt_every_ticks and ticks % yt_every_ticks == 0:
+                try:
+                    ycode, ytt = CW.youtube_probe(port, timeout=12)
+                    if ycode in (200, 301, 302):
+                        if yt_fails:
+                            lg.info(f"Watch: YouTube снова отвечает (было провалов: {yt_fails})")
+                        yt_fails = 0
+                    else:
+                        yt_fails += 1
+                        lg.warn(f"Watch: YouTube не отвечает через пул "
+                                f"(код {ycode}, {ytt} мс) {yt_fails}/3")
+                        if yt_fails >= 3:
+                            yt_fails = 0
+                            lg.warn("Watch: YouTube стабильно недоступен — полный цикл")
+                            if full_cycle:
+                                full_cycle()
+                except Exception as e:
+                    lg.error(f"Watch: канарейка YouTube: {e}")
+            if spd_min > 0 and spd_every_ticks and ticks % spd_every_ticks == 0:
+                try:
+                    sp = CW.measure_speed_kbps(client, 2000000, 12)
+                    if sp and sp < spd_min:
+                        slow_hits += 1
+                        lg.warn(f"Watch: скорость {sp:.0f} КБ/с < {spd_min:.0f} ({slow_hits}/2)")
+                        if slow_hits >= 2:
+                            slow_hits = 0
+                            lg.warn("Watch: пул медленный — пересобираю балансировщик")
+                            if not CW.ensure_balancer(client, cfg, n=bal_n, force=True):
+                                if full_cycle:
+                                    full_cycle()
+                    else:
+                        slow_hits = 0
+                except Exception as e:
+                    lg.error(f"Watch: контроль скорости: {e}")
+        else:
+            strikes += 1
+            lg.warn(f"Watch: связь не отвечает (удар {strikes}/{max_strikes}, rtt={rtt})")
+            try:
+                TS.beat(cfg, "down", _tip("НЕТ СВЯЗИ"))
+            except Exception:
+                pass
+            port_dead = False
+            try:
+                port_dead = not CW.port_listening(port)
+            except Exception:
+                pass
+            if strikes >= max_strikes or port_dead:
+                try:
+                    st_f = CW.StateStore(cfg)
+                    st_f.data["last_probe_fail_ts"] = time.time()
+                    st_f.save()
+                except Exception:
+                    pass
+                lg.warn("Watch: обрыв — пересобираю балансировщик")
+                try:
+                    TS.write_status(cfg, state="down", tip=_tip("НЕТ СВЯЗИ"))
+                except Exception:
+                    pass
+                recovered = False
+                try:
+                    recovered = CW.ensure_balancer(client, cfg, n=bal_n,
+                                                   force=True, fast_ok=True)
+                except Exception as e:
+                    lg.error(f"Watch: ensure_balancer: {e}")
+                if recovered:
+                    ok2, rtt2 = CW.probe_client(client, timeout=probe_timeout)
+                    if ok2:
+                        lg.info(f"Watch: связь восстановлена балансировщиком (rtt={rtt2})")
+                        try:
+                            TS.write_status(cfg, state="ok", rtt=rtt2)
+                        except Exception:
+                            pass
+                    else:
+                        recovered = False
+                        try:
+                            CW.bl_add_pool(cfg, CW.balancer_pool(client, cfg, n=bal_n),
+                                           minutes=20, why="stub_pool")
+                        except Exception as e:
+                            lg.warn(f"Watch: bl_add_pool: {e}")
+                if not recovered:
+                    lg.warn("Watch: пул не помог — полный цикл (свежие серверы)")
+                    if full_cycle:
+                        full_cycle()
+                strikes = 0
+
+        if once:
+            break
+
+        # ПУЛЬС: пока спим — следим за портом (смерть ядра видна за 1-2 с)
+        pid_file = os.path.join(cfg["paths"]["state_dir"], "core.pid")
+        dead = False
+        kpid = None
+        for _ in range(max(1, int(interval * 20))):
+            if _stopped():
+                break
+            time.sleep(0.05)
+            try:
+                if CW.port_listening(port, timeout=0.3):
+                    continue
+                try:
+                    kpid = int(open(pid_file, encoding="utf-8").read().strip())
+                except Exception:
+                    kpid = 0
+                if kpid and not CW._pid_alive(kpid):
+                    dead = True
+                    break
+                time.sleep(0.3)
+                if not CW.port_listening(port, timeout=0.3):
+                    dead = True
+                    break
+            except Exception:
+                pass
+        if dead and not _stopped():
+            time.sleep(0.1)
+            try:
+                npid = int(open(pid_file, encoding="utf-8").read().strip())
+                if npid != kpid or CW.port_listening(port, timeout=0.2):
+                    lg.info("Watch: пульс — плановый перезапуск, не обрыв")
+                    strikes = 0
+                    continue
+            except Exception:
+                pass
+            lg.warn("Watch: пульс — ядро не слушает порт, пересборка немедленно")
+            try:
+                st_p = CW.StateStore(cfg)
+                st_p.data["last_probe_fail_ts"] = time.time()
+                st_p.save()
+            except Exception:
+                pass
+            rec = False
+            try:
+                rec = CW.ensure_balancer(client, cfg, n=bal_n, force=True, fast_ok=True)
+            except Exception as e:
+                lg.error(f"Watch: пульс-восстановление: {e}")
+            if rec:
+                ok_p, rtt_p = CW.probe_client(client, timeout=probe_timeout)
+                if ok_p:
+                    lg.info(f"Watch: связь восстановлена по пульсу (rtt={rtt_p})")
+                    try:
+                        TS.write_status(cfg, state="ok", rtt=rtt_p)
+                    except Exception:
+                        pass
+                else:
+                    rec = False
+            if not rec and full_cycle:
+                lg.warn("Watch: пульс не помог — полный цикл")
+                full_cycle()
+            strikes = 0
+    return 0
+
+
+def main() -> int:
+    cfg = CFG.load_config()
+    log.reset_logger(cfg["paths"]["log_dir"])
+    lg = log.get_logger()
+    if not _acquire_singleton(cfg):
+        lg.warn("Watch: страж уже запущен — выходим (защита от дублей)")
+        return 0
+    import v2ray_updater as VU
+
+    def _full_cycle():
+        if VU.acquire_lock("cycle", stale_s=40 * 60, cfg=cfg):
+            try:
+                VU.run_cycle(cfg, dry=False)
+            finally:
+                VU.release_lock(cfg)
+    return run_watch(cfg, full_cycle=_full_cycle)
+
+
+if __name__ == "__main__":
+    main()

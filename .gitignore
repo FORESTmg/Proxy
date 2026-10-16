@@ -1,0 +1,40 @@
+# FOREST's Proxy Auto-updater — локальные данные и артефакты сборки
+# (в репозитории НЕ должно быть личного: ни состояния, ни логов, ни конфига)
+
+# рабочий конфиг (личный) — в репозитории только config.example.json
+/config.json
+config.json
+
+# состояние и логи (по умолчанию пишутся в %LOCALAPPDATA%\ForestProxyUpdater,
+# но на случай запуска с paths.root внутри проекта — исключаем)
+/state/
+/state
+/logs/
+/logs
+
+# кэши серверов и прочее
+*.log
+*.pid
+subscription_base64.txt
+pool_cache.json
+lastgood_servers.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# сборка
+build/
+dist/
+*.spec
+packaging/build/
+packaging/dist/
+
+# редакторы / ОС
+.idea/
+.vscode/
+Thumbs.db
+desktop.ini

@@ -1,0 +1,1647 @@
+"""Ядро клиентской логики: standalone-режим (своё ядро xray) + режим v2rayN.
+
+FOREST's Proxy Auto-updater (GPL-3.0).
+
+Этот модуль — ТОЧКА ВХОДА для остальных модулей (``import clientwrite as CW``).
+Он содержит:
+
+  * переносимую сердцевину (проверки связи/скорости, чёрный список, стор
+    состояния, hotcache, генерация конфигов ядра, блокировки, валидация,
+    системный прокси через реестр WinINET);
+  * **standalone-бэкенд** для Windows: своё ядро ``xray.exe`` запускается/
+    останавливается как дочерний процесс, свой файл состояния серверов
+    (``state/servers.json``), свой конфиг ядра (``state/forest_xray.json``),
+    системный прокси ставится/снимается через HKCU Internet Settings;
+  * диспетчер режимов: при ``client.mode == "v2rayn"`` вызовы уходят в
+    ``clientwrite_v2rayn`` (работа через базу/ядро установленного v2rayN),
+    при ``standalone`` — в реализацию этого модуля.
+
+Логика standalone перенесена из POSIX-версии (``clientwrite_posix.py``)
+исходного проекта: там ядро было systemd-сервисом, здесь — обычным процессом
+``xray.exe`` (systemctl заменён на запуск/остановку процесса).
+"""
+from __future__ import annotations
+
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+
+import log
+
+CONFIG_TYPE = {"vless": 5, "vmess": 1, "trojan": 6, "ss": 3}
+AUTO_TAG = "[AUTO] "
+PROBE_URL = "https://www.gstatic.com/generate_204"
+PROBE_URL_ALT = "https://cp.cloudflare.com/generate_204"
+YOUTUBE_URL = "https://www.youtube.com/"
+PROBE_DATA_URL = "https://speed.cloudflare.com/__down?bytes=200000"
+PROBE_DATA_MIN_BYTES = 50000
+
+DEFAULT_SOCKS_PORT = 10808
+DEFAULT_TORRENT_PORT = 10820
+
+# Имя конфига НАШЕГО ядра — уникальное, чтобы kill_kernels снимал только свои
+# процессы и не задевал ядро v2rayN (xray_balancer.json / xray_runtime.json).
+CORE_CFG_NAME = "forest_xray.json"
+CORE_PID_NAME = "core.pid"
+CORE_LOG_NAME = "forest_xray.log"
+
+RU_DIRECT_DOMAINS = ["geosite:category-ru", "geosite:tld-ru",
+                     "geosite:category-gov-ru", "geosite:category-bank-ru",
+                     "geosite:category-medicine-ru", "geosite:private"]
+RU_DIRECT_IPS = ["geoip:ru", "geoip:private"]
+LOCAL_DIRECT_DOMAINS = ["full:retracker.local", "domain:local"]
+REMOVED_OUT_KEYS = {"lowinsecure", "allowinsecure"}
+
+
+def _no_window() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# ══════════════════════════════════════════ проверки связи/скорости ═══
+def _curl_metrics(port: int, url: str, max_time: int) -> tuple:
+    """(http_code, time_total, ssl_verify_result, size_download) через socks."""
+    cmd = ["curl", "-s", "-o", os.devnull,
+           "-w", "%{http_code} %{time_total} %{ssl_verify_result} %{size_download}",
+           "--max-time", str(max_time), "-x", f"socks5h://127.0.0.1:{port}", url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=max_time + 8,
+                           creationflags=_no_window())
+        out = r.stdout.decode("utf-8", "replace").strip().split()
+        code = int(out[0]) if out and out[0].isdigit() else 0
+        tt = float(out[1]) if len(out) > 1 else 999.0
+        sslv = int(out[2]) if len(out) > 2 and out[2].lstrip("-").isdigit() else 0
+        size = int(out[3]) if len(out) > 3 and out[3].isdigit() else 0
+        return code, tt, sslv, size
+    except Exception:
+        return 0, 999.0, 0, 0
+
+
+def _curl_speed(port: int, url: str, max_time: int) -> tuple:
+    """(http_code, bytes/sec) через socks."""
+    cmd = ["curl", "-s", "-o", os.devnull, "-w", "%{http_code} %{speed_download}",
+           "--max-time", str(max_time), "-x", f"socks5h://127.0.0.1:{port}", url]
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=max_time + 8,
+                           creationflags=_no_window())
+        out = r.stdout.decode("utf-8", "replace").strip().split()
+        code = int(out[0]) if out and out[0].isdigit() else 0
+        spd = float(out[1]) if len(out) > 1 and out[1].isdigit() else 0.0
+        return code, spd
+    except Exception:
+        return 0, 0.0
+
+
+def measure_speed_kbps(client: dict, bytes_n: int = 2000000, timeout: int = 15) -> float:
+    """Замер скорости через порт клиента (КБ/с). 0 — если не удалось."""
+    port = client.get("socks_port", DEFAULT_SOCKS_PORT)
+    url = f"https://speed.cloudflare.com/__down?bytes={int(bytes_n)}"
+    code, spd = _curl_speed(port, url, timeout)
+    return round(spd / 1024.0, 1) if code == 200 else 0.0
+
+
+def youtube_probe(port: int, timeout: int = 12) -> tuple:
+    """(http_code, rtt_ms) по YouTube через порт. 403/0 = узел не пускает."""
+    code, tt, _sslv, _sz = _curl_metrics(port, YOUTUBE_URL, timeout)
+    return code, round(tt * 1000, 1)
+
+
+def port_works(port: int, timeout: int = 8) -> bool:
+    """Строгая проверка: через порт идут РЕАЛЬНЫЕ данные и TLS не подменён."""
+    ok204 = False
+    for _url in (PROBE_URL, PROBE_URL_ALT):
+        code, _tt, sslv, _ = _curl_metrics(port, _url, timeout)
+        if code == 204 and sslv == 0:
+            ok204 = True
+            break
+    if not ok204:
+        return False
+    code2, _t2, sslv2, size = _curl_metrics(port, PROBE_DATA_URL, timeout)
+    return sslv2 == 0 and code2 == 200 and size >= PROBE_DATA_MIN_BYTES
+
+
+def probe_client(client: dict, timeout: int = 10, strict: bool = True,
+                 alt: bool = False) -> tuple:
+    """(ok, rtt_ms) через socks-порт клиента.
+
+    strict=True: мало получить 204 — проверяем, что данные реально идут и TLS
+    не подменён (иначе сервер-«заглушка» проходит как рабочий).
+    alt=True — проверять второй эндпоинт (Cloudflare): для повторных попыток.
+    """
+    port = client.get("socks_port", DEFAULT_SOCKS_PORT)
+    code, tt, sslv, _ = _curl_metrics(port, PROBE_URL_ALT if alt else PROBE_URL, timeout)
+    if code != 204 or sslv != 0:
+        return False, round(tt * 1000, 1)
+    rtt = round(tt * 1000, 1)
+    if not strict:
+        return True, rtt
+    if not port_works(port, timeout):
+        return False, rtt
+    return True, rtt
+
+
+def port_listening(port: int, timeout: float = 0.5) -> bool:
+    """Порт слушается? Быстрая TCP-проверка (~1 мс), без curl."""
+    import socket
+    try:
+        with socket.create_connection(("127.0.0.1", int(port)), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
+def port_busy(port: int, timeout: float = 0.4) -> bool:
+    """Алиас port_listening (совместимость с POSIX-версией)."""
+    return port_listening(port, timeout)
+
+
+# ══════════════════════════════════════════ чёрный список ═══
+def bl_add(cfg: dict, key, minutes: float = 60, why: str = ""):
+    try:
+        st = StateStore(cfg)
+        bl = st.data.get("blacklist") or {}
+        if not isinstance(bl, dict):
+            bl = {}
+        bl[str(key)] = {"until": time.time() + minutes * 60, "why": why,
+                        "ts": time.time()}
+        st.data["blacklist"] = bl
+        st.save()
+    except Exception:
+        pass
+
+
+def bl_add_pool(cfg: dict, servers: list, minutes: float = 20,
+                why: str = "stub_pool"):
+    """Бан на ВЕСЬ состав пула (заглушки отдают 204, но трафик не везут)."""
+    for s in servers or []:
+        key = getattr(s, "_row_index_id", None) or getattr(s, "index_id", None)
+        if key:
+            bl_add(cfg, key, minutes=minutes, why=why)
+
+
+def bl_active(cfg: dict) -> dict:
+    try:
+        st = StateStore(cfg)
+        bl = st.data.get("blacklist") or {}
+        now = time.time()
+        return {k: v for k, v in bl.items()
+                if isinstance(v, dict) and float(v.get("until", 0)) > now}
+    except Exception:
+        return {}
+
+
+def bl_filter(cfg: dict, servers: list) -> list:
+    act = bl_active(cfg)
+    if not act:
+        return servers
+    out = []
+    for s in servers:
+        k = str(getattr(s, "_row_index_id", None) or getattr(s, "index_id", ""))
+        if k in act:
+            continue
+        out.append(s)
+    return out
+
+
+# ══════════════════════════════════════════ row <-> Server ═══
+def _json_safe(v):
+    if not v:
+        return {}
+    if isinstance(v, dict):
+        return v
+    try:
+        return json.loads(v)
+    except Exception:
+        return {}
+
+
+def row_to_server(row: dict):
+    """Строка стора/БД -> Server (для повторного теста существующих)."""
+    import parser as P
+    ct = row.get("ConfigType")
+    proto = {5: "vless", 1: "vmess", 3: "ss", 6: "trojan"}.get(ct)
+    if proto is None:
+        return None
+    s = P.Server(protocol=proto, address=row.get("Address") or "",
+                 port=int(row.get("Port") or 0))
+    if not s.address or s.port <= 0:
+        return None
+    s.password = row.get("Password") or ""
+    s.remark = row.get("Remarks") or ""
+    # Delay — мс, Speed — МБ/с (так пишет server_to_row: speed_kbps / 1024)
+    try:
+        s.rtt_ms = float(row.get("_Delay") or row.get("Delay") or 0)
+    except Exception:
+        s.rtt_ms = 0.0
+    try:
+        s.speed_kbps = float(row.get("_Speed") or row.get("Speed") or 0) * 1024.0
+    except Exception:
+        s.speed_kbps = 0.0
+    s.network = (row.get("Network") or "raw")
+    if s.network in ("", "tcp"):
+        s.network = "raw"
+    s.stream_security = row.get("StreamSecurity") or ""
+    s.sni = row.get("Sni") or ""
+    s.alpn = row.get("Alpn") or ""
+    s.fingerprint = row.get("Fingerprint") or ""
+    s.public_key = row.get("PublicKey") or ""
+    s.short_id = row.get("ShortId") or ""
+    s.spider_x = row.get("SpiderX") or ""
+    s.allow_insecure = (row.get("AllowInsecure") or "") == "1"
+    s._row_index_id = str(row.get("IndexId"))
+    pe = _json_safe(row.get("ProtoExtra"))
+    te = _json_safe(row.get("TransportExtra"))
+    if proto == "ss":
+        s.method = pe.get("SsMethod", "")
+    elif proto == "vmess":
+        s.method = pe.get("VmessSecurity", "auto")
+        s.alter_id = str(pe.get("AlterId") or "0")
+    s.flow = pe.get("Flow", "")
+    if s.network == "raw":
+        s.header_type = te.get("RawHeaderType", "none")
+        s.host = te.get("Host", "")
+        s.path = te.get("Path", "")
+    elif s.network in ("ws", "httpupgrade", "xhttp"):
+        s.host = te.get("Host", "")
+        s.path = te.get("Path", "/")
+    elif s.network == "kcp":
+        s.header_type = te.get("KcpHeaderType", "none")
+        s.kcp_seed = te.get("KcpSeed", "")
+    elif s.network == "grpc":
+        s.host = te.get("GrpcAuthority", "")
+        s.path = te.get("GrpcServiceName", "")
+        s.header_type = te.get("GrpcMode", "gun")
+    return s
+
+
+def server_to_row(s) -> dict:
+    """Server -> строка стора (обратная к row_to_server)."""
+    proto = getattr(s, "protocol", "") or ""
+    pe, te = {}, {}
+    if proto == "ss":
+        pe["SsMethod"] = getattr(s, "method", "") or ""
+    elif proto == "vmess":
+        pe["VmessSecurity"] = getattr(s, "method", "auto") or "auto"
+        pe["AlterId"] = str(getattr(s, "alter_id", "0") or "0")
+    pe["Flow"] = getattr(s, "flow", "") or ""
+    net = getattr(s, "network", "raw") or "raw"
+    if net == "raw":
+        te["RawHeaderType"] = getattr(s, "header_type", "none") or "none"
+        te["Host"] = getattr(s, "host", "") or ""
+        te["Path"] = getattr(s, "path", "") or ""
+    elif net in ("ws", "httpupgrade", "xhttp"):
+        te["Host"] = getattr(s, "host", "") or ""
+        te["Path"] = getattr(s, "path", "/") or "/"
+    elif net == "kcp":
+        te["KcpHeaderType"] = getattr(s, "header_type", "none") or "none"
+        te["KcpSeed"] = getattr(s, "kcp_seed", "") or ""
+    elif net == "grpc":
+        te["GrpcAuthority"] = getattr(s, "host", "") or ""
+        te["GrpcServiceName"] = getattr(s, "path", "") or ""
+        te["GrpcMode"] = getattr(s, "header_type", "gun") or "gun"
+    remark = getattr(s, "remark", "") or ""
+    return {
+        "IndexId": str(getattr(s, "_row_index_id", None) or getattr(s, "index_id", "") or ""),
+        "Remarks": remark if remark.startswith(AUTO_TAG) else (AUTO_TAG + remark),
+        "Address": getattr(s, "address", "") or "",
+        "Port": int(getattr(s, "port", 0) or 0),
+        "ConfigType": CONFIG_TYPE.get(proto, 5),
+        "Password": getattr(s, "password", "") or "",
+        "Network": net,
+        "StreamSecurity": getattr(s, "stream_security", "") or "",
+        "Sni": getattr(s, "sni", "") or "",
+        "Alpn": getattr(s, "alpn", "") or "",
+        "Fingerprint": getattr(s, "fingerprint", "") or "",
+        "PublicKey": getattr(s, "public_key", "") or "",
+        "ShortId": getattr(s, "short_id", "") or "",
+        "SpiderX": getattr(s, "spider_x", "") or "",
+        "AllowInsecure": "1" if getattr(s, "allow_insecure", False) else "",
+        # Speed — МБ/с, Delay — мс: тот же формат, что читает row_to_server.
+        "Speed": round(float(getattr(s, "speed_kbps", 0) or 0) / 1024.0, 2),
+        "Delay": int(getattr(s, "rtt_ms", 0) or 0),
+        "ProtoExtra": pe,
+        "TransportExtra": te,
+    }
+
+
+# ══════════════════════════════════════════ стор серверов (JSON) ═══
+def _store_load(path: str) -> dict:
+    """Читает JSON-store серверов. Формат: {next_index, active_id, servers:[]}."""
+    if not os.path.isfile(path):
+        return {"next_index": 1, "active_id": "", "servers": []}
+    try:
+        with open(path, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict) and "servers" in d:
+            return d
+        if isinstance(d, list):
+            return {"next_index": len(d) + 1, "active_id": "", "servers": d}
+    except Exception:
+        pass
+    return {"next_index": 1, "active_id": "", "servers": []}
+
+
+def _store_save(path: str, data: dict) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, path)
+
+
+def _sa_read_db_rows(db_path: str) -> list:
+    return list(_store_load(db_path).get("servers") or [])
+
+
+def _sa_write_auto_group(db_path: str, servers: list, update_stats: bool = True) -> int:
+    """Пишет [AUTO]-серверы в стор, сохраняя серверы пользователя."""
+    data = _store_load(db_path)
+    existing = {str(r.get("IndexId")): r for r in (data.get("servers") or [])
+                if not (r.get("Remarks") or "").startswith(AUTO_TAG)}
+    rows = list(existing.values())
+    nxt = int(data.get("next_index", 1))
+    written = 0
+    for s in servers:
+        row = server_to_row(s)
+        if not row.get("IndexId"):
+            row["IndexId"] = str(nxt)
+            nxt += 1
+        rows.append(row)
+        written += 1
+    data["servers"] = rows
+    data["next_index"] = nxt
+    _store_save(db_path, data)
+    return written
+
+
+def _sa_read_active_id(cfg_path: str):
+    store = os.path.join(os.path.dirname(cfg_path) or ".", "servers.json")
+    for cand in (store,
+                 os.path.normpath(os.path.join(os.path.dirname(cfg_path) or ".",
+                                               "..", "state", "servers.json"))):
+        if os.path.isfile(cand):
+            return _store_load(cand).get("active_id") or None
+    return None
+
+
+def _sa_write_active_id(cfg_path: str, index_id: str) -> None:
+    store = os.path.join(os.path.dirname(cfg_path) or ".", "servers.json")
+    if not os.path.isfile(store):
+        alt = os.path.normpath(os.path.join(os.path.dirname(cfg_path) or ".",
+                                            "..", "state", "servers.json"))
+        store = alt if os.path.isfile(alt) else store
+    data = _store_load(store)
+    data["active_id"] = str(index_id)
+    _store_save(store, data)
+
+
+# ══════════════════════════════════════════ генерация конфигов ядра ═══
+def _sanitize_outbound(ob):
+    """Убирает из outbound поля, удалённые в текущем xray (рекурсивно)."""
+    if not isinstance(ob, dict):
+        return ob
+    out = {}
+    for k, v in ob.items():
+        if str(k).lower() in REMOVED_OUT_KEYS:
+            continue
+        if isinstance(v, dict):
+            v = _sanitize_outbound(v)
+        elif isinstance(v, list):
+            v = [_sanitize_outbound(x) if isinstance(x, dict) else x for x in v]
+        out[k] = v
+    return out
+
+
+def _fields_from_err(err) -> set:
+    s = str(err or "")
+    out = set()
+    m = re.search(r'"?([A-Za-z_][A-Za-z0-9_]*)"?\s+has been removed', s, re.I)
+    if m:
+        out.add(m.group(1).lower())
+    if not out:
+        out = {x.lower() for x in re.findall(r'"([A-Za-z_][A-Za-z0-9_]*)"', s)}
+    return out
+
+
+def _build_routing(ru_direct: bool) -> dict:
+    """Правила: локальные имена и РФ — напрямую, остальное — через пул."""
+    rules = [{"type": "field", "outboundTag": "direct",
+              "domain": LOCAL_DIRECT_DOMAINS},
+             {"type": "field", "inboundTag": ["torrent-in"],
+              "balancerTag": "bal"}]
+    if ru_direct:
+        rules.append({"type": "field", "outboundTag": "direct",
+                      "domain": RU_DIRECT_DOMAINS})
+        rules.append({"type": "field", "outboundTag": "direct",
+                      "ip": RU_DIRECT_IPS})
+    rules.append({"type": "field", "network": "tcp,udp", "balancerTag": "bal"})
+    return {
+        "domainStrategy": "IPIfNonMatch",
+        "balancers": [{"tag": "bal", "selector": ["proxy-out"],
+                       "strategy": {"type": "leastPing"}}],
+        "rules": rules,
+    }
+
+
+def _build_dns(ru_direct: bool) -> dict:
+    if not ru_direct:
+        return {"servers": [{"address": "localhost", "domains": LOCAL_DIRECT_DOMAINS},
+                            "1.1.1.1", "8.8.8.8"]}
+    return {
+        "servers": [
+            {"address": "localhost", "domains": LOCAL_DIRECT_DOMAINS},
+            {"address": "77.88.8.8", "domains": RU_DIRECT_DOMAINS,
+             "expectIPs": RU_DIRECT_IPS},
+            {"address": "77.88.8.1", "domains": RU_DIRECT_DOMAINS,
+             "expectIPs": RU_DIRECT_IPS},
+            "1.1.1.1", "8.8.8.8",
+        ],
+        "queryStrategy": "UseIPv4",
+    }
+
+
+def build_balancer_config(servers: list, port: int, listen: str = "127.0.0.1",
+                          probe_url: str = None, ru_direct: bool = None,
+                          torrent_port: int = DEFAULT_TORRENT_PORT) -> dict:
+    """Конфиг ОДНОГО ядра с пулом серверов и нативным балансировщиком xray.
+
+    xray сам следит за живостью узлов (observatory) и направляет новые
+    соединения на живой/быстрый (leastPing) — переключение НЕ требует
+    перезапуска ядра, поэтому связь не рвётся.
+    """
+    import xraytest as XT
+    outs = []
+    for i, s in enumerate(servers):
+        # Пустой пароль/ID даёт невалидный outbound («invalid UUID»), который
+        # роняет ВЕСЬ конфиг балансировщика. Такой сервер в пул не берём.
+        if not (getattr(s, "password", "") or "").strip():
+            continue
+        ob = XT.outbound_json(s)
+        if ob is None:
+            continue
+        ob = _sanitize_outbound(dict(ob))
+        ob["tag"] = f"proxy-out-{i}"
+        outs.append(ob)
+    if not outs:
+        return None
+    outs.append({"tag": "direct", "protocol": "freedom"})
+    outs.append({"tag": "block", "protocol": "blackhole"})
+    if ru_direct is None:
+        ru_direct = True
+    return {
+        "log": {"loglevel": "warning"},
+        "inbounds": [{
+            "tag": "in", "port": int(port), "listen": listen,
+            "protocol": "mixed",
+            "settings": {"udp": True, "auth": "noauth"},
+            "sniffing": {"enabled": True, "destOverride": ["http", "tls", "quic"]},
+        }, {
+            "tag": "torrent-in", "port": int(torrent_port), "listen": "127.0.0.1",
+            "protocol": "socks",
+            "settings": {"udp": True, "auth": "noauth"},
+        }],
+        "outbounds": outs,
+        "dns": _build_dns(ru_direct),
+        "observatory": {
+            "subjectSelector": ["proxy-out"],
+            "probeUrl": probe_url or PROBE_URL,
+            "probeInterval": "5s",
+            "enableConcurrency": True,
+        },
+        "routing": _build_routing(ru_direct),
+    }
+
+
+def _write_json(path: str, data: dict) -> bool:
+    """Записать JSON АТОМАРНО (tmp + os.replace)."""
+    if not path:
+        return False
+    try:
+        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+        tmp = path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=1)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+        return True
+    except Exception as e:
+        log.get_logger().error(f"_write_json({path}): {e}")
+        return False
+
+
+def geo_asset_dir(core: str = None, cfg: dict = None) -> str:
+    """Каталог с geosite.dat / geoip.dat (нужны для правил geosite:/geoip:)."""
+    if cfg is not None:
+        try:
+            cached = StateStore(cfg).data.get("geo_asset_dir") or ""
+            if cached and (os.path.isfile(os.path.join(cached, "geoip.dat"))
+                           or os.path.isfile(os.path.join(cached, "geosite.dat"))):
+                return cached
+        except Exception:
+            pass
+    cands = []
+    env = os.environ.get("XRAY_LOCATION_ASSET")
+    if env:
+        cands.append(env)
+    if core:
+        d = os.path.dirname(core)
+        for _ in range(4):
+            if d and d not in cands:
+                cands.append(d)
+            d = os.path.dirname(d)
+    extra = []
+    for c in list(cands):
+        for sub in ("bin", "xray"):
+            cand = os.path.join(c, sub)
+            if cand not in cands:
+                extra.append(cand)
+    for d in cands + extra:
+        if d and (os.path.isfile(os.path.join(d, "geosite.dat"))
+                  or os.path.isfile(os.path.join(d, "geoip.dat"))):
+            if cfg is not None:
+                try:
+                    st = StateStore(cfg)
+                    st.data["geo_asset_dir"] = d
+                    st.save()
+                except Exception:
+                    pass
+            return d
+    return os.path.dirname(core) if core else ""
+
+
+def ru_direct_enabled(cfg: dict) -> bool:
+    """Нужна ли маршрутизация «РФ → напрямую» (только при наличии гео-баз)."""
+    want = bool((cfg or {}).get("watch", {}).get("ru_direct", False))
+    if not want:
+        return False
+    if geo_asset_dir(None, cfg):
+        return True
+    log.get_logger().warn("ru_direct включён, но geosite.dat/geoip.dat не найдены — "
+                          "правила РФ→direct отключены (весь трафик через прокси)")
+    return False
+
+
+def _validate_config(core: str, conf: dict, cfg: dict) -> tuple:
+    """Проверка конфига ядра ДО снятия рабочего ядра: запуск на свободных портах."""
+    import hashlib as _hl
+    import socket
+    import tempfile
+    try:
+        v_sig = _hl.md5(json.dumps(conf, sort_keys=True,
+                                   ensure_ascii=False).encode("utf-8")).hexdigest()
+        st_v = StateStore(cfg)
+        if st_v.data.get("validate_sig") == v_sig and \
+                time.time() - float(st_v.data.get("validate_ts", 0) or 0) < 3600:
+            return True, ""
+    except Exception:
+        v_sig = None
+    test = json.loads(json.dumps(conf))
+    for ib in test.get("inbounds", []):
+        s = socket.socket()
+        try:
+            s.bind(("127.0.0.1", 0))
+            ib["port"] = s.getsockname()[1]
+        finally:
+            s.close()
+        ib["listen"] = "127.0.0.1"
+    fd, tmp_conf = tempfile.mkstemp(suffix=".json", prefix="forest-validate-")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        json.dump(test, f, ensure_ascii=False)
+    log_p = os.path.join(cfg["paths"]["state_dir"], "forest_validate.log")
+    try:
+        env_v = dict(os.environ)
+        adir = geo_asset_dir(core, cfg)
+        if adir:
+            env_v["XRAY_LOCATION_ASSET"] = adir
+        with open(log_p, "w", encoding="utf-8") as lf:
+            pv = subprocess.Popen([core, "run", "-c", tmp_conf],
+                                  cwd=os.path.dirname(core) or None, env=env_v,
+                                  stdout=lf, stderr=subprocess.STDOUT,
+                                  creationflags=_no_window())
+            tst_ports = [ib.get("port") for ib in test.get("inbounds", []) if ib.get("port")]
+            alive = False
+            dl = time.time() + 2.5
+            while time.time() < dl:
+                if pv.poll() is not None:
+                    break
+                try:
+                    if tst_ports and all(port_listening(pp, timeout=0.15) for pp in tst_ports):
+                        alive = True
+                        break
+                except Exception:
+                    pass
+                time.sleep(0.05)
+            if alive:
+                time.sleep(0.15)
+                alive = pv.poll() is None
+            if pv.poll() is None:
+                pv.kill()
+            pv.wait(timeout=10)
+        if alive:
+            if v_sig:
+                try:
+                    st_v = StateStore(cfg)
+                    st_v.data["validate_sig"] = v_sig
+                    st_v.data["validate_ts"] = time.time()
+                    st_v.save()
+                except Exception:
+                    pass
+            return True, ""
+        try:
+            tail = open(log_p, encoding="utf-8", errors="replace").read()[-300:]
+        except Exception:
+            tail = ""
+        m = re.search(r"(failed to[^\n]{0,180})", tail)
+        return False, (m.group(1) if m else tail.strip()[-180:])
+    except Exception as e:
+        return False, f"validate error: {e}"
+    finally:
+        try:
+            os.unlink(tmp_conf)
+        except Exception:
+            pass
+
+
+# ══════════════════════════════════════════ блокировки ═══
+def _lock_path(cfg: dict, name: str) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], f"{name}.lock")
+
+
+def _lock(cfg: dict, name: str, ttl: float = 180.0, wait: float = 0.0) -> bool:
+    """Файловый lock: ядром управляет ТОЛЬКО один поток/процесс."""
+    p = _lock_path(cfg, name)
+    deadline = time.time() + wait
+    while True:
+        try:
+            if os.path.isfile(p):
+                age = time.time() - os.path.getmtime(p)
+                if age > ttl:
+                    os.unlink(p)
+            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            os.write(fd, str(os.getpid()).encode())
+            os.close(fd)
+            return True
+        except FileExistsError:
+            if time.time() >= deadline:
+                return False
+            time.sleep(0.5)
+        except Exception:
+            return False
+
+
+def _unlock(cfg: dict, name: str) -> None:
+    try:
+        os.unlink(_lock_path(cfg, name))
+    except Exception:
+        pass
+
+
+# ══════════════════════════════════════════ процессы (Windows) ═══
+def _pid_alive(pid: int) -> bool:
+    """Жив ли процесс (ctypes, ~0.1 мс)."""
+    try:
+        import ctypes
+        SYNCHRONIZE = 0x00100000
+        WAIT_TIMEOUT = 0x00000102
+        k32 = ctypes.windll.kernel32
+        h = k32.OpenProcess(SYNCHRONIZE, False, int(pid))
+        if not h:
+            return True
+        try:
+            return k32.WaitForSingleObject(h, 0) == WAIT_TIMEOUT
+        finally:
+            k32.CloseHandle(h)
+    except Exception:
+        return True
+
+
+def _port_pid(port: int):
+    """PID процесса, слушающего порт (ctypes GetExtendedTcpTable, fallback netstat)."""
+    try:
+        import ctypes
+        from ctypes import wintypes
+        AF_INET = 2
+        TCP_TABLE_OWNER_PID_LISTENER = 3
+
+        class _ROW(ctypes.Structure):
+            _fields_ = [("dwState", wintypes.DWORD), ("dwLocalAddr", wintypes.DWORD),
+                        ("dwLocalPort", wintypes.DWORD), ("dwRemoteAddr", wintypes.DWORD),
+                        ("dwRemotePort", wintypes.DWORD), ("dwOwningPid", wintypes.DWORD)]
+
+        iphlp = ctypes.windll.iphlpapi
+        size = wintypes.DWORD(0)
+        iphlp.GetExtendedTcpTable(None, ctypes.byref(size), False, AF_INET,
+                                  TCP_TABLE_OWNER_PID_LISTENER, 0)
+        buf = ctypes.create_string_buffer(size.value)
+        if iphlp.GetExtendedTcpTable(buf, ctypes.byref(size), False, AF_INET,
+                                     TCP_TABLE_OWNER_PID_LISTENER, 0) == 0:
+            n = ctypes.cast(buf, ctypes.POINTER(wintypes.DWORD)).contents.value
+            rows = ctypes.cast(ctypes.addressof(buf) + ctypes.sizeof(wintypes.DWORD),
+                               ctypes.POINTER(_ROW))
+            want = int(port)
+            for i in range(n):
+                r = rows[i]
+                p = ((r.dwLocalPort & 0xFF) << 8) | ((r.dwLocalPort >> 8) & 0xFF)
+                if p == want:
+                    return str(r.dwOwningPid)
+            return None
+    except Exception:
+        pass
+    try:
+        r = subprocess.run(["netstat", "-ano"], capture_output=True, timeout=15,
+                           creationflags=_no_window())
+        out = r.stdout.decode("cp1251", "replace")
+        for line in out.splitlines():
+            if "LISTENING" in line and f":{port} " in line:
+                parts = line.split()
+                if parts:
+                    return parts[-1].strip()
+    except Exception:
+        pass
+    return None
+
+
+def _our_core_pids(cfg: dict) -> list:
+    """Все НАШИ ядра xray (в командной строке наш конфиг forest_xray.json)."""
+    try:
+        ps = ("Get-CimInstance Win32_Process -Filter \"Name='xray.exe'\" | "
+              "Where-Object { $_.CommandLine -like '*forest_xray.json*' } | "
+              "ForEach-Object { $_.ProcessId }")
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=25, text=True, errors="replace",
+                           creationflags=_no_window())
+        return [int(x) for x in (r.stdout or "").split() if x.strip().isdigit()]
+    except Exception:
+        return []
+
+
+def _kill_pid(pid) -> bool:
+    try:
+        r = subprocess.run(["taskkill", "/PID", str(int(pid)), "/F"],
+                           capture_output=True, timeout=15,
+                           creationflags=_no_window())
+        return r.returncode == 0
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════ жизненный цикл ядра ═══
+def core_pid_path(cfg: dict) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], CORE_PID_NAME)
+
+
+def core_config_path(cfg: dict) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], CORE_CFG_NAME)
+
+
+def _read_core_pid(cfg: dict):
+    try:
+        return int(open(core_pid_path(cfg), encoding="utf-8").read().strip())
+    except Exception:
+        return None
+
+
+def _write_core_pid(cfg: dict, pid):
+    try:
+        with open(core_pid_path(cfg), "w", encoding="utf-8") as f:
+            f.write(str(int(pid)))
+    except Exception:
+        pass
+
+
+def stop_core(cfg: dict, why: str = "") -> None:
+    """Останавливает НАШЕ ядро (по pid-файлу и по конфигу в командной строке).
+
+    НИКОГДА не трогает чужие процессы xray.exe (например, ядро v2rayN).
+    """
+    lg = log.get_logger()
+    pid = _read_core_pid(cfg)
+    if pid and _pid_alive(pid):
+        if _kill_pid(pid):
+            lg.info(f"stop_core{'(' + why + ')' if why else ''}: снято наше ядро pid={pid}")
+    for p in _our_core_pids(cfg):
+        if p != pid:
+            _kill_pid(p)
+            lg.warn(f"stop_core: снято осиротевшее наше ядро pid={p}")
+    try:
+        os.unlink(core_pid_path(cfg))
+    except Exception:
+        pass
+
+
+def start_core(client: dict, cfg: dict) -> bool:
+    """Запускает ядро xray с текущим конфигом (client['cfg']). True — порт открыт."""
+    lg = log.get_logger()
+    core = client.get("core")
+    cfg_path = client.get("cfg")
+    if not core or not os.path.isfile(core):
+        lg.error("start_core: ядро xray не найдено")
+        return False
+    if not cfg_path or not os.path.isfile(cfg_path):
+        lg.error("start_core: конфиг ядра ещё не записан")
+        return False
+    env = dict(os.environ)
+    adir = geo_asset_dir(core, cfg)
+    if adir:
+        env["XRAY_LOCATION_ASSET"] = adir
+    log_path = os.path.join(cfg["paths"]["state_dir"], CORE_LOG_NAME)
+    try:
+        logf = open(log_path, "a", encoding="utf-8")
+        p = subprocess.Popen([core, "run", "-c", cfg_path],
+                             cwd=os.path.dirname(core) or None, env=env,
+                             stdout=logf, stderr=subprocess.STDOUT,
+                             creationflags=_no_window())
+    except Exception as e:
+        lg.error(f"start_core: {e}")
+        return False
+    _write_core_pid(cfg, p.pid)
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    dl = time.time() + 8.0
+    while time.time() < dl:
+        if p.poll() is not None:
+            lg.error("start_core: ядро упало сразу после старта (см. forest_xray.log)")
+            return False
+        if port_listening(port, timeout=0.3):
+            return True
+        time.sleep(0.1)
+    lg.warn(f"start_core: порт {port} не открылся за 8 с")
+    return False
+
+
+def restart_core(client: dict, cfg: dict) -> bool:
+    """Перезапуск ядра: снять наше старое -> поднять новое с текущим конфигом."""
+    stop_core(cfg, why="restart")
+    time.sleep(0.3)
+    return start_core(client, cfg)
+
+
+def wait_and_probe(client: dict, attempts: int = 6, gap: float = 3.0) -> tuple:
+    """Ждёт подъёма порта и проверяет связь.
+
+    Первые попытки — строгая проверка (реальные данные + TLS). Последние две —
+    быстрая (204 + TLS): под нагрузкой строгое скачивание 200 КБ даёт ложные
+    отказы (в тестах видели связь, которая работала сразу после), а заглушки
+    уже отсеяны на этапе отбора пула.
+    """
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    for i in range(attempts):
+        if port_listening(port):
+            strict = i < max(1, attempts - 2)
+            ok, rtt = probe_client(client, timeout=8, strict=strict)
+            if ok:
+                return True, rtt
+        if i < attempts - 1:
+            time.sleep(gap)
+    return False, 0.0
+
+
+def kill_kernels(cfg: dict = None, why: str = "") -> None:
+    """Standalone: снимает ТОЛЬКО наше ядро (чужое не трогает)."""
+    if cfg and _mode_of(None, cfg) == "v2rayn":
+        return _v2().kill_kernels(cfg, why=why)
+    stop_core(cfg, why=why)
+
+
+def ensure_port_free(client: dict, cfg: dict) -> bool:
+    """Standalone: порт принадлежит нашему ядру.
+
+    Если порт занят НЕ нашим процессом (например, ядром v2rayN) — не убиваем
+    чужое, только предупреждаем (standalone работает на своём порту из конфига).
+    """
+    lg = log.get_logger()
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    if not port_busy(port):
+        return True
+    pid = _port_pid(port)
+    ours = _read_core_pid(cfg)
+    if pid and ours and str(pid) == str(ours):
+        return True
+    if _mode_of(client, cfg) == "v2rayn":
+        return _v2().ensure_port_free(client, cfg)
+    lg.warn(f"порт {port} занят процессом pid={pid} (не нашим) — не трогаю; "
+            f"смените client.socks_port в конфиге, если он конфликтует")
+    return True
+
+
+def start_client(client: dict):
+    if _mode_of(client) == "v2rayn":
+        return _v2().start_client(client)
+    return start_core(client, {"paths": {"state_dir": os.path.dirname(client.get("cfg") or ".")}})
+
+
+def stop_client(client: dict, wait: float = 20.0):
+    if _mode_of(client) == "v2rayn":
+        return _v2().stop_client(client, wait=wait)
+    sd = os.path.dirname(client.get("cfg") or ".")
+    stop_core({"paths": {"state_dir": sd}})
+
+
+# ══════════════════════════════════════════ системный прокси (WinINET) ═══
+def _sys_proxy_state() -> tuple:
+    """(включён, сервер) системного прокси из реестра WinINET."""
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        en, _ = winreg.QueryValueEx(k, "ProxyEnable")
+        try:
+            srv, _ = winreg.QueryValueEx(k, "ProxyServer")
+        except FileNotFoundError:
+            srv = ""
+        winreg.CloseKey(k)
+        return bool(en), str(srv)
+    except Exception:
+        return False, ""
+
+
+def _sys_proxy_apply(server: str) -> bool:
+    """Включает системный прокси и сообщает WinINET об изменении (без окон)."""
+    import ctypes
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                           0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(k, "ProxyServer", 0, winreg.REG_SZ, server)
+        winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 1)
+        winreg.CloseKey(k)
+    except Exception:
+        return False
+    try:
+        wi = ctypes.windll.wininet
+        wi.InternetSetOptionW(0, 39, 0, 0)   # INTERNET_OPTION_SETTINGS_CHANGED
+        wi.InternetSetOptionW(0, 37, 0, 0)   # INTERNET_OPTION_REFRESH
+    except Exception:
+        pass
+    return True
+
+
+def _sys_proxy_disable() -> bool:
+    """Выключает системный прокси и сообщает WinINET (без окон)."""
+    import ctypes
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings",
+                           0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(k, "ProxyEnable", 0, winreg.REG_DWORD, 0)
+        winreg.CloseKey(k)
+    except Exception:
+        return False
+    try:
+        wi = ctypes.windll.wininet
+        wi.InternetSetOptionW(0, 39, 0, 0)
+        wi.InternetSetOptionW(0, 37, 0, 0)
+    except Exception:
+        pass
+    return True
+
+
+def proxy_orig_path(cfg: dict) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], "proxy_orig.json")
+
+
+def save_proxy_orig(cfg: dict) -> None:
+    """Запомнить ИСХОДНОЕ состояние системного прокси (для --uninstall)."""
+    p = proxy_orig_path(cfg)
+    if os.path.isfile(p):
+        return
+    en, srv = _sys_proxy_state()
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"enable": bool(en), "server": srv, "ts": time.time()}, f)
+    except Exception:
+        pass
+
+
+def restore_system_proxy(cfg: dict) -> bool:
+    """Вернуть системный прокси в состояние ДО первого вмешательства."""
+    p = proxy_orig_path(cfg)
+    if not os.path.isfile(p):
+        return False
+    try:
+        d = json.load(open(p, encoding="utf-8"))
+    except Exception:
+        return False
+    if d.get("enable") and d.get("server"):
+        _sys_proxy_apply(str(d["server"]))
+    else:
+        _sys_proxy_disable()
+    try:
+        os.unlink(p)
+    except Exception:
+        pass
+    log.get_logger().info("Системный прокси возвращён в исходное состояние")
+    return True
+
+
+def ensure_system_proxy(client: dict, cfg: dict) -> bool:
+    """Системный прокси должен смотреть на наш порт.
+
+    Вызывается из ensure_balancer ДО всех ранних return. В режиме v2rayn не
+    вмешивается при живом GUI v2rayN (это его забота).
+    """
+    lg = log.get_logger()
+    if proxy_off(cfg):
+        return False
+    if cfg.get("client", {}).get("manage_system_proxy", True) is False:
+        return True
+    if str(client.get("mode")) == "v2rayn":
+        return _v2().ensure_system_proxy(client, cfg)
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    want = f"127.0.0.1:{port}"
+    en, srv = _sys_proxy_state()
+    if en and srv.strip() == want:
+        return True
+    save_proxy_orig(cfg)      # запомнить исходное состояние (один раз)
+    if _sys_proxy_apply(want):
+        lg.warn(f"Системный прокси был {'включён на ' + (srv or '—') if en else 'ВЫКЛЮЧЕН'} — "
+                f"включил на {want}")
+        return True
+    lg.error("не удалось включить системный прокси")
+    return False
+
+
+# ══════════════════════════════════════════ ручное отключение / страховка ═══
+def proxy_off_path(cfg: dict) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], "proxy_off.flag")
+
+
+def proxy_off(cfg: dict) -> bool:
+    try:
+        return os.path.isfile(proxy_off_path(cfg))
+    except Exception:
+        return False
+
+
+def set_proxy_off(cfg: dict, on: bool, client: dict = None, why: str = "tray") -> bool:
+    """Ручное выключение/включение прокси (флаг — единственный источник истины)."""
+    lg = log.get_logger()
+    p = proxy_off_path(cfg)
+    try:
+        if on:
+            os.makedirs(os.path.dirname(p), exist_ok=True)
+            open(p, "w", encoding="utf-8").write(why)
+            lg.warn("Прокси выключен ВРУЧНУЮ: автоподъём остановлен")
+        else:
+            if os.path.isfile(p):
+                os.unlink(p)
+            lg.info("Прокси включён вручную: автоподъём возобновлён")
+    except Exception as e:
+        lg.error(f"set_proxy_off: {e}")
+        return False
+    if on:
+        stop_core(cfg, why="manual-off")
+        try:
+            _sys_proxy_disable()
+        except Exception:
+            pass
+    return True
+
+
+def lastgood_path(cfg: dict) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], "lastgood_servers.json")
+
+
+def save_lastgood(cfg: dict, servers: list) -> None:
+    """Запомнить последний РАБОЧИЙ состав пула (аварийный конфиг)."""
+    try:
+        import dataclasses
+        _write_json(lastgood_path(cfg),
+                    {"ts": time.time(), "servers": [dataclasses.asdict(s) for s in servers]})
+    except Exception:
+        pass
+
+
+def load_lastgood(cfg: dict) -> list:
+    try:
+        import dataclasses
+        import parser as P
+        d = json.load(open(lastgood_path(cfg), encoding="utf-8"))
+        fields = {f.name for f in dataclasses.fields(P.Server)}
+        out = []
+        for row in (d.get("servers") or []):
+            try:
+                out.append(P.Server(**{k: v for k, v in row.items() if k in fields}))
+            except Exception:
+                pass
+        return out
+    except Exception:
+        return []
+
+
+def _emergency_restore(client: dict, cfg: dict, port: int) -> bool:
+    """Аварийный подъём последнего рабочего состава."""
+    lg = log.get_logger()
+    st = StateStore(cfg)
+    if time.time() - float(st.data.get("emergency_ts", 0) or 0) < 120:
+        return False
+    servers = load_lastgood(cfg)
+    if not servers:
+        lg.warn("аварийный конфиг: сохранённого рабочего состава нет")
+        return False
+    st.data["emergency_ts"] = time.time()
+    st.save()
+    lg.warn(f"АВАРИЙНЫЙ КОНФИГ: живых серверов нет — поднимаю последний рабочий "
+            f"состав ({len(servers)} серверов)")
+    if not _lock(cfg, "balancer", ttl=240, wait=8):
+        return False
+    try:
+        if not write_balancer_config(client, servers, cfg):
+            return False
+        conf = json.load(open(client["cfg"], encoding="utf-8"))
+        ok_v, err_v = _validate_config(client["core"], conf, cfg)
+        if not ok_v:
+            lg.error(f"аварийный конфиг невалиден ({err_v})")
+            return False
+        if not restart_core(client, cfg):
+            return False
+    finally:
+        _unlock(cfg, "balancer")
+    ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
+    if ok:
+        save_lastgood(cfg, servers)
+        lg.info(f"аварийный конфиг: связь поднята (rtt={rtt} мс)")
+    return ok
+
+
+# ══════════════════════════════════════════ запись конфигов ядра (standalone) ═══
+def write_core_config(client: dict, server, cfg: dict) -> bool:
+    """Пишет конфиг ядра с ОДНИМ сервером."""
+    import xraytest as XT
+    ob = XT.outbound_json(server)
+    if ob is None:
+        log.get_logger().error("write_core_config: outbound не собрался")
+        return False
+    ob = _sanitize_outbound(dict(ob))
+    ob["tag"] = "proxy"
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    listen = cfg.get("client", {}).get("listen", "127.0.0.1")
+    ru = ru_direct_enabled(cfg)
+    conf = {
+        "log": {"loglevel": "warning"},
+        "inbounds": [_inbound(port, listen), _inbound_torrent(cfg)],
+        "outbounds": [ob, {"tag": "direct", "protocol": "freedom"}],
+        "dns": _build_dns(ru),
+        "routing": _routing_single(ru),
+    }
+    return _write_json(client.get("cfg"), conf)
+
+
+def _inbound(port: int, listen: str = "127.0.0.1") -> dict:
+    return {"tag": "in", "port": int(port), "listen": listen,
+            "protocol": "mixed", "settings": {"udp": True, "auth": "noauth"}}
+
+
+def _inbound_torrent(cfg: dict) -> dict:
+    tport = int(cfg.get("client", {}).get("torrent_port", DEFAULT_TORRENT_PORT))
+    return {"tag": "torrent-in", "port": tport, "listen": "127.0.0.1",
+            "protocol": "socks", "settings": {"udp": True, "auth": "noauth"}}
+
+
+def _routing_single(ru_direct: bool) -> dict:
+    rules = [{"type": "field", "outboundTag": "direct", "domain": LOCAL_DIRECT_DOMAINS},
+             {"type": "field", "inboundTag": ["torrent-in"], "outboundTag": "proxy"}]
+    if ru_direct:
+        rules.append({"type": "field", "outboundTag": "direct", "domain": RU_DIRECT_DOMAINS})
+        rules.append({"type": "field", "outboundTag": "direct", "ip": RU_DIRECT_IPS})
+    rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "proxy"})
+    return {"domainStrategy": "IPIfNonMatch", "rules": rules}
+
+
+def write_balancer_config(client: dict, servers: list, cfg: dict) -> bool:
+    """Пишет конфиг ядра с пулом серверов и нативным балансировщиком xray."""
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    listen = cfg.get("client", {}).get("listen", "127.0.0.1")
+    tport = int(client.get("torrent_port",
+                           cfg.get("client", {}).get("torrent_port", DEFAULT_TORRENT_PORT)))
+    ru = ru_direct_enabled(cfg)
+    conf = build_balancer_config(servers, port, listen=listen, ru_direct=ru,
+                                 torrent_port=tport)
+    if conf is None:
+        log.get_logger().error("write_balancer_config: пул пуст")
+        return False
+    return _write_json(client.get("cfg"), conf)
+
+
+# ══════════════════════════════════════════ пул балансировщика ═══
+def balancer_pool(client: dict, cfg: dict, n: int = 10, min_speed_kbps: float = 0) -> list:
+    """Топ-N серверов для пула: из hotcache, иначе из [AUTO]-стора.
+
+    Без подтверждённой скорости сервер в пул не берём (CF-заглушки отдают 204,
+    но данных не везут — leastPing выбрал бы именно их).
+    """
+    import xraytest as XT
+    st = StateStore(cfg)
+    pool = []
+    seen = set()
+    for e in (st.data.get("hotcache") or []):
+        if not e.get("speed_kbps"):
+            continue
+        if min_speed_kbps and e["speed_kbps"] < min_speed_kbps:
+            continue
+        s = _row_to_server_from_cache(e)
+        if s is not None and s.address and s.port and (s.password or "").strip() \
+                and (s.address, s.port) not in seen:
+            seen.add((s.address, s.port))
+            pool.append(s)
+        if len(pool) >= n:
+            return pool
+    bl = bl_active(cfg)
+    rows = [r for r in read_db_rows(client["db"])
+            if (r.get("Remarks") or "").startswith(AUTO_TAG)]
+    for r in rows:
+        if str(r.get("IndexId")) in bl:
+            continue
+        s = row_to_server(r)
+        if s is None:
+            continue
+        s._row_index_id = str(r.get("IndexId"))
+        if (s.address, s.port) in seen:
+            continue
+        if (s.speed_kbps or 0) <= 0:
+            continue
+        if min_speed_kbps and (s.speed_kbps or 0) < min_speed_kbps:
+            continue
+        try:
+            if "xhttp" in json.dumps(XT.outbound_json(s)).lower():
+                continue
+        except Exception:
+            pass
+        seen.add((s.address, s.port))
+        pool.append(s)
+        if len(pool) >= n:
+            break
+    pool.sort(key=lambda s: -(s.speed_kbps or 0))
+    return pool[:n]
+
+
+def _row_to_server_from_cache(e: dict):
+    """Собирает Server из записи hotcache.
+
+    В hotcache хранится ПОЛНЫЙ сервер (asdict) — иначе у восстановленного
+    сервера нет пароля/ID и outbound выходит невалидным («invalid UUID»).
+    """
+    import parser as P
+    full = e.get("server")
+    if isinstance(full, dict):
+        try:
+            import dataclasses
+            fields = {f.name for f in dataclasses.fields(P.Server)}
+            return P.Server(**{k: v for k, v in full.items() if k in fields})
+        except Exception:
+            pass
+    try:
+        s = P.Server(protocol=e.get("protocol", "vless"),
+                     address=e.get("address", ""), port=int(e.get("port", 0)))
+        s.remark = e.get("remark", "")
+        s.rtt_ms = e.get("rtt_ms", 0)
+        s.speed_kbps = e.get("speed_kbps", 0)
+        return s if s.address and s.port > 0 else None
+    except Exception:
+        return None
+
+
+def _pool_sig(pool: list) -> str:
+    return ",".join(sorted(f"{s.address}:{s.port}" for s in pool))
+
+
+def _link_ok(cfg: dict, port: int, fresh_s: float = 45.0) -> bool:
+    """Живость связи по отметкам сторожа (дёшево), иначе — probe."""
+    now = time.time()
+    try:
+        st = StateStore(cfg)
+        fail_ts = float(st.data.get("last_probe_fail_ts", 0) or 0)
+        if fail_ts and now - fail_ts <= fresh_s:
+            return False
+        ok_ts = float(st.data.get("last_probe_ok_ts", 0) or 0)
+        if ok_ts and now - ok_ts <= fresh_s:
+            return True
+    except Exception:
+        pass
+    try:
+        ok, _rtt = probe_client({"socks_port": int(port)}, timeout=8)
+        return bool(ok)
+    except Exception:
+        return False
+
+
+def ensure_balancer(client: dict, cfg: dict, n: int = 10,
+                    force: bool = False, fast_ok: bool = False) -> bool:
+    """Поднимает пул серверов с балансировщиком xray. True — связь есть."""
+    if _mode_of(client, cfg) == "v2rayn":
+        return _v2().ensure_balancer(client, cfg, n=n, force=force, fast_ok=fast_ok)
+    lg = log.get_logger()
+    socks_port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    if proxy_off(cfg):
+        return True
+    pool = balancer_pool(client, cfg, n=n,
+                         min_speed_kbps=float(cfg.get("watch", {}).get(
+                             "speed_min_kbps", 0) or 0))
+    if not pool:
+        lg.warn("ensure_balancer: пул пуст")
+        if not _link_ok(cfg, socks_port) and _emergency_restore(client, cfg, socks_port):
+            return True
+        return False
+    ensure_system_proxy(client, cfg)
+    sig = _pool_sig(pool)
+    st = StateStore(cfg)
+    if not force and st.data.get("balancer_sig") == sig and _link_ok(cfg, socks_port):
+        return True
+    freeze_s = float(cfg.get("watch", {}).get("pool_freeze_s", 10800))
+    age = time.time() - float(st.data.get("balancer_ts", 0) or 0)
+    if st.data.get("balancer_sig") and age < freeze_s and _link_ok(cfg, socks_port):
+        if st.data.get("balancer_sig") != sig:
+            lg.info("ensure_balancer: состав пула изменился, но ядро работает — "
+                    f"пул заморожен ещё на {int((freeze_s - age) / 60)} мин")
+        return True
+    if not _lock(cfg, "balancer", ttl=240, wait=8):
+        lg.warn("ensure_balancer: другое управление ядром уже идёт — пропускаю цикл")
+        return True
+    try:
+        if not write_balancer_config(client, pool, cfg):
+            return False
+        conf = json.load(open(client["cfg"], encoding="utf-8"))
+        ok_v, err_v = _validate_config(client["core"], conf, cfg)
+        if not ok_v:
+            lg.error(f"ensure_balancer: конфиг невалиден ({err_v}) — ядро не трогаю")
+            return False
+        if not restart_core(client, cfg):
+            lg.error("ensure_balancer: ядро не поднялось")
+            return False
+    finally:
+        _unlock(cfg, "balancer")
+    if fast_ok and port_listening(socks_port):
+        ok, rtt = True, 0.0
+    else:
+        ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
+    if ok:
+        st.data["balancer_sig"] = sig
+        st.data["balancer_n"] = len(pool)
+        st.data["balancer_ts"] = time.time()
+        st.data["emergency_ts"] = 0
+        st.save()
+        save_lastgood(cfg, pool)
+        lg.info(f"Балансировщик поднят: {len(pool)} серверов (rtt={rtt} мс)")
+    else:
+        lg.warn("ensure_balancer: связь не появилась")
+    return ok
+
+
+# ══════════════════════════════════════════ активация ═══
+def activate(client: dict, servers: list, active_id: str, cfg: dict,
+             active_server=None, update_stats: bool = True, existing: list = None,
+             restart_client: bool = True) -> dict:
+    """Полный цикл активации: запись стора -> конфиг -> запуск ядра -> проверка."""
+    if _mode_of(client, cfg) == "v2rayn":
+        return _v2().activate(client, servers, active_id, cfg,
+                              active_server=active_server, update_stats=update_stats,
+                              existing=existing, restart_client=restart_client)
+    lg = log.get_logger()
+    switched = str(read_active_id(client["cfg"])) != str(active_id)
+    try:
+        n = write_auto_group(client["db"], servers, update_stats)
+        write_active_id(client["cfg"], active_id)
+        lg.info(f"Стор обновлён: {n} [AUTO]-серверов, активный: {active_id}")
+    except Exception as e:
+        lg.error(f"Запись стора не удалась: {e}")
+        return {"ok": False, "switched": switched, "rtt": 0, "msg": f"write_error: {e}"}
+
+    if bool(cfg.get("watch", {}).get("balancer_mode", False)):
+        if ensure_balancer(client, cfg,
+                           n=int(cfg["watch"].get("balancer_pool_n", 10)),
+                           force=switched):
+            ok2, rtt2 = probe_client(client, timeout=8)
+            if ok2:
+                return {"ok": True, "switched": switched, "rtt": rtt2,
+                        "msg": "balancer_ok"}
+        lg.warn("Балансировщик не дал связи — пробую одиночный сервер")
+
+    srv = active_server
+    if srv is None:
+        for r in read_db_rows(client["db"]):
+            if str(r.get("IndexId")) == str(active_id):
+                srv = row_to_server(r)
+                break
+    if srv is None:
+        return {"ok": False, "switched": switched, "rtt": 0, "msg": "server_not_found"}
+    if not write_core_config(client, srv, cfg):
+        return {"ok": False, "switched": switched, "rtt": 0, "msg": "config_write_failed"}
+    if restart_core(client, cfg):
+        ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
+        if ok:
+            lg.info(f"Активация OK: {active_id} (rtt={rtt} мс)")
+            return {"ok": True, "switched": switched, "rtt": rtt, "msg": "activated"}
+    lg.warn("Связи нет — пробую аварийный состав (last-good)")
+    if _emergency_restore(client, cfg, int(client.get("socks_port", DEFAULT_SOCKS_PORT))):
+        return {"ok": True, "switched": switched, "rtt": 0, "msg": "emergency_ok"}
+    return {"ok": False, "switched": switched, "rtt": 0, "msg": "activate_failed"}
+
+
+# ══════════════════════════════════════════ сторож (guard) ═══
+def guard_cycle(client: dict, cfg: dict, probe_timeout: float = 6.0) -> bool:
+    """Быстрый самоконтроль: порт жив? иначе failover по [AUTO]-серверам."""
+    if _mode_of(client, cfg) == "v2rayn":
+        return _v2().guard_cycle(client, cfg, probe_timeout=probe_timeout)
+    lg = log.get_logger()
+    ok, rtt = probe_client(client, timeout=probe_timeout)
+    if ok:
+        return True
+    port = client.get("socks_port", DEFAULT_SOCKS_PORT)
+    lg.warn(f"Порт {port} не отвечает ({rtt} мс); запускаю failover…")
+
+    if bool(cfg.get("watch", {}).get("balancer_mode", False)):
+        if ensure_balancer(client, cfg,
+                           n=int(cfg["watch"].get("balancer_pool_n", 10)), force=True):
+            ok_b, rtt_b = probe_client(client, timeout=8)
+            if ok_b:
+                lg.info(f"Guard OK: балансировщик дал связь (rtt={rtt_b} мс)")
+                return True
+
+    cands = []
+    for r in read_db_rows(client.get("db", "")):
+        if not (r.get("Remarks") or "").startswith(AUTO_TAG):
+            continue
+        s = row_to_server(r)
+        if s is not None:
+            cands.append(s)
+    try:
+        cands = bl_filter(cfg, cands)
+    except Exception:
+        pass
+    lg.info(f"Failover: [AUTO]-кандидатов: {len(cands)}")
+    if cands:
+        import xraytest as XT
+        pool = XT.PortPool(int(cfg["test"].get("port_start", 10810)),
+                           int(cfg["test"].get("workers", 8)) * 2 + 4)
+        try:
+            cands = XT.tcp_prefilter(cands, cfg)
+        except Exception:
+            pass
+        for s in cands:
+            try:
+                XT.test_rtt(pool, client["core"], s, 6)
+            except Exception:
+                pass
+        alive = [s for s in cands if getattr(s, "ok", False)]
+        alive.sort(key=lambda s: (s.rtt_ms or 9999, -(s.speed_kbps or 0)))
+        lg.info(f"Failover: живых [AUTO]: {len(alive)}")
+        for s in alive[:8]:
+            if not write_core_config(client, s, cfg):
+                continue
+            if not restart_core(client, cfg):
+                continue
+            ok2, rtt2 = wait_and_probe(client, attempts=5, gap=2.0)
+            if ok2:
+                sid = getattr(s, "_row_index_id", None) or getattr(s, "index_id", None)
+                if sid:
+                    write_active_id(client["cfg"], sid)
+                lg.info(f"Failover OK: переключились на {s.address}:{s.port} "
+                        f"(rtt={rtt2} мс)")
+                return True
+            try:
+                bl_add(cfg, getattr(s, "_row_index_id", None) or getattr(s, "index_id", ""),
+                       60, "failover_no_connect")
+            except Exception:
+                pass
+    else:
+        lg.warn("Failover: нет [AUTO]-серверов в сторе")
+
+    if _emergency_restore(client, cfg, int(port)):
+        return True
+    lg.error("Guard: восстановить связь не удалось")
+    return False
+
+
+# ══════════════════════════════════════════ стор состояния + hotcache ═══
+class StateStore:
+    def __init__(self, cfg: dict):
+        self.path = os.path.join(cfg["paths"]["state_dir"], "state.json")
+        self.data = self._load()
+
+    def _load(self) -> dict:
+        if os.path.isfile(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    return json.load(f)
+            except Exception:
+                pass
+        return {}
+
+    def save(self):
+        tmp = self.path + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(self.data, f, ensure_ascii=False, indent=1)
+        os.replace(tmp, self.path)
+
+
+def update_hotcache(client: dict, cfg: dict, servers: list):
+    """Сохраняет проверенно-живые серверы в hotcache (быстрый failover)."""
+    st = StateStore(cfg)
+    hot_n = int(cfg.get("watch", {}).get("hotcache_n", 5))
+    if not servers or hot_n <= 0:
+        return
+    alive = [s for s in servers
+             if getattr(s, "ok", False) and getattr(s, "rtt_ms", 0) > 0
+             and (getattr(s, "speed_kbps", 0) or 0) > 0]
+    alive.sort(key=lambda s: (-(s.speed_kbps or 0), s.rtt_ms))
+    import dataclasses
+    cache = []
+    for s in alive[:hot_n]:
+        idx = getattr(s, "_row_index_id", None) or getattr(s, "index_id", "")
+        try:
+            full = dataclasses.asdict(s)
+        except Exception:
+            full = {}
+        cache.append({
+            "address": s.address, "port": s.port, "protocol": s.protocol,
+            "remark": getattr(s, "remark", "") or "",
+            "rtt_ms": s.rtt_ms, "speed_kbps": s.speed_kbps,
+            "index_id": idx, "ts": time.time(),
+            "server": full,          # полные данные для быстрого восстановления
+        })
+    st.data["hotcache"] = cache
+    st.save()
+    log.get_logger().info(f"hotcache обновлён: {len(cache)} серверов")
+
+
+def hotcache_switch(client: dict, cfg: dict, hot_n: int = 5,
+                    hot_ttl: float = 600.0, probe_timeout: float = 5.0) -> str:
+    """Быстрое переключение на сервер из hotcache (без полного теста)."""
+    lg = log.get_logger()
+    st = StateStore(cfg)
+    cache = st.data.get("hotcache") or []
+    now = time.time()
+    fresh = [e for e in cache if (now - float(e.get("ts", 0) or 0)) < hot_ttl
+             and e.get("speed_kbps")]
+    if not fresh:
+        return ""
+    servers = [s for s in (_row_to_server_from_cache(e) for e in fresh[:hot_n]) if s]
+    if not servers:
+        return ""
+    if ensure_balancer(client, cfg, n=max(3, len(servers)), force=True, fast_ok=True):
+        ok, rtt = probe_client(client, timeout=probe_timeout)
+        if ok:
+            lg.info(f"hotcache-переключение удалось (rtt={rtt} мс)")
+            return "hotcache_ok"
+    return ""
+
+
+# ══════════════════════════════════════════ диспетчер режимов ═══
+_V2 = None
+
+
+def _v2():
+    """Ленивая загрузка бэкенда v2rayN (работа через базу/ядро v2rayN)."""
+    global _V2
+    if _V2 is None:
+        import clientwrite_v2rayn as _m
+        _V2 = _m
+    return _V2
+
+
+def _is_v2rayn_path(path: str) -> bool:
+    return bool(path) and os.path.basename(str(path)).lower().startswith("guinconfig")
+
+
+def _mode_of(client: dict = None, cfg: dict = None) -> str:
+    if client and client.get("mode"):
+        return str(client["mode"]).lower()
+    if cfg:
+        return str(cfg.get("client", {}).get("mode") or "standalone").lower()
+    return "standalone"
+
+
+def read_db_rows(db_path: str) -> list:
+    """Чтение серверов: .db -> SQLite v2rayN, иначе наш JSON-store."""
+    if str(db_path).lower().endswith(".db"):
+        return _v2().read_db_rows(db_path)
+    return _sa_read_db_rows(db_path)
+
+
+def write_auto_group(db_path: str, servers: list, update_stats: bool = True) -> int:
+    if str(db_path).lower().endswith(".db"):
+        return _v2().write_auto_group(db_path, servers, update_stats)
+    return _sa_write_auto_group(db_path, servers, update_stats)
+
+
+def read_active_id(cfg_path: str):
+    if _is_v2rayn_path(cfg_path):
+        return _v2().read_active_id(cfg_path)
+    return _sa_read_active_id(cfg_path)
+
+
+def write_active_id(cfg_path: str, index_id: str) -> None:
+    if _is_v2rayn_path(cfg_path):
+        return _v2().write_active_id(cfg_path, index_id)
+    return _sa_write_active_id(cfg_path, index_id)
+
+
+def write_bin_config(client: dict, server, cfg: dict) -> bool:
+    if _mode_of(client, cfg) == "v2rayn":
+        return _v2().write_bin_config(client, server, cfg)
+    return write_core_config(client, server, cfg)

@@ -1,0 +1,841 @@
+"""Единый процесс-супервизор FOREST's Proxy Auto-updater (GPL-3.0).
+
+Одна программа вместо трёх: внутри — потоки «сторож» (watch), «гвард»
+(guard), «обновление» (update) и «трей». Трей визуальный пока не реализован
+(следующий этап, Win32/ctypes) — вместо него поток следит за каналом
+состояния, см. ``tray.py``.
+
+Команды:
+  --install     раскладка в %LOCALAPPDATA%\\ForestProxyUpdater, ярлык,
+                автозапуск, первый цикл
+  --uninstall   снять всё и вернуть системный прокси в исходное состояние
+  --run         обычный запуск с треем (супервизор до остановки)
+  --once        один полный цикл подбора серверов
+  --guard       одна быстрая самопроверка/восстановление
+  --status      показать текущее состояние
+  --selftest    прогнать автотесты
+  --watch       только сторож (совместимость)
+  --dry-run     цикл без записи и запуска ядра
+  --auto        синоним --once
+"""
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import subprocess
+import sys
+import threading
+import time
+
+import clientwrite as CW
+import config as CFG
+import i18n
+import log
+
+APP_RUN_VALUE = "ForestProxyUpdater"
+
+
+def _no_window() -> int:
+    return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# ══════════════════════════════════════════ блокировка цикла ═══
+def _lock_path(cfg: dict) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], "lock.json")
+
+
+def acquire_lock(mode: str, stale_s: float = 4 * 3600, cfg: dict = None) -> bool:
+    c = cfg or CFG.load_config()
+    p = _lock_path(c)
+    try:
+        if os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                d = json.load(f)
+            if time.time() - d.get("ts", 0) < stale_s:
+                return False
+        with open(p, "w", encoding="utf-8") as f:
+            json.dump({"pid": os.getpid(), "mode": mode, "ts": time.time()}, f)
+        return True
+    except Exception:
+        return True
+
+
+def release_lock(cfg: dict = None):
+    c = cfg or CFG.load_config()
+    try:
+        os.unlink(_lock_path(c))
+    except Exception:
+        pass
+
+
+def _proc_exists(exe_path: str) -> bool:
+    name = os.path.basename(exe_path or "xray.exe")
+    try:
+        r = subprocess.run(["tasklist", "/FI", f"IMAGENAME eq {name}", "/FO", "CSV", "/NH"],
+                           capture_output=True, timeout=15, creationflags=_no_window())
+        return name.lower().encode() in (r.stdout or b"").lower()
+    except Exception:
+        return False
+
+
+# ══════════════════════════════════════════ полный цикл ═══
+def run_cycle(cfg: dict, dry: bool = False, force_discovery: bool = False) -> int:
+    lg = log.get_logger()
+    import parser as P
+    import sources as SRC
+    import xraytest as XT
+    import netfilters as NF
+
+    client = CFG.find_client(cfg)
+    if not client.get("core"):
+        lg.error("Ядро xray не найдено — цикл невозможен. Скачайте официальный "
+                 "релиз Xray-core и положите xray.exe в bin\\xray рядом с программой.")
+        return 2
+    CW.ensure_port_free(client, cfg)
+    lg.info("=" * 70)
+    lg.info(f"Цикл FOREST's Proxy Auto-updater | режим: {client.get('mode')} | "
+            f"ядро: {client.get('core')}")
+    lg.info(f"Порт клиента: {client.get('socks_port')} | стор: {client.get('db')}")
+
+    proxies = CFG.proxy_for_fetch(cfg)
+    st = CW.StateStore(cfg)
+    sm = SRC.SourceManager(cfg)
+
+    full_hours = float(cfg.get("cycle", {}).get("full_refresh_hours", 0.5))
+    last_full = st.data.get("last_full_refresh", 0)
+    force_full = force_discovery or (time.time() - last_full) >= full_hours * 3600
+    if force_full:
+        lg.info("ПОЛНЫЙ цикл: обновление списков (раз в %.0f ч)" % full_hours)
+    else:
+        lg.info("БЫСТРЫЙ цикл: только перетест имеющихся серверов")
+
+    cur_ok, cur_rtt = CW.probe_client(client, timeout=12)
+    cur_active = CW.read_active_id(client["cfg"])
+    lg.info(f"Текущий активный: {cur_active} | работает: {cur_ok} (rtt={cur_rtt} мс)")
+    if cur_ok:
+        st.data["last_ok"] = time.time()
+    if cur_active and cur_ok and not dry:
+        st.data["baseline_active"] = cur_active
+        st.save()
+
+    # --- 1. источники ---
+    changed = []
+    if force_full:
+        sm.discover_if_due(proxies, force=force_discovery or False)
+        lg.info(f"Источников в списке: {len(sm.data['sources'])}")
+        changed = sm.refresh(proxies)
+    changed += sm.refresh_fixed(proxies)
+
+    # --- 3. кандидаты ---
+    rows = CW.read_db_rows(client["db"])
+    pool = []
+    if changed:
+        for src, body in changed:
+            found = P.parse_batch(body, source=src["repo"])
+            lg.info(f"  {src['repo']}: распознано {len(found)} серверов")
+            pool += found
+    pool_user = []
+    for r in rows:
+        s = CW.row_to_server(r)
+        if s is not None:
+            s._is_auto = (r.get("Remarks") or "").startswith(CW.AUTO_TAG)
+            s._row_index_id = str(r["IndexId"])
+            pool_user.append(s)
+    known_ids = {s.index_id for s in pool_user}
+    pool = pool_user + [s for s in pool if s.index_id not in known_ids]
+    pool = P.dedupe(pool)
+
+    cap_pre = int(cfg["test"].get("max_candidates", 400))
+    if len(pool) < cap_pre:
+        lg.warn(f"Пул кандидатов мал ({len(pool)} < {cap_pre}) — добираю из кэша")
+        try:
+            extra = list(_load_pool_cache(cfg))
+            for name, body in sm.load_bodies():
+                extra += P.parse_batch(body, source=name)
+            have = {s.index_id for s in pool}
+            extra = [s for s in extra if s.index_id not in have]
+            extra = P.dedupe(extra)
+            import random as _rnd
+            _rnd.shuffle(extra)
+            pool = pool + extra[:max(0, cap_pre - len(pool))]
+            lg.info(f"  добрано кандидатов из кэша: {len(pool) - len(pool_user)}")
+        except Exception as e:
+            lg.warn(f"  добор из кэша не удался: {e}")
+
+    cap = int(cfg["test"].get("max_candidates", 400))
+    if len(pool) > cap:
+        import random as _rnd
+        keep_user = pool_user[:cap]
+        keep_ids = {id(s) for s in keep_user}
+        rest = [s for s in pool if id(s) not in keep_ids]
+        prio_kw = ("rjsxrd", "pawdroid", "fixed")
+        prio = [s for s in rest
+                if any(k in (getattr(s, "source", "") or "").lower() for k in prio_kw)]
+        prio_ids = {id(x) for x in prio}
+        other = [s for s in rest if id(s) not in prio_ids]
+        _rnd.shuffle(other)
+        room = max(0, cap - len(keep_user))
+        take_prio = prio[:room]
+        pool = keep_user + take_prio + other[:max(0, room - len(take_prio))]
+        lg.warn(f"Кандидатов > {cap}; взято {len(pool)}")
+    lg.info(f"Кандидатов на тест: {len(pool)}")
+    try:
+        _save_pool_cache(cfg, pool)
+    except Exception as e:
+        lg.warn(f"  pool cache save: {e}")
+
+    if not pool:
+        lg.error("Нет ни одного кандидата (источники пусты/не парсятся)")
+        return 0 if cur_ok else 1
+
+    # --- 4. фильтр Cloudflare + тесты ---
+    try:
+        before_cf = len(pool)
+        pool, cf_drop = NF.drop_cloudflare(pool, cfg)
+        if cf_drop:
+            lg.info(f"Исключено Cloudflare-узлов: {len(cf_drop)} "
+                    f"(осталось {len(pool)} из {before_cf})")
+    except Exception as _e:
+        lg.warn(f"Фильтр Cloudflare не сработал: {_e}")
+    healthy = XT.run_tests(pool, cfg, client["core"])
+    if not healthy:
+        reserve = [s for s in (getattr(XT, "LAST_RTT_OK", []) or [])
+                   if getattr(s, "rtt_ms", 0)
+                   and s.rtt_ms <= float(cfg["test"].get("max_rtt_ms", 1500))]
+        reserve.sort(key=lambda s: s.rtt_ms)
+        if reserve:
+            lg.warn(f"Строгий отбор пуст — резерв по RTT: {len(reserve)} серверов")
+            healthy = _reserve_with_speed_check(reserve, cfg, client["core"], lg)
+        else:
+            lg.error("Рабочих серверов не найдено (и резерва по RTT нет)")
+            return 1
+
+    top10 = sorted([s for s in healthy if not getattr(s, "_reserve", False)],
+                   key=lambda s: s.rtt_ms)[:10]
+    if top10:
+        lg.info("Повторный RTT топ-10 (стабильность)...")
+        XT.retest_rtt(top10, cfg, client["core"])
+    healthy = [s for s in healthy if s.ok]
+    ranked = XT.best_ranked(healthy, int(cfg["limits"]["max_servers"]))
+    try:
+        filtered = CW.bl_filter(cfg, ranked)
+        if filtered:
+            ranked = filtered
+    except Exception as e:
+        lg.warn(f"bl_filter: {e}")
+
+    reserve_min = int(cfg["test"].get("reserve_min", 12))
+    if len(ranked) < reserve_min:
+        have = {s.index_id for s in ranked}
+        max_rtt = float(cfg["test"].get("max_rtt_ms", 1500))
+        added = 0
+        for s in list(getattr(XT, "LAST_RTT_OK", []) or []):
+            if len(ranked) >= reserve_min:
+                break
+            if s.index_id in have or not getattr(s, "rtt_ms", 0) or s.rtt_ms > max_rtt:
+                continue
+            s._reserve = True
+            s.ok = True
+            have.add(s.index_id)
+            ranked.append(s)
+            added += 1
+        if added:
+            lg.warn(f"Добавлен резерв по RTT: +{added} (итого {len(ranked)})")
+
+    # --- кап по подсетям ---
+    try:
+        _cap = int(cfg.get("diversity", {}).get("per_subnet_cap", 1) or 0)
+        _floor = int(cfg.get("diversity", {}).get("min_pool_after_cap", 12) or 0)
+        _maxcap = int(cfg.get("diversity", {}).get("max_cap_relax", 4) or 0)
+        before = len(ranked)
+        capped, used = NF.pick_diverse_floor(ranked, int(cfg["limits"]["max_servers"]),
+                                             cap=_cap, floor=_floor,
+                                             max_cap=max(_maxcap, _cap))
+        if capped:
+            ranked = capped
+        if used != _cap:
+            lg.warn(f"Страховка пула: кап по подсетям ослаблен {_cap} -> {used}; "
+                    f"итог {len(ranked)} серверов")
+        if len(ranked) != before:
+            lg.info(f"Разнообразие пула: {len(ranked)} из {before} "
+                    f"(подсетей {len(NF.subnet_stats(ranked))}, кап {used})")
+    except Exception as _e:
+        lg.warn(f"Кап по подсетям не сработал: {_e}")
+
+    lg.info("Топ-10 по скорости:")
+    for i, s in enumerate(ranked[:10]):
+        lg.info(f"  #{i+1} {s.summary()} | rtt={s.rtt_ms:.0f} мс "
+                f"| speed={s.speed_kbps/1024:.1f} МБ/с")
+
+    try:
+        CW.update_hotcache(client, cfg, ranked)
+    except Exception as e:
+        lg.warn(f"update_hotcache: {e}")
+
+    # --- 5. выбор активного ---
+    def eff(s):
+        return getattr(s, "_row_index_id", None) or s.index_id
+
+    top1 = ranked[0]
+    cur_srv_obj = next((s for s in pool if eff(s) == str(cur_active)), None)
+    keep_current = False
+    if cur_ok and cur_srv_obj is not None and cur_srv_obj.ok:
+        prefer = bool(cfg.get("activation", {}).get("prefer_current_if_healthy", True))
+        better = (top1.speed_kbps > cur_srv_obj.speed_kbps * 1.3) or \
+                 (top1.rtt_ms < cur_srv_obj.rtt_ms * 0.75)
+        keep_current = prefer and not better
+        if keep_current:
+            lg.info("Текущий сервер здоров и конкурентен — оставляю его активным")
+    active_id = str(cur_active) if (keep_current and cur_active) else eff(top1)
+
+    auto_servers = []
+    for s in ranked:
+        if getattr(s, "_is_auto", False) or not hasattr(s, "_row_index_id"):
+            auto_servers.append(s)
+    new_auto_ids = {s.index_id for s in auto_servers}
+    old_auto_ids = {str(r["IndexId"]) for r in rows
+                    if (r.get("Remarks") or "").startswith(CW.AUTO_TAG)}
+    need_write = new_auto_ids != old_auto_ids
+    if cur_active is not None and active_id != str(cur_active):
+        need_write = True
+    if dry:
+        lg.info("[dry-run] Будет записано [AUTO]-серверов: %d, активный: %s"
+                % (len(auto_servers), active_id))
+        return 0
+    if not need_write:
+        lg.info("Изменений нет — запись и перезапуск не требуются")
+        return 0
+
+    if CW.proxy_off(cfg):
+        try:
+            n_w = CW.write_auto_group(client["db"], auto_servers, update_stats=True)
+            lg.warn(f"Прокси выключен вручную — активация пропущена (записано {n_w})")
+        except Exception as e:
+            lg.warn(f"Прокси выключен вручную — активация пропущена ({e})")
+        return 0
+
+    lg.info("Пишу стор и активирую (режим балансировщика)...")
+    active_server = next((s for s in ranked if eff(s) == active_id), ranked[0])
+    res = CW.activate(client, auto_servers, active_id, cfg,
+                      active_server=active_server, update_stats=True)
+    if res["ok"]:
+        lg.info(f"Активация завершена: {res['msg']} (rtt={res.get('rtt')} мс)")
+        st.data["last_active"] = active_id
+        st.data["last_cycle"] = time.time()
+        if force_full:
+            st.data["last_full_refresh"] = time.time()
+        st.save()
+        _write_sub_file(ranked, cfg)
+        return 0
+    lg.error(f"Активация НЕ удалась: {res['msg']}")
+    return 1
+
+
+def _pool_cache_path(cfg: dict) -> str:
+    return os.path.join(cfg["paths"]["state_dir"], "pool_cache.json")
+
+
+def _load_pool_cache_raw(p: str) -> list:
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        return [x for x in d if isinstance(x, str)]
+    except Exception:
+        return []
+
+
+def _save_pool_cache(cfg: dict, servers: list, max_links: int = 4000):
+    import parser as P
+    p = _pool_cache_path(cfg)
+    old = _load_pool_cache_raw(p)
+    seen = set(old)
+    fresh = []
+    for s in servers:
+        try:
+            l = P.to_share_link(s)
+        except Exception:
+            l = None
+        if l and l not in seen:
+            seen.add(l)
+            fresh.append(l)
+    merged = (fresh + old)[:max_links]
+    tmp = p + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(merged, f, ensure_ascii=False)
+    os.replace(tmp, p)
+
+
+def _load_pool_cache(cfg: dict) -> list:
+    import parser as P
+    links = _load_pool_cache_raw(_pool_cache_path(cfg))
+    if not links:
+        return []
+    try:
+        return P.parse_batch("\n".join(links), source="pool-cache")
+    except Exception:
+        return []
+
+
+def _write_sub_file(ranked: list, cfg: dict):
+    """Пишет state/subscription_base64.txt (для импорта в любой клиент)."""
+    import base64
+    import parser as P
+    lines = [P.to_share_link(s) for s in ranked]
+    text = "\n".join(l for l in lines if l)
+    p = os.path.join(cfg["paths"]["state_dir"], "subscription_base64.txt")
+    try:
+        with open(p, "w", encoding="utf-8") as f:
+            f.write(base64.b64encode(text.encode("utf-8")).decode())
+        log.get_logger().info(f"Подписка для ручного импорта: {p} ({len(ranked)} серверов)")
+    except Exception as e:
+        log.get_logger().warn(f"_write_sub_file: {e}")
+
+
+def _reserve_with_speed_check(reserve: list, cfg: dict, core: str, lg) -> list:
+    """Резерв по RTT без измеренной скорости активировать нельзя — меряем скорость."""
+    import xraytest as XT
+    try:
+        import netfilters as NF
+    except Exception:
+        NF = None
+    max_srv = int(cfg["limits"]["max_servers"])
+    try:
+        cap = int(cfg.get("diversity", {}).get("per_subnet_cap", 1) or 0)
+        try_n = int(cfg["test"].get("reserve_verify", 20))
+        cand = NF.pick_diverse(reserve, max(try_n, max_srv), cap=cap)
+        lg.warn(f"Резерв: проверяю скорость у {len(cand)} узлов...")
+        good = XT.verify_speed(cand, cfg, core)
+        out = good[:max_srv] if good else reserve[:max_srv]
+        if not good:
+            lg.warn("Резерв: скорость не подтвердилась — беру по RTT (крайний случай)")
+    except Exception as e:
+        lg.warn(f"Проверка скорости резерва не удалась ({e}) — беру по RTT")
+        out = reserve[:max_srv]
+    for s in out:
+        s.ok = True
+        s._reserve = True
+    return out
+
+
+# ══════════════════════════════════════════ гвард ═══
+def run_guard(cfg: dict) -> int:
+    lg = log.get_logger()
+    try:
+        import clientwrite as _CW
+        if _CW.proxy_off(cfg):
+            lg.info("Guard: прокси выключен вручную — ничего не поднимаю")
+            return 0
+    except Exception:
+        pass
+    client = CFG.find_client(cfg)
+    if not client.get("core"):
+        lg.error("Guard: ядро xray не найдено")
+        return 2
+    bal = bool(cfg.get("watch", {}).get("balancer_mode", False))
+    if bal:
+        try:
+            if CW.ensure_balancer(client, cfg, n=int(cfg["watch"].get("balancer_pool_n", 10))):
+                ok_b, _rtt = CW.probe_client(client, timeout=6, strict=False)
+                if ok_b:
+                    return 0
+        except Exception as e:
+            lg.error(f"Guard: ensure_balancer: {e}")
+    else:
+        CW.ensure_port_free(client, cfg)
+        ok, _rtt = CW.probe_client(client, timeout=6)
+        if ok:
+            return 0
+    if not acquire_lock("guard", stale_s=10 * 60, cfg=cfg):
+        lg.warn("Guard: уже идёт другой цикл, пропускаю")
+        return 0
+    try:
+        if bal:
+            try:
+                if CW.ensure_balancer(client, cfg,
+                                      n=int(cfg["watch"].get("balancer_pool_n", 10)),
+                                      force=True):
+                    ok_b, rtt_b = CW.probe_client(client, timeout=8, strict=False)
+                    if ok_b:
+                        lg.info(f"Guard OK: балансировщик дал связь (rtt={rtt_b} мс)")
+                        return 0
+            except Exception as e:
+                lg.error(f"Guard: ensure_balancer: {e}")
+        res = CW.guard_cycle(client, cfg)
+    finally:
+        release_lock(cfg)
+    if res:
+        return 0
+    lg.warn("Guard: не помогло -> полный цикл")
+    try:
+        r2 = run_cycle(cfg, dry=False, force_discovery=False)
+        if r2 == 0:
+            ok9, rtt9 = CW.probe_client(client, timeout=8)
+            if ok9:
+                lg.info(f"Guard: полный цикл восстановил связь (rtt={rtt9} мс)")
+                return 0
+    except Exception as e:
+        lg.error(f"Guard: экстренный цикл не удался: {e}")
+    lg.error("Guard: связь не восстановлена")
+    return 1
+
+
+# ══════════════════════════════════════════ супервизор ═══
+def _guard_loop(cfg: dict, stop: threading.Event):
+    lg = log.get_logger()
+    while not stop.is_set():
+        try:
+            run_guard(cfg)
+        except Exception as e:
+            lg.error(f"supervisor: guard исключение: {e}")
+        stop.wait(300)
+
+
+def _update_loop(cfg: dict, stop: threading.Event):
+    lg = log.get_logger()
+    if os.environ.get("FOREST_NO_CYCLE"):
+        lg.info("supervisor: цикл обновления отключён (FOREST_NO_CYCLE)")
+        return
+    while not stop.is_set():
+        try:
+            if acquire_lock("cycle", stale_s=3 * 3600, cfg=cfg):
+                try:
+                    run_cycle(cfg, dry=False)
+                finally:
+                    release_lock(cfg)
+            else:
+                lg.warn("supervisor: другой цикл уже выполняется — пропускаю")
+        except Exception as e:
+            lg.error(f"supervisor: цикл исключение: {e}")
+        stop.wait(30 * 60)
+
+
+def run_supervisor(cfg: dict) -> int:
+    """Один процесс: сторож + гвард + обновление + трей (до остановки)."""
+    import watch
+    import tray
+    lg = log.get_logger()
+    client = CFG.find_client(cfg)
+    if not client.get("core"):
+        lg.error("Ядро xray не найдено. Положите bin\\xray\\xray.exe рядом с "
+                 "программой или установите xray в PATH.")
+    stop = threading.Event()
+
+    def _full_cycle():
+        if os.environ.get("FOREST_NO_CYCLE"):
+            return
+        if acquire_lock("cycle", stale_s=40 * 60, cfg=cfg):
+            try:
+                run_cycle(cfg, dry=False)
+            finally:
+                release_lock(cfg)
+
+    threads = [
+        threading.Thread(target=watch.run_watch, name="watch",
+                         args=(cfg,), kwargs={"stop_event": stop,
+                                              "full_cycle": _full_cycle}, daemon=True),
+        threading.Thread(target=_guard_loop, name="guard", args=(cfg, stop), daemon=True),
+        threading.Thread(target=_update_loop, name="update", args=(cfg, stop), daemon=True),
+        threading.Thread(target=tray.run_tray, name="tray", args=(cfg, stop), daemon=True),
+    ]
+    for t in threads:
+        t.start()
+    lg.info("Супервизор запущен: потоки watch/guard/update/tray")
+
+    # ограничение времени работы (для автотестов и демонстраций)
+    run_s = os.environ.get("FOREST_RUN_SECONDS")
+    stop_file = os.path.join(cfg["paths"]["state_dir"], "stop.flag")
+    try:
+        if run_s:
+            deadline = time.time() + float(run_s)
+            while time.time() < deadline and not stop.is_set():
+                if os.path.isfile(stop_file):
+                    break
+                time.sleep(0.5)
+        else:
+            while not stop.is_set():
+                if os.path.isfile(stop_file):
+                    break
+                time.sleep(1)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        stop.set()
+        for t in threads:
+            t.join(timeout=5)
+        try:
+            CW.stop_core(cfg, why="supervisor-stop")
+        except Exception:
+            pass
+        lg.info("Супервизор остановлен")
+    return 0
+
+
+# ══════════════════════════════════════════ установка / удаление ═══
+def _shortcut_dir() -> str:
+    d = os.environ.get("FOREST_SHORTCUT_DIR")
+    if d:
+        return d
+    appdata = os.environ.get("APPDATA") or os.path.expanduser("~")
+    return os.path.join(appdata, "Microsoft", "Windows", "Start Menu", "Programs")
+
+
+def _run_value_name() -> str:
+    return os.environ.get("FOREST_RUN_VALUE", APP_RUN_VALUE)
+
+
+def _pythonw() -> str:
+    py = sys.executable
+    if os.path.basename(py).lower() == "python.exe":
+        alt = os.path.join(os.path.dirname(py), "pythonw.exe")
+        if os.path.isfile(alt):
+            return alt
+    return py
+
+
+def _create_shortcut(target: str, args: str, workdir: str, lnk_path: str) -> bool:
+    os.makedirs(os.path.dirname(lnk_path), exist_ok=True)
+    ps = (
+        "$w = New-Object -ComObject WScript.Shell; "
+        f"$s = $w.CreateShortcut('{lnk_path}'); "
+        f"$s.TargetPath = '{target}'; "
+        f"$s.Arguments = '{args}'; "
+        f"$s.WorkingDirectory = '{workdir}'; "
+        "$s.Description = \"FOREST's Proxy Auto-updater\"; "
+        "$s.Save()"
+    )
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=40, text=True, errors="replace",
+                           creationflags=_no_window())
+        return r.returncode == 0 and os.path.isfile(lnk_path)
+    except Exception:
+        return False
+
+
+def _set_autostart(cmd: str) -> bool:
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Run",
+                           0, winreg.KEY_SET_VALUE)
+        winreg.SetValueEx(k, _run_value_name(), 0, winreg.REG_SZ, cmd)
+        winreg.CloseKey(k)
+        return True
+    except Exception:
+        return False
+
+
+def _remove_autostart() -> bool:
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Run",
+                           0, winreg.KEY_SET_VALUE)
+        try:
+            winreg.DeleteValue(k, _run_value_name())
+        except FileNotFoundError:
+            pass
+        winreg.CloseKey(k)
+        return True
+    except Exception:
+        return False
+
+
+def install(cfg: dict) -> int:
+    lg = log.get_logger()
+    root = cfg["paths"]["root"]
+    src_dir = os.path.join(root, "src")
+    lg.info(f"Установка в {root}")
+    os.makedirs(src_dir, exist_ok=True)
+    # 1. раскладка кода
+    code_dir = os.path.dirname(os.path.abspath(__file__))
+    copied = 0
+    for fn in os.listdir(code_dir):
+        if fn.endswith(".py"):
+            try:
+                shutil.copy2(os.path.join(code_dir, fn), os.path.join(src_dir, fn))
+                copied += 1
+            except Exception as e:
+                lg.warn(f"  копирование {fn}: {e}")
+    for extra in ("LICENSE", "README.md", "README.ru.md", "config.example.json"):
+        p = os.path.join(os.path.dirname(code_dir), extra)
+        if os.path.isfile(p):
+            try:
+                shutil.copy2(p, os.path.join(root, extra))
+            except Exception:
+                pass
+    lg.info(f"  файлов программы скопировано: {copied} -> {src_dir}")
+
+    # 2. конфиг (первый запуск)
+    conf = os.path.join(root, "config.json")
+    if not os.path.isfile(conf):
+        try:
+            shutil.copy2(os.path.join(root, "config.example.json"), conf)
+            lg.info(f"  конфиг создан: {conf}")
+        except Exception as e:
+            lg.warn(f"  конфиг не создан: {e}")
+
+    # 3. ярлык + автозапуск
+    pyw = _pythonw()
+    entry = os.path.join(src_dir, "v2ray_updater.py")
+    lnk = os.path.join(_shortcut_dir(), f"{APP_RUN_VALUE}.lnk")
+    ok_lnk = _create_shortcut(pyw, f'"{entry}" --run', root, lnk)
+    ok_auto = _set_autostart(f'"{pyw}" "{entry}" --run')
+    lg.info(f"  ярлык: {'создан' if ok_lnk else 'НЕ создан'} ({lnk})")
+    lg.info(f"  автозапуск (HKCU\\...\\Run\\{_run_value_name()}): "
+            f"{'включён' if ok_auto else 'НЕ включён'}")
+
+    # 4. первый цикл (системный прокси на этом шаге НЕ трогается)
+    if not os.environ.get("FOREST_SKIP_FIRST_CYCLE"):
+        lg.info("  первый цикл (системный прокси не изменяется)...")
+        try:
+            run_cycle(cfg, dry=False)
+        except Exception as e:
+            lg.warn(f"  первый цикл: {e}")
+    print(i18n.t("install.done"))
+    print(i18n.t("install.proxy_note"))
+    return 0
+
+
+def uninstall(cfg: dict) -> int:
+    lg = log.get_logger()
+    root = cfg["paths"]["root"]
+    lg.info(f"Удаление из {root}")
+    # 1. остановить наше ядро (только наше)
+    try:
+        CW.stop_core(cfg, why="uninstall")
+    except Exception:
+        pass
+    # 2. вернуть системный прокси в исходное состояние
+    try:
+        CW.restore_system_proxy(cfg)
+    except Exception as e:
+        lg.warn(f"  восстановление прокси: {e}")
+    # 3. снять автозапуск и ярлык
+    _remove_autostart()
+    lnk = os.path.join(_shortcut_dir(), f"{APP_RUN_VALUE}.lnk")
+    try:
+        if os.path.isfile(lnk):
+            os.unlink(lnk)
+            lg.info(f"  ярлык удалён: {lnk}")
+    except Exception as e:
+        lg.warn(f"  ярлык: {e}")
+    # 4. убрать файлы программы
+    # закрыть свой лог-файл: иначе он держит каталог и rmtree не удалит logs/
+    try:
+        log.get_logger().close()
+    except Exception:
+        pass
+    try:
+        if os.path.isdir(root):
+            shutil.rmtree(root, ignore_errors=True)
+            if os.path.isdir(root):
+                lg.warn(f"  каталог частично остался (файлы заняты): {root}")
+            else:
+                lg.info(f"  каталог удалён: {root}")
+    except Exception as e:
+        lg.warn(f"  каталог: {e}")
+    print(i18n.t("install.uninstalled"))
+    print(i18n.t("install.proxy_note"))
+    return 0
+
+
+# ══════════════════════════════════════════ статус ═══
+def show_status(cfg: dict) -> int:
+    client = CFG.find_client(cfg)
+    st = CW.StateStore(cfg)
+    pool_n = int(st.data.get("balancer_n", 0) or 0)
+    core = client.get("core")
+    core_run = CFG.core_running(cfg)
+    en, srv = CW._sys_proxy_state()
+    port = int(client.get("socks_port", 10808))
+    link = ""
+    if core_run and CW.port_listening(port, timeout=0.5):
+        ok, rtt = CW.probe_client(client, timeout=6, strict=False)
+        link = (i18n.t("status.link_ok") + f" (rtt={rtt} мс)") if ok else i18n.t("status.link_down")
+    print("=" * 60)
+    print(f"{i18n.t('app.name')} — {i18n.t('status.title')}")
+    print("=" * 60)
+    print(f"{i18n.t('status.mode')}: {client.get('mode')}")
+    print(f"{i18n.t('status.core')}: {core or i18n.t('status.core_missing')}")
+    if core_run:
+        print(f"{i18n.t('status.core_running')}: {CFG.core_pid_path(cfg)} -> да")
+    else:
+        print(i18n.t("status.core_stopped"))
+    print(f"{i18n.t('status.pool')}: {pool_n}")
+    print(f"{i18n.t('status.proxy')}: "
+          f"{i18n.t('status.proxy_on') + ' ' + srv if en else i18n.t('status.proxy_off')}")
+    if link:
+        print(f"{i18n.t('status.link')}: {link}")
+    print(f"config: {cfg.get('_config_path')}")
+    print(f"root:   {cfg['paths']['root']}")
+    return 0
+
+
+def run_selftest() -> int:
+    import selftest
+    return selftest.main()
+
+
+# ══════════════════════════════════════════ main ═══
+def main(argv=None) -> int:
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, "w")
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, "w")
+
+    ap = argparse.ArgumentParser(description="FOREST's Proxy Auto-updater")
+    ap.add_argument("--install", action="store_true")
+    ap.add_argument("--uninstall", action="store_true")
+    ap.add_argument("--run", action="store_true", help="супервизор с треем")
+    ap.add_argument("--once", action="store_true", help="один полный цикл")
+    ap.add_argument("--guard", action="store_true", help="одна самопроверка")
+    ap.add_argument("--status", action="store_true")
+    ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--watch", action="store_true", help="только сторож")
+    ap.add_argument("--auto", action="store_true", help="синоним --once")
+    ap.add_argument("--dry-run", action="store_true")
+    ap.add_argument("--config", default=None, help="путь к config.json")
+    args = ap.parse_args(argv)
+
+    # --selftest обрабатываем ДО загрузки конфига: тест сам задаёт свой
+    # временный корень и не должен создавать рабочий каталог программы.
+    if args.selftest:
+        return run_selftest()
+
+    cfg = CFG.load_config(args.config)
+    log.reset_logger(cfg["paths"]["log_dir"])
+    i18n.set_lang(i18n.detect_lang(cfg))
+    lg = log.get_logger()
+    lg.info("Запуск FOREST's Proxy Auto-updater (аргументы: %s)"
+            % " ".join(a for a in (argv if argv is not None else sys.argv[1:])))
+
+    if args.install:
+        return install(cfg)
+    if args.uninstall:
+        return uninstall(cfg)
+    if args.status:
+        return show_status(cfg)
+    if args.guard:
+        return run_guard(cfg)
+    if args.watch:
+        import watch
+        return watch.main()
+    if args.run:
+        return run_supervisor(cfg)
+    if args.once or args.auto or args.dry_run:
+        if not acquire_lock("cycle", stale_s=3 * 3600, cfg=cfg):
+            lg.warn("Другой цикл уже выполняется — выход")
+            return 0
+        try:
+            return run_cycle(cfg, dry=args.dry_run)
+        finally:
+            release_lock(cfg)
+    ap.print_help()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

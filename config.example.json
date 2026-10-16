@@ -1,0 +1,150 @@
+{
+  "ui": {
+    "lang": ""
+  },
+  "client": {
+    "mode": "standalone",
+    "socks_port": 10808,
+    "torrent_port": 10820,
+    "listen": "127.0.0.1",
+    "manage_system_proxy": true,
+    "core": "",
+    "dir": "",
+    "exe": "v2rayN.exe",
+    "db_rel": "guiConfigs/guiNDB.db",
+    "cfg_rel": "guiConfigs/guiNConfig.json",
+    "core_rel": "bin/xray/xray.exe"
+  },
+  "cycle": {
+    "full_refresh_hours": 0.5
+  },
+  "test": {
+    "port_start": 10810,
+    "workers": 8,
+    "rtt_timeout": 6,
+    "rtt_repeats": 2,
+    "speed_timeout": 15,
+    "speed_bytes": 5242880,
+    "min_speed_kbps": 1000,
+    "max_rtt_ms": 1500,
+    "max_jitter_ms": 800,
+    "top_for_speed": 60,
+    "max_candidates": 400,
+    "tcp_prefilter": true,
+    "final_verify_top": 60,
+    "min_pool": 60,
+    "reserve_min": 30,
+    "speed_rounds": 1,
+    "gate_urls": [],
+    "reserve_verify": 20
+  },
+  "sources": {
+    "search_queries": [
+      "v2ray free subscription",
+      "free v2ray servers updated",
+      "free v2ray nodes github"
+    ],
+    "seed_repos": [
+      "Pawdroid/Free-servers",
+      "ebrasha/free-v2ray-public-list",
+      "licheng527/Free-servers"
+    ],
+    "known_files": [
+      "sub",
+      "sub.txt",
+      "v2ray",
+      "v2ray.txt",
+      "xray",
+      "config/v2ray.txt",
+      "config/v2ray",
+      "freeservers/v2ray",
+      "V2Ray-Config-By-EbraSha-All-Type.txt",
+      "V2Ray-Config-By-EbraSha.txt",
+      "all_extracted_configs.txt",
+      "vless_configs.txt",
+      "vmess_configs.txt"
+    ],
+    "stale_days": 30,
+    "rediscover_hours": 12,
+    "fixed_urls": [
+      {
+        "name": "rjsxrd-bypass",
+        "url": "https://raw.githubusercontent.com/whoahaow/rjsxrd/refs/heads/main/githubmirror/bypass/bypass-all.txt",
+        "every_minutes": 30
+      },
+      {
+        "name": "pawdroid-freeservers",
+        "url": "https://raw.githubusercontent.com/Pawdroid/Free-servers/main/sub",
+        "every_minutes": 30
+      },
+      {
+        "name": "ebrasha-free-v2ray",
+        "url": "https://raw.githubusercontent.com/ebrasha/free-v2ray-public-list/main/V2Ray-Config-By-EbraSha-All-Type.txt",
+        "every_minutes": 60
+      },
+      {
+        "name": "epodonios-v2ray-configs",
+        "url": "https://raw.githubusercontent.com/Epodonios/v2ray-configs/main/All_Configs_Sub.txt",
+        "every_minutes": 30
+      },
+      {
+        "name": "ermaozi-get-subscribe",
+        "url": "https://raw.githubusercontent.com/ermaozi/get_subscribe/main/subscribe/v2ray.txt",
+        "every_minutes": 30
+      },
+      {
+        "name": "peasoft-nomorewalls",
+        "url": "https://raw.githubusercontent.com/peasoft/NoMoreWalls/master/list.txt",
+        "every_minutes": 30
+      },
+      {
+        "name": "aliiLAPRO-v2rayNG",
+        "url": "https://raw.githubusercontent.com/ALIILAPRO/v2rayNG-Config/main/server.txt",
+        "every_minutes": 60
+      },
+      {
+        "name": "roosterkid-openproxylist",
+        "url": "https://raw.githubusercontent.com/roosterkid/openproxylist/main/V2RAY_RAW.txt",
+        "every_minutes": 60
+      },
+      {
+        "name": "ts-sf-free-nodes",
+        "url": "https://raw.githubusercontent.com/ts-sf/fly/main/v2",
+        "every_minutes": 60
+      }
+    ]
+  },
+  "limits": {
+    "max_servers": 100
+  },
+  "activation": {
+    "prefer_current_if_healthy": true,
+    "max_restart_wait_s": 40
+  },
+  "watch": {
+    "check_interval_s": 10,
+    "probe_timeout_s": 4,
+    "max_strikes": 3,
+    "hotcache_n": 20,
+    "hotcache_ttl_s": 3600,
+    "speed_min_kbps": 1500,
+    "speed_check_every_s": 300,
+    "balancer_pool_n": 10,
+    "pool_refresh_s": 600,
+    "balancer_mode": true,
+    "probe_retries": 2,
+    "strict_check_every_s": 300,
+    "ru_direct": false,
+    "pool_freeze_s": 10800,
+    "min_speed_kbps": 200,
+    "youtube_check_every_s": 300
+  },
+  "diversity": {
+    "per_subnet_cap": 1,
+    "min_pool_after_cap": 12,
+    "max_cap_relax": 4
+  },
+  "blacklist": {
+    "cloudflare_nodes": true
+  }
+}
