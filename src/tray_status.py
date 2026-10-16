@@ -1,3 +1,10 @@
+# FOREST's Proxy Auto-updater
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+# This program is free software: you can redistribute it and/or modify it
+# under the terms of the GNU General Public License as published by the Free
+# Software Foundation, either version 3 of the License, or (at your option)
+# any later version. See LICENSE or <https://www.gnu.org/licenses/gpl-3.0.html>.
 # -*- coding: utf-8 -*-
 """Канал «скрипт -> значок трея»: одно состояние + текущий процесс.
 
