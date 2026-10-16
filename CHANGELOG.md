@@ -4,6 +4,63 @@ All notable changes to **FOREST's Proxy Auto-updater** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- **Installer wrote a broken launch command.** `--install` used to register the
+  Start Menu shortcut and the autostart entry as `pythonw.exe "<dev
+  folder>\src\v2ray_updater.py" --run`, so clicking the shortcut or rebooting
+  produced a modal error window. `--install` now **copies the product `.exe`
+  into the install directory** (`%LOCALAPPDATA%\ForestProxyUpdater\
+  ForestProxyUpdater.exe`) and registers exactly
+  `"<install dir>\ForestProxyUpdater.exe" --run` — no extra script argument and
+  no dependency on the folder the archive was unpacked into. Both the shortcut
+  and the registry value are read back and compared right after being written
+  (the result is logged). `--uninstall` now also removes the installed `.exe`
+  (deferring to a cleanup script when `--uninstall` runs from that very `.exe`,
+  which Windows will not let a process delete).
+- **State file lost keys written by another writer.** `StateStore.save()`
+  replaced the whole file from its own in-memory snapshot, so the pool
+  fingerprint, its hash and the freeze timestamp written while the balancer was
+  raised were wiped by the cycle's final save — the pool freeze and the
+  "unchanged pool" fast path silently stopped working. Saves now merge with what
+  is on disk (keys are never dropped).
+- **Orphan cores were never reaped.** The "our core" lookup matched the literal
+  `forest_xray.json`, while the config actually used is
+  `state/xray_config.json`; a leftover core could keep holding the client port.
+  The lookup now matches our own state directory.
+
+### Changed
+
+- **Seamless core switching.** The new core config is validated **before** the
+  running core is stopped (`xray run -test -config <file>`; automatic fallback
+  to the old "start on free ports" check if a core build does not support
+  `-test`), so a broken config can no longer take the link down. The live config
+  file is only replaced after it passes.
+- The core is **not restarted when nothing changed**: the pool fingerprint
+  (`balancer_sig`) and the hash of the config the running core actually uses
+  (`balancer_cfg_sha`) are compared first; an identical config or a frozen pool
+  (`watch.pool_freeze_s`) means no restart at all, even for `force=True`.
+- Restart is now measured: the log gets the actual **link gap in milliseconds**
+  (from stopping the old core to the new one accepting the client port, plus the
+  time until data is confirmed). The fixed 300 ms sleep after stopping the core
+  is gone — the new process starts immediately and the port is polled for
+  release.
+- Faster restart path (the measured gap drops from ~0.9–1.1 s to ~0.2 s):
+  stopping uses `TerminateProcess` (no `taskkill.exe` spawn), the orphan sweep
+  (a ~0.4 s PowerShell query) only runs when there was no live core to stop, the
+  port is polled in 10–50 ms steps, and the balancer no longer re-probes a link
+  that the restart already confirmed.
+- `start_core` verifies that the new core process is still alive after the port
+  comes up, so a foreign/orphan process holding the port is not mistaken for a
+  healthy core.
+- `--install` now reports a first cycle that found no live servers (the install
+  itself is complete; the watchdog keeps retrying and raises the link as soon as
+  usable nodes appear) instead of staying silent about it.
+- The single-server activation path and the guard failover path validate their
+  configs before touching the live one as well.
+
 ## [1.0.0] — 2026
 
 First public release.

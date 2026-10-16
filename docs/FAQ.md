@@ -131,10 +131,9 @@ explicit `client.core` path, `bin\xray\xray.exe` next to the program, then
 `xray.exe` in `PATH`.
 
 - Download the official core from
-  [XTLS/Xray-core releases](https://github.com/XTLS/Xray-core/releases) and put
-  `xray.exe` (and the `geoip.dat` / `geosite.dat` files) into a `bin\xray\`
-  folder next to the `.exe`, then run `--once` again.
-- If the core starts and immediately exits, see `state\forest_xray.log` — the
+> Since 1.0.1 **you do not need to download the core**: the `.exe` already
+> contains Xray and both geo databases. Put your own `bin\xray\` beside the
+> `.exe` only if you want to override or update the core — that copy wins.
   most common cause is an invalid server config, but the program validates the
   config before switching, so this is rare.
 

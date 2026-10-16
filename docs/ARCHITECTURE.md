@@ -94,11 +94,25 @@ does not break the connection. Routing rules: local names → direct, `torrent-i
 Only servers with a non-empty password/ID enter the pool (an empty one produces
 an invalid outbound that would break the whole config).
 
-**Guarding the config.** Before any core restart the new config is validated by
-`_validate_config`: it is started on free ephemeral ports with the current
-config still running. If it does not come up, the running core is left
-untouched. A hash of the last successfully validated config is cached so
-identical configs are not re-validated within an hour.
+**Guarding the config and seamlessness.** Before ANY core restart the new config
+is validated **before** the running core is stopped:
+
+1. a fast check by the core itself — `xray run -test -config <file>` (no ports
+   are bound, the live core is untouched); if a core build does not understand
+   `-test`, the program falls back to `_validate_config` (start on free
+   ephemeral ports while the current config still runs);
+2. fingerprint comparison: `_conf_sha` of the freshly built config against
+   `_cfg_sha` of the file the running core actually uses (also kept in
+   `state.json` as `balancer_cfg_sha`), plus the pool fingerprint
+   (`balancer_sig`). Equal means **the core is not touched at all** (even on
+   `force=True`). Otherwise, if the core is ours, the link works and the pool is
+   frozen (`watch.pool_freeze_s`), no restart happens either;
+3. only then the config is replaced atomically and the core restarted — with the
+   **link gap measured in milliseconds** (`_restart_core_timed`): from stopping
+   the core to the new one accepting the port and to confirmed data transfer.
+   There is no fixed sleep after stopping any more; the port is polled for
+   release. Hashes of successful checks are cached so identical configs are not
+   re-validated within an hour.
 
 **Connectivity checks.** `probe_client` fetches
 `https://www.gstatic.com/generate_204` (or the Cloudflare endpoint on retries)

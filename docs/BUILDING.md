@@ -149,9 +149,16 @@ python src\v2ray_updater.py --once --dry-run
 python src\v2ray_updater.py --selftest
 ```
 
-`--install` from a source checkout copies the `.py` files into
-`%LOCALAPPDATA%\ForestProxyUpdater\src`, creates the Start Menu shortcut and the
-autostart entry, and runs a first cycle.
+`--install` from a source checkout copies **the `.exe` itself** (if one is built —
+it is looked for next to the repository and in `packaging\dist`) into
+`%LOCALAPPDATA%\ForestProxyUpdater` and registers the launch command exactly as
+`"<install dir>\ForestProxyUpdater.exe" --run`, with no extra arguments; when no
+built `.exe` is available it lays out the `.py` files in
+`%LOCALAPPDATA%\ForestProxyUpdater\src` and launches through `pythonw.exe` plus
+the installed script. Either way it creates the Start Menu shortcut and the
+autostart entry and runs a first cycle. To test without touching the real
+autostart use `FOREST_REG_RUN_KEY`, `FOREST_RUN_VALUE`, `FOREST_SHORTCUT_DIR` and
+`FOREST_EXE_SRC`.
 
 ## Publishing a release on GitHub
 

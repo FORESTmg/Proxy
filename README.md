@@ -76,11 +76,12 @@ put `xray.exe` in place yourself.
 The distributable is a single `.exe`. The usual flow:
 
 1. **Download** the `.exe` from the project's GitHub Releases page.
-2. **Put the Xray core next to it** (standalone mode): create a folder
-   `bin\xray\` beside the `.exe` and drop in the official `xray.exe` and the
-   geo databases (`geoip.dat`, `geosite.dat`) from the
-   [XTLS/Xray-core releases](https://github.com/XTLS/Xray-core/releases).
-   If you are going to use v2rayN mode, skip this — v2rayN provides the core.
+   2. **Nothing to download — the core is already inside.** The `.exe` ships with
+      Xray v26.3.27 and both geo databases (`geoip.dat`, `geosite.dat`) embedded, so
+      standalone mode works on a clean machine with no extra files. Put your own
+      `bin\xray\` folder beside the `.exe` only if you want to override or update
+      the core — that copy takes priority over the built-in one.
+      v2rayN mode needs no files at all: v2rayN provides its own core.
 3. **Run the `.exe`.** Windows will warn about an unsigned program
    (SmartScreen) — see the security section. On first run the program creates
    its working config from `config.example.json`, lays itself out under
@@ -132,6 +133,31 @@ A single program runs several worker threads (a "supervisor"):
 
 When the balancer cannot be brought up, the program falls back to a single
 server, and then to an **emergency "last good" pool** it saved earlier.
+
+### Seamlessness: when the core is NOT restarted
+
+Restarting the core means a short link gap, so it only happens when it really is
+needed:
+
+- **The new config is validated by the core before the running one is stopped** —
+  `xray run -test -config <file>`. A broken config is never applied, so it cannot
+  take the link down (if a core build does not support `-test`, the program falls
+  back automatically to starting it on free ports).
+- **Unchanged pool means no restart at all.** The program remembers the hash of
+  the config the running core actually uses (`balancer_cfg_sha`) and the pool
+  fingerprint (`balancer_sig`); if the freshly built config matches the running
+  one, the core is not touched, even on `force=True`.
+- **Pool freeze** (`watch.pool_freeze_s`, 3 h by default): while the core is alive
+  and the link works, a re-computed top-10 does not reshuffle the config.
+- **Restart only for a reason**: the active node is dead / the core is not
+  answering, the pool really changed after the freeze expired, or the user
+  pressed "Rebuild" in the tray.
+- **The gap is measured and logged in milliseconds** — from stopping the old core
+  to the new one accepting the client port, plus the time until data transfer is
+  confirmed. The fixed 300 ms sleep is gone; the port is polled for release.
+
+Log line template: `перезапуск ядра: РАЗРЫВ связи <ms> мс (порт принял
+соединения), подтверждение данных <ms> мс, rtt=<ms> мс`.
 
 The program saves the original system-proxy settings on its first intervention
 and can restore them exactly.
@@ -223,10 +249,11 @@ Run the program (`.exe`, or `python src/v2ray_updater.py` from source) with one
 of these:
 
 ```
---install     lay out under %LOCALAPPDATA%\ForestProxyUpdater, create the
-              Start Menu shortcut and autostart entry, run the first cycle
---uninstall   stop the core, restore the system proxy, remove autostart,
-              shortcut and the program directory
+--install     lay out under %LOCALAPPDATA%\ForestProxyUpdater (the .exe itself is
+              copied there), create the Start Menu shortcut and the autostart
+              entry "<install dir>\ForestProxyUpdater.exe" --run, run the first cycle
+--uninstall   stop the core, restore the system proxy, remove the autostart entry,
+              the shortcut, the installed .exe and the program directory
 --run         normal run: the supervisor with its worker threads (until stopped)
 --once        one full server-selection cycle            (alias: --auto)
 --guard       one quick self-check / recovery pass

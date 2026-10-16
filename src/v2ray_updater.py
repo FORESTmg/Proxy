@@ -596,6 +596,13 @@ def run_supervisor(cfg: dict) -> int:
 
 
 # ══════════════════════════════════════════ установка / удаление ═══
+APP_EXE_NAME = APP_RUN_VALUE + ".exe"
+
+# Ветка реестра автозапуска; для тестов переопределяется FOREST_REG_RUN_KEY,
+# чтобы НЕ трогать реальный автозапуск пользователя.
+RUN_KEY_DEFAULT = r"Software\Microsoft\Windows\CurrentVersion\Run"
+
+
 def _shortcut_dir() -> str:
     d = os.environ.get("FOREST_SHORTCUT_DIR")
     if d:
@@ -608,6 +615,10 @@ def _run_value_name() -> str:
     return os.environ.get("FOREST_RUN_VALUE", APP_RUN_VALUE)
 
 
+def _run_key_path() -> str:
+    return os.environ.get("FOREST_REG_RUN_KEY") or RUN_KEY_DEFAULT
+
+
 def _pythonw() -> str:
     py = sys.executable
     if os.path.basename(py).lower() == "python.exe":
@@ -615,6 +626,78 @@ def _pythonw() -> str:
         if os.path.isfile(alt):
             return alt
     return py
+
+
+def _installed_exe(cfg: dict) -> str:
+    """Путь к .exe в каталоге установки (единственный исполняемый файл)."""
+    return os.path.join(cfg["paths"]["root"], APP_EXE_NAME)
+
+
+def _is_pe(path: str) -> bool:
+    """Похож ли файл на настоящий Windows-исполняемый (MZ + размер)."""
+    try:
+        if os.path.getsize(path) < 1024 * 1024:
+            return False
+        with open(path, "rb") as f:
+            return f.read(2) == b"MZ"
+    except Exception:
+        return False
+
+
+def _find_built_exe() -> str:
+    """Ищет готовый ForestProxyUpdater.exe (для копирования в каталог установки).
+
+    Порядок: FOREST_EXE_SRC -> сам процесс (frozen onefile) -> рядом с
+    репозиторием -> packaging/dist. Возвращает '' если не найден.
+    """
+    cands = []
+    env = os.environ.get("FOREST_EXE_SRC")
+    if env:
+        cands.append(env)
+    if getattr(sys, "frozen", False):
+        cands.append(sys.executable)
+    else:
+        here = os.path.dirname(os.path.abspath(__file__))
+        repo = os.path.dirname(here)
+        for d in (os.getcwd(), repo, here,
+                  os.path.join(repo, "packaging", "dist"),
+                  os.path.join(repo, "dist")):
+            cands.append(os.path.join(d, APP_EXE_NAME))
+    for c in cands:
+        if c and os.path.isfile(c) and _is_pe(c):
+            return os.path.abspath(c)
+    return ""
+
+
+def prepare_install_launch(cfg: dict) -> tuple:
+    """Готовит команду запуска: (target, args, mode).
+
+    Продукт поставляется ОДНИМ .exe, поэтому установка копирует его в каталог
+    установки и запускает как ``<каталог установки>\\ForestProxyUpdater.exe
+    --run`` — БЕЗ лишних аргументов (иначе ярлык/автозапуск даёт модальное
+    окно ошибки) и без зависимости от папки разработки.
+    Если .exe не найден (запуск прямо из исходников) — режим ``src``:
+    pythonw + установленный скрипт ``<root>\\src\\v2ray_updater.py``.
+    """
+    lg = log.get_logger()
+    root = cfg["paths"]["root"]
+    exe_src = _find_built_exe()
+    if exe_src:
+        dst = _installed_exe(cfg)
+        if os.path.abspath(exe_src) != os.path.abspath(dst):
+            try:
+                shutil.copy2(exe_src, dst)
+            except Exception as e:
+                lg.warn(f"  копирование .exe в каталог установки не удалось: {e}")
+                dst = ""
+        if dst and os.path.isfile(dst):
+            lg.info(f"  exe в каталоге установки: {dst} "
+                    f"({os.path.getsize(dst)} байт)")
+            return dst, "--run", "exe"
+    entry = os.path.join(root, "src", "v2ray_updater.py")
+    lg.warn("  готового .exe не найдено — ярлык через pythonw + скрипт "
+            "(режим разработки)")
+    return _pythonw(), f'"{entry}" --run', "src"
 
 
 def _create_shortcut(target: str, args: str, workdir: str, lnk_path: str) -> bool:
@@ -637,12 +720,33 @@ def _create_shortcut(target: str, args: str, workdir: str, lnk_path: str) -> boo
         return False
 
 
+def _read_shortcut(lnk_path: str) -> tuple:
+    """Читает ярлык обратно: (target, args, workdir). ('','','') при ошибке."""
+    if not os.path.isfile(lnk_path):
+        return "", "", ""
+    ps = (
+        "$w = New-Object -ComObject WScript.Shell; "
+        f"$s = $w.CreateShortcut('{lnk_path}'); "
+        "Write-Output ($s.TargetPath + \"`n\" + $s.Arguments + \"`n\" + "
+        "$s.WorkingDirectory)"
+    )
+    try:
+        r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
+                           capture_output=True, timeout=40, text=True, errors="replace",
+                           creationflags=_no_window())
+        parts = (r.stdout or "").replace("\r", "").split("\n")
+        while len(parts) < 3:
+            parts.append("")
+        return parts[0].strip(), parts[1].strip(), parts[2].strip()
+    except Exception:
+        return "", "", ""
+
+
 def _set_autostart(cmd: str) -> bool:
     import winreg
     try:
-        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                           r"Software\Microsoft\Windows\CurrentVersion\Run",
-                           0, winreg.KEY_SET_VALUE)
+        k = winreg.CreateKeyEx(winreg.HKEY_CURRENT_USER, _run_key_path(),
+                               0, winreg.KEY_SET_VALUE)
         winreg.SetValueEx(k, _run_value_name(), 0, winreg.REG_SZ, cmd)
         winreg.CloseKey(k)
         return True
@@ -650,11 +754,24 @@ def _set_autostart(cmd: str) -> bool:
         return False
 
 
+def _read_autostart() -> str:
+    """Читает записанную команду автозапуска обратно (проверка установки)."""
+    import winreg
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _run_key_path(), 0, winreg.KEY_READ)
+        try:
+            v, _t = winreg.QueryValueEx(k, _run_value_name())
+            return str(v)
+        finally:
+            winreg.CloseKey(k)
+    except Exception:
+        return ""
+
+
 def _remove_autostart() -> bool:
     import winreg
     try:
-        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
-                           r"Software\Microsoft\Windows\CurrentVersion\Run",
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER, _run_key_path(),
                            0, winreg.KEY_SET_VALUE)
         try:
             winreg.DeleteValue(k, _run_value_name())
@@ -666,55 +783,125 @@ def _remove_autostart() -> bool:
         return False
 
 
+def _schedule_delete(paths: list, root: str) -> bool:
+    """Удаляет файлы/каталог ПОСЛЕ выхода процесса.
+
+    Windows не даёт удалить запущенный .exe, поэтому удаление откладывается
+    отдельному .bat (запускается отдельно от нас): ждёт ~2 с, пока процесс
+    выйдет, сносит файлы, затем каталог, затем сам себя.
+    Возвращает True, если «чистильщик» поставлен.
+    """
+    import tempfile as _tf
+    if not paths and not root:
+        return False
+    lines = ["@echo off", "ping -n 3 127.0.0.1 >nul"]
+    lines += [f'del /f /q "{p}"' for p in paths if p]
+    if root:
+        lines.append(f'rmdir /s /q "{root}"')
+    lines.append('del /f /q "%~f0" & exit /b 0')
+    try:
+        fd, bat = _tf.mkstemp(prefix="forest_cleanup_", suffix=".bat")
+        with os.fdopen(fd, "w", encoding="cp1251", errors="replace") as f:
+            f.write("\r\n".join(lines))
+    except Exception:
+        return False
+    try:
+        subprocess.Popen(
+            ["cmd.exe", "/c", bat],
+            creationflags=getattr(subprocess, "DETACHED_PROCESS", 0) | _no_window(),
+            close_fds=True)
+        return True
+    except Exception:
+        try:
+            os.unlink(bat)
+        except Exception:
+            pass
+        return False
+
+
 def install(cfg: dict) -> int:
     lg = log.get_logger()
     root = cfg["paths"]["root"]
     src_dir = os.path.join(root, "src")
     lg.info(f"Установка в {root}")
     os.makedirs(src_dir, exist_ok=True)
-    # 1. раскладка кода
-    code_dir = os.path.dirname(os.path.abspath(__file__))
-    copied = 0
-    for fn in os.listdir(code_dir):
-        if fn.endswith(".py"):
-            try:
-                shutil.copy2(os.path.join(code_dir, fn), os.path.join(src_dir, fn))
-                copied += 1
-            except Exception as e:
-                lg.warn(f"  копирование {fn}: {e}")
-    for extra in ("LICENSE", "README.md", "README.ru.md", "config.example.json"):
-        p = os.path.join(os.path.dirname(code_dir), extra)
-        if os.path.isfile(p):
-            try:
-                shutil.copy2(p, os.path.join(root, extra))
-            except Exception:
-                pass
-    lg.info(f"  файлов программы скопировано: {copied} -> {src_dir}")
+
+    # 1. сама программа. Продукт — один самодостаточный .exe: копируем его в
+    #    каталог установки, чтобы ярлык/автозапуск не зависели от папки
+    #    разработки. Если .exe нет (запуск из исходников) — раскладываем .py.
+    target, args, mode = prepare_install_launch(cfg)
+    if mode == "src":
+        code_dir = os.path.dirname(os.path.abspath(__file__))
+        copied = 0
+        if not getattr(sys, "frozen", False):
+            for fn in os.listdir(code_dir):
+                if fn.endswith(".py"):
+                    try:
+                        shutil.copy2(os.path.join(code_dir, fn),
+                                     os.path.join(src_dir, fn))
+                        copied += 1
+                    except Exception as e:
+                        lg.warn(f"  копирование {fn}: {e}")
+        for extra in ("LICENSE", "README.md", "README.ru.md", "config.example.json"):
+            p = os.path.join(os.path.dirname(code_dir), extra)
+            if os.path.isfile(p):
+                try:
+                    shutil.copy2(p, os.path.join(root, extra))
+                except Exception:
+                    pass
+        lg.info(f"  файлов программы скопировано: {copied} -> {src_dir}")
 
     # 2. конфиг (первый запуск)
     conf = os.path.join(root, "config.json")
     if not os.path.isfile(conf):
-        try:
-            shutil.copy2(os.path.join(root, "config.example.json"), conf)
-            lg.info(f"  конфиг создан: {conf}")
-        except Exception as e:
-            lg.warn(f"  конфиг не создан: {e}")
+        ex = CFG.example_config_path() or ""
+        if not ex or not os.path.isfile(ex):
+            lg.warn("  config.example.json не найден — конфиг будет создан "
+                    "при первом обычном запуске")
+        else:
+            try:
+                shutil.copy2(ex, conf)
+                lg.info(f"  конфиг создан: {conf}")
+            except Exception as e:
+                lg.warn(f"  конфиг не создан: {e}")
 
-    # 3. ярлык + автозапуск
-    pyw = _pythonw()
-    entry = os.path.join(src_dir, "v2ray_updater.py")
+    # 3. ярлык + автозапуск (ровно: "<установленный exe>" --run)
     lnk = os.path.join(_shortcut_dir(), f"{APP_RUN_VALUE}.lnk")
-    ok_lnk = _create_shortcut(pyw, f'"{entry}" --run', root, lnk)
-    ok_auto = _set_autostart(f'"{pyw}" "{entry}" --run')
+    ok_lnk = _create_shortcut(target, args, root, lnk)
+    cmd = f'"{target}" {args}'.strip()
+    ok_auto = _set_autostart(cmd)
+    lg.info(f"  цель запуска: \"{target}\" {args}   (режим: {mode})")
     lg.info(f"  ярлык: {'создан' if ok_lnk else 'НЕ создан'} ({lnk})")
-    lg.info(f"  автозапуск (HKCU\\...\\Run\\{_run_value_name()}): "
-            f"{'включён' if ok_auto else 'НЕ включён'}")
+    lg.info(f"  автозапуск (HKCU\\{_run_key_path()}\\{_run_value_name()}): "
+            f"{'включён' if ok_auto else 'НЕ включён'} = {cmd}")
+
+    # 3б. проверка по факту: что реально лежит в ярлыке и в реестре
+    lt, la, _lw = _read_shortcut(lnk)
+    if ok_lnk:
+        if lt == target and la.strip() == args.strip():
+            lg.info(f"  проверка ярлыка: OK (\"{lt}\" {la})")
+        else:
+            lg.warn(f"  проверка ярлыка: расхождение — в ярлыке \"{lt}\" {la}")
+    got = _read_autostart()
+    if ok_auto:
+        if got == cmd:
+            lg.info(f"  проверка автозапуска: OK ({got})")
+        else:
+            lg.warn(f"  проверка автозапуска: расхождение — в реестре «{got}»")
 
     # 4. первый цикл (системный прокси на этом шаге НЕ трогается)
     if not os.environ.get("FOREST_SKIP_FIRST_CYCLE"):
         lg.info("  первый цикл (системный прокси не изменяется)...")
         try:
-            run_cycle(cfg, dry=False)
+            rc = run_cycle(cfg, dry=False)
+            if rc != 0:
+                # Установка состоялась (файлы, ярлык, автозапуск), но живых
+                # серверов в этот момент не нашлось. Это не отказ установки:
+                # сторож/гвард повторят полный цикл и поднимут связь, как
+                # только найдутся рабочие узлы.
+                lg.warn(f"  первый цикл не дал связи (код {rc}): рабочих серверов "
+                        "сейчас нет. Сторожевая петля повторит подбор "
+                        "автоматически — вмешательство не требуется.")
         except Exception as e:
             lg.warn(f"  первый цикл: {e}")
     print(i18n.t("install.done"))
@@ -738,13 +925,39 @@ def uninstall(cfg: dict) -> int:
         lg.warn(f"  восстановление прокси: {e}")
     # 3. снять автозапуск и ярлык
     _remove_autostart()
+    left = _read_autostart()
+    lg.info(f"  автозапуск (HKCU\\{_run_key_path()}\\{_run_value_name()}): "
+            f"{'снят' if not left else 'ОСТАЛСЯ = ' + left}")
     lnk = os.path.join(_shortcut_dir(), f"{APP_RUN_VALUE}.lnk")
     try:
         if os.path.isfile(lnk):
             os.unlink(lnk)
             lg.info(f"  ярлык удалён: {lnk}")
+        else:
+            lg.info(f"  ярлыка нет: {lnk}")
     except Exception as e:
         lg.warn(f"  ярлык: {e}")
+    # 3б. убрать установленный .exe (до rmtree: так видно, если он занят)
+    exe = _installed_exe(cfg)
+    self_locked = bool(getattr(sys, "frozen", False)
+                       and os.path.abspath(sys.executable) == os.path.abspath(exe))
+    if self_locked and os.path.isfile(exe):
+        # себя удалить нельзя — откладываем нашим внутренним «чистильщику»
+        if _schedule_delete([exe], root):
+            lg.info(f"  exe удалится после выхода программы (запущен сейчас): {exe}")
+            print(i18n.t("install.uninstalled"))
+            print(i18n.t("install.proxy_note"))
+            return 0
+        lg.warn(f"  exe занят запущенным процессом — удалите вручную: {exe}")
+    else:
+        try:
+            if os.path.isfile(exe):
+                os.unlink(exe)
+                lg.info(f"  exe удалён: {exe}")
+            else:
+                lg.info(f"  exe уже отсутствует: {exe}")
+        except Exception as e:
+            lg.warn(f"  exe не удалён: {e}")
     # 4. убрать файлы программы
     # закрыть свой лог-файл: иначе он держит каталог и rmtree не удалит logs/
     try:

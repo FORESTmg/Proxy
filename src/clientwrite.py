@@ -29,12 +29,15 @@ FOREST's Proxy Auto-updater (GPL-3.0).
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import re
 import shutil
+import socket
 import subprocess
 import sys
+import tempfile
 import time
 
 import log
@@ -540,6 +543,109 @@ def _write_json(path: str, data: dict) -> bool:
         return False
 
 
+# ══════════════════════════════════════ проверка НОВОГО конфига до остановки ядра ═══
+def _conf_sha(conf: dict) -> str:
+    """Хэш содержимого конфига ядра (канонический JSON, порядок ключей не важен)."""
+    try:
+        return hashlib.sha1(
+            json.dumps(conf, sort_keys=True, ensure_ascii=False).encode("utf-8")
+        ).hexdigest()
+    except Exception:
+        return ""
+
+
+def _cfg_sha(path: str) -> str:
+    """Хэш конфига, лежащего на диске (то, с чем реально работает ядро)."""
+    try:
+        with open(path, encoding="utf-8") as f:
+            return _conf_sha(json.load(f))
+    except Exception:
+        return ""
+
+
+def _test_config_by_core(core: str, conf: dict, cfg: dict) -> tuple:
+    """Проверка конфига ЯДРОМ через ``xray run -test -config <файл>``.
+
+    Ядро только разбирает конфиг и проверяет его — порты НЕ занимаются,
+    живое ядро не трогается, запускается лишь короткий процесс проверки.
+    Возвращает (ok, err): ``ok=False`` — конфиг невалиден; второй элемент
+    ``"unsupported"`` — ядро не понимает ключ ``-test`` (старая сборка),
+    вызывающий обязан откатиться на проверку запуском на свободных портах.
+    """
+    if not core or not os.path.isfile(core):
+        return False, "unsupported"
+    # Уникальный временный файл: проверка может идти из разных потоков
+    # супервизора (watch/guard/update) — общий путь приводил бы к гонке
+    # «файл удалён другим потоком» и ложному «конфиг невалиден».
+    try:
+        fd, p = tempfile.mkstemp(dir=cfg["paths"]["state_dir"],
+                                 prefix="forest_test_config_", suffix=".json")
+        os.close(fd)
+    except Exception as e:
+        return False, f"test config path: {e}"
+    try:
+        _write_json(p, conf)
+    except Exception as e:
+        return False, f"test config write: {e}"
+    env = dict(os.environ)
+    adir = geo_asset_dir(core, cfg)
+    if adir:
+        env["XRAY_LOCATION_ASSET"] = adir
+    try:
+        r = subprocess.run([core, "run", "-test", "-config", p],
+                           cwd=os.path.dirname(core) or None, env=env,
+                           capture_output=True, timeout=25,
+                           creationflags=_no_window())
+    except Exception as e:
+        return False, f"test config: {e}"
+    finally:
+        try:
+            os.unlink(p)
+        except Exception:
+            pass
+    out = ((r.stdout or b"") + (r.stderr or b"")).decode("utf-8", "replace")
+    if r.returncode == 0:
+        return True, ""
+    low = out.lower()
+    if "flag provided but not defined" in low or "unknown flag" in low:
+        return False, "unsupported"
+    m = re.search(r"(failed to[^\n]{0,200})", out)
+    tail = out.strip().splitlines()[-1] if out.strip() else ""
+    return False, (m.group(1) if m else tail[-200:])
+
+
+def _validate_new_config(core: str, conf: dict, cfg: dict) -> tuple:
+    """Проверяет НОВЫЙ конфиг ДО остановки работающего ядра.
+
+    Порядок: быстрая проверка ``xray run -test -config`` (кэш по хэшу
+    конфига на час). Если ядро не поддерживает ``-test`` — откат на
+    «боевую» проверку ``_validate_config`` (запуск на свободных портах).
+    """
+    lg = log.get_logger()
+    sha = _conf_sha(conf)
+    try:
+        st = StateStore(cfg)
+        if sha and st.data.get("fast_validate_sha") == sha and \
+                time.time() - float(st.data.get("fast_validate_ts", 0) or 0) < 3600:
+            return True, ""
+    except Exception:
+        pass
+    ok, err = _test_config_by_core(core, conf, cfg)
+    if not ok and err == "unsupported":
+        lg.warn("ядро не понимает 'run -test' — проверяю конфиг запуском "
+                "на свободных портах")
+        return _validate_config(core, conf, cfg)
+    if ok:
+        try:
+            st = StateStore(cfg)
+            st.data["fast_validate_sha"] = sha
+            st.data["fast_validate_ts"] = time.time()
+            st.save()
+        except Exception:
+            pass
+    return ok, err
+
+
 def geo_asset_dir(core: str = None, cfg: dict = None) -> str:
     """Каталог с geosite.dat / geoip.dat (нужны для правил geosite:/geoip:)."""
     if cfg is not None:
@@ -773,10 +879,17 @@ def _port_pid(port: int):
 
 
 def _our_core_pids(cfg: dict) -> list:
-    """Все НАШИ ядра xray (в командной строке наш конфиг forest_xray.json)."""
+    """Все НАШИ ядра xray: в командной строке наш конфиг из state_dir.
+
+    Раньше фильтр искал литерал ``forest_xray.json``, а фактический конфиг —
+    ``state_dir/xray_config.json``, поэтому осиротевшие ядра (например, после
+    аварийного завершения) не находились и оставались держать клиентский порт.
+    """
     try:
+        marker = os.path.join(cfg["paths"]["state_dir"], "")
+        marker = marker.replace("[", "[[]")
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='xray.exe'\" | "
-              "Where-Object { $_.CommandLine -like '*forest_xray.json*' } | "
+              f"Where-Object {{ $_.CommandLine -like '*{marker}*' }} | "
               "ForEach-Object { $_.ProcessId }")
         r = subprocess.run(["powershell.exe", "-NoProfile", "-Command", ps],
                            capture_output=True, timeout=25, text=True, errors="replace",
@@ -787,6 +900,25 @@ def _our_core_pids(cfg: dict) -> list:
 
 
 def _kill_pid(pid) -> bool:
+    """Завершить процесс как можно быстрее.
+
+    Сначала TerminateProcess через ctypes (без запуска taskkill.exe — это
+    экономит ~150–300 мс, а на перезапуске ядра время остановки целиком
+    входит в разрыв связи). Если не вышло — откат на taskkill.
+    """
+    try:
+        import ctypes
+        k = ctypes.windll.kernel32
+        h = k.OpenProcess(0x0001, False, int(pid))      # PROCESS_TERMINATE
+        if h:
+            try:
+                ok = bool(k.TerminateProcess(h, 1))
+            finally:
+                k.CloseHandle(h)
+            if ok:
+                return True
+    except Exception:
+        pass
     try:
         r = subprocess.run(["taskkill", "/PID", str(int(pid)), "/F"],
                            capture_output=True, timeout=15,
@@ -827,13 +959,20 @@ def stop_core(cfg: dict, why: str = "") -> None:
     """
     lg = log.get_logger()
     pid = _read_core_pid(cfg)
+    killed = False
     if pid and _pid_alive(pid):
         if _kill_pid(pid):
+            killed = True
             lg.info(f"stop_core{'(' + why + ')' if why else ''}: снято наше ядро pid={pid}")
-    for p in _our_core_pids(cfg):
-        if p != pid:
-            _kill_pid(p)
-            lg.warn(f"stop_core: снято осиротевшее наше ядро pid={p}")
+    # Осиротевшие наши ядра ищем ТОЛЬКО если живого ядра по pid-файлу не было:
+    # поиск идёт через PowerShell CIM (~0.4 с) и на перезапуске целиком входит
+    # в разрыв связи. Если осиротевшее ядро держит порт, следующий заход
+    # (pid-файл уже удалён) его подберёт.
+    if not killed:
+        for p in _our_core_pids(cfg):
+            if p != pid:
+                _kill_pid(p)
+                lg.warn(f"stop_core: снято осиротевшее наше ядро pid={p}")
     try:
         os.unlink(core_pid_path(cfg))
     except Exception:
@@ -872,18 +1011,56 @@ def start_core(client: dict, cfg: dict) -> bool:
         if p.poll() is not None:
             lg.error("start_core: ядро упало сразу после старта (см. forest_xray.log)")
             return False
-        if port_listening(port, timeout=0.3):
+        # мелкий шаг опроса: приём порта замечаем через ~10-20 мс, а не 100-300
+        if port_listening(port, timeout=0.05):
+            # порт мог держать ЧУЖОЙ/осиротевший процесс, а наш уже упал от
+            # «address already in use» — без этой проверки мы бы считали ядро
+            # поднятым и не перезапускали его
+            time.sleep(0.05)
+            if p.poll() is not None:
+                lg.error("start_core: наш процесс ядра вышел сразу после запуска "
+                         "(порт занят другим процессом?) — см. forest_xray.log")
+                return False
             return True
-        time.sleep(0.1)
+        time.sleep(0.01)
     lg.warn(f"start_core: порт {port} не открылся за 8 с")
     return False
 
 
+def _restart_core_timed(client: dict, cfg: dict) -> tuple:
+    """Перезапуск ядра С ЗАМЕРОМ РАЗРЫВА связи (мс).
+
+    Разрыв = от снятия старого ядра до момента, когда новое ядро реально
+    приняло клиентский порт (приём соединений). Фиксированная пауза 300 мс
+    убрана: новый процесс стартует сразу, а ожидание идёт по факту
+    освобождения порта. Возвращает (ok, разрыв_мс, rtt) — rtt уже
+    подтверждённой связи, чтобы вызывающий не проверял её второй раз.
+    """
+    lg = log.get_logger()
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    t0 = time.time()
+    stop_core(cfg, why="restart")
+    dl = time.time() + 2.0
+    while time.time() < dl and port_listening(port, timeout=0.05):
+        time.sleep(0.01)
+    if not start_core(client, cfg):
+        return False, None, 0.0
+    listen_ms = (time.time() - t0) * 1000.0
+    ok, rtt = wait_and_probe(client, attempts=4, gap=1.0)
+    total_ms = (time.time() - t0) * 1000.0
+    if not ok:
+        lg.warn(f"перезапуск ядра: связь не подтвердилась за {total_ms:.0f} мс")
+        return False, None, 0.0
+    lg.info(f"перезапуск ядра: РАЗРЫВ связи {listen_ms:.0f} мс "
+            f"(порт принял соединения), подтверждение данных {total_ms:.0f} мс, "
+            f"rtt={rtt:.0f} мс")
+    return True, listen_ms, float(rtt or 0.0)
+
+
 def restart_core(client: dict, cfg: dict) -> bool:
     """Перезапуск ядра: снять наше старое -> поднять новое с текущим конфигом."""
-    stop_core(cfg, why="restart")
-    time.sleep(0.3)
-    return start_core(client, cfg)
+    ok, _gap_ms, _rtt = _restart_core_timed(client, cfg)
+    return ok
 
 
 def wait_and_probe(client: dict, attempts: int = 6, gap: float = 3.0) -> tuple:
@@ -1158,15 +1335,31 @@ def _emergency_restore(client: dict, cfg: dict, port: int) -> bool:
     if not _lock(cfg, "balancer", ttl=240, wait=8):
         return False
     try:
-        if not write_balancer_config(client, servers, cfg):
+        port_n = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+        conf = build_balancer_config(
+            servers, port_n,
+            listen=cfg.get("client", {}).get("listen", "127.0.0.1"),
+            ru_direct=ru_direct_enabled(cfg),
+            torrent_port=int(client.get("torrent_port",
+                                        cfg.get("client", {}).get(
+                                            "torrent_port", DEFAULT_TORRENT_PORT))))
+        if conf is None:
+            lg.error("аварийный конфиг: пул пуст после сборки")
             return False
-        conf = json.load(open(client["cfg"], encoding="utf-8"))
-        ok_v, err_v = _validate_config(client["core"], conf, cfg)
+        # проверка ядром ДО подмены рабочего конфига
+        ok_v, err_v = _validate_new_config(client["core"], conf, cfg)
         if not ok_v:
-            lg.error(f"аварийный конфиг невалиден ({err_v})")
+            lg.error(f"аварийный конфиг невалиден ({err_v}) — не применяю")
             return False
-        if not restart_core(client, cfg):
+        if not _write_json(client["cfg"], conf):
             return False
+        ok_r, gap_ms, _rtt_r = _restart_core_timed(client, cfg)
+        if not ok_r:
+            return False
+        st.data["balancer_cfg_sha"] = _conf_sha(conf)
+        st.data["balancer_sig"] = _pool_sig(servers)
+        st.data["balancer_gap_ms"] = gap_ms
+        st.save()
     finally:
         _unlock(cfg, "balancer")
     ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
@@ -1177,25 +1370,32 @@ def _emergency_restore(client: dict, cfg: dict, port: int) -> bool:
 
 
 # ══════════════════════════════════════════ запись конфигов ядра (standalone) ═══
-def write_core_config(client: dict, server, cfg: dict) -> bool:
-    """Пишет конфиг ядра с ОДНИМ сервером."""
+def build_single_config(client: dict, server, cfg: dict) -> dict:
+    """Собирает конфиг ядра с ОДНИМ сервером (без записи на диск)."""
     import xraytest as XT
     ob = XT.outbound_json(server)
     if ob is None:
-        log.get_logger().error("write_core_config: outbound не собрался")
-        return False
+        log.get_logger().error("build_single_config: outbound не собрался")
+        return None
     ob = _sanitize_outbound(dict(ob))
     ob["tag"] = "proxy"
     port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
     listen = cfg.get("client", {}).get("listen", "127.0.0.1")
     ru = ru_direct_enabled(cfg)
-    conf = {
+    return {
         "log": {"loglevel": "warning"},
         "inbounds": [_inbound(port, listen), _inbound_torrent(cfg)],
         "outbounds": [ob, {"tag": "direct", "protocol": "freedom"}],
         "dns": _build_dns(ru),
         "routing": _routing_single(ru),
     }
+
+
+def write_core_config(client: dict, server, cfg: dict) -> bool:
+    """Пишет конфиг ядра с ОДНИМ сервером."""
+    conf = build_single_config(client, server, cfg)
+    if conf is None:
+        return False
     return _write_json(client.get("cfg"), conf)
 
 
@@ -1357,32 +1557,79 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10,
     ensure_system_proxy(client, cfg)
     sig = _pool_sig(pool)
     st = StateStore(cfg)
-    if not force and st.data.get("balancer_sig") == sig and _link_ok(cfg, socks_port):
-        return True
-    freeze_s = float(cfg.get("watch", {}).get("pool_freeze_s", 10800))
-    age = time.time() - float(st.data.get("balancer_ts", 0) or 0)
-    if st.data.get("balancer_sig") and age < freeze_s and _link_ok(cfg, socks_port):
-        if st.data.get("balancer_sig") != sig:
-            lg.info("ensure_balancer: состав пула изменился, но ядро работает — "
-                    f"пул заморожен ещё на {int((freeze_s - age) / 60)} мин")
-        return True
+    live_sha = _cfg_sha(client["cfg"]) if os.path.isfile(client["cfg"]) else ""
+    owned_sha = str(st.data.get("balancer_cfg_sha") or "")
+    pid = _read_core_pid(cfg)
+    ours = bool(pid and _pid_alive(pid))
+    live = bool(ours and port_listening(socks_port, timeout=0.3))
+    link = _link_ok(cfg, socks_port) if live else False
+    # Работающее ядро наше и конфиг на диске — тот, что мы записали:
+    # только тогда его можно считать «своим» и не трогать.
+    same_running = bool(live and owned_sha and owned_sha == live_sha)
+    if live and link:
+        if st.data.get("balancer_sig") == sig and same_running:
+            lg.info("ensure_balancer: состав пула не изменился — перезапуска нет")
+            return True
+        age = time.time() - float(st.data.get("balancer_ts", 0) or 0)
+        freeze_s = float(cfg.get("watch", {}).get("pool_freeze_s", 10800))
+        # force=True (кнопка «Пересобрать» в трее) — явный запрос: заморозку
+        # не удерживаем. Плановые вызовы force не передают.
+        if same_running and st.data.get("balancer_sig") and age < freeze_s and not force:
+            if st.data.get("balancer_sig") != sig:
+                lg.info("ensure_balancer: состав пула изменился, но ядро работает — "
+                        f"пул заморожен ещё на {int((freeze_s - age) / 60)} мин "
+                        "(перезапуска нет)")
+            return True
     if not _lock(cfg, "balancer", ttl=240, wait=8):
         lg.warn("ensure_balancer: другое управление ядром уже идёт — пропускаю цикл")
         return True
+    restarted = False
+    rtt_restart = 0.0
     try:
-        if not write_balancer_config(client, pool, cfg):
-            return False
-        conf = json.load(open(client["cfg"], encoding="utf-8"))
-        ok_v, err_v = _validate_config(client["core"], conf, cfg)
+        port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+        listen = cfg.get("client", {}).get("listen", "127.0.0.1")
+        tport = int(client.get("torrent_port",
+                               cfg.get("client", {}).get("torrent_port",
+                                                         DEFAULT_TORRENT_PORT)))
+        conf = build_balancer_config(pool, port, listen=listen,
+                                     ru_direct=ru_direct_enabled(cfg),
+                                     torrent_port=tport)
+        if conf is None:
+            lg.warn("ensure_balancer: пул пуст после сборки outbound'ов")
+            return bool(link)
+        cand_sha = _conf_sha(conf)
+        # (а) НОВЫЙ конфиг проверяется ядром ДО остановки рабочего ядра:
+        # мёртвый конфиг не должен уносить связь.
+        ok_v, err_v = _validate_new_config(client["core"], conf, cfg)
         if not ok_v:
-            lg.error(f"ensure_balancer: конфиг невалиден ({err_v}) — ядро не трогаю")
+            lg.error(f"ensure_balancer: новый конфиг невалиден ({err_v}) — "
+                     "живое ядро НЕ трогаю")
+            return bool(link)
+        if live and link and cand_sha == live_sha:
+            lg.info("ensure_balancer: конфиг совпадает с работающим — "
+                    "перезапуска нет")
+            st.data["balancer_sig"] = sig
+            st.data["balancer_cfg_sha"] = cand_sha
+            st.data["balancer_n"] = len(pool)
+            st.save()
+            return True
+        if not _write_json(client["cfg"], conf):
+            lg.error("ensure_balancer: не удалось записать конфиг ядра")
             return False
-        if not restart_core(client, cfg):
+        ok_r, gap_ms, rtt_r = _restart_core_timed(client, cfg)
+        if not ok_r:
             lg.error("ensure_balancer: ядро не поднялось")
             return False
+        restarted, rtt_restart = True, rtt_r
+        st.data["balancer_cfg_sha"] = cand_sha
+        st.data["balancer_gap_ms"] = gap_ms
+        st.save()
     finally:
         _unlock(cfg, "balancer")
-    if fast_ok and port_listening(socks_port):
+    if restarted:
+        # связь уже подтверждена внутри перезапуска — не проверяем второй раз
+        ok, rtt = True, rtt_restart
+    elif fast_ok and port_listening(socks_port):
         ok, rtt = True, 0.0
     else:
         ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
@@ -1393,7 +1640,13 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10,
         st.data["emergency_ts"] = 0
         st.save()
         save_lastgood(cfg, pool)
-        lg.info(f"Балансировщик поднят: {len(pool)} серверов (rtt={rtt} мс)")
+        extra = ""
+        try:
+            gm = st.data.get("balancer_gap_ms")
+            extra = f", разрыв {float(gm):.0f} мс" if gm is not None else ""
+        except Exception:
+            extra = ""
+        lg.info(f"Балансировщик поднят: {len(pool)} серверов (rtt={rtt} мс{extra})")
     else:
         lg.warn("ensure_balancer: связь не появилась")
     return ok
@@ -1419,9 +1672,11 @@ def activate(client: dict, servers: list, active_id: str, cfg: dict,
         return {"ok": False, "switched": switched, "rtt": 0, "msg": f"write_error: {e}"}
 
     if bool(cfg.get("watch", {}).get("balancer_mode", False)):
+        # force НЕ передаём: ensure_balancer сам решает, нужен ли перезапуск
+        # (состав пула/рабочий конфиг не изменились — ядро не трогаем).
         if ensure_balancer(client, cfg,
                            n=int(cfg["watch"].get("balancer_pool_n", 10)),
-                           force=switched):
+                           force=False):
             ok2, rtt2 = probe_client(client, timeout=8)
             if ok2:
                 return {"ok": True, "switched": switched, "rtt": rtt2,
@@ -1436,7 +1691,22 @@ def activate(client: dict, servers: list, active_id: str, cfg: dict,
                 break
     if srv is None:
         return {"ok": False, "switched": switched, "rtt": 0, "msg": "server_not_found"}
-    if not write_core_config(client, srv, cfg):
+    # НОВЫЙ конфиг собираем и проверяем ядром ДО остановки рабочего ядра
+    conf_s = build_single_config(client, srv, cfg)
+    if conf_s is None:
+        return {"ok": False, "switched": switched, "rtt": 0, "msg": "config_write_failed"}
+    ok_v, err_v = _validate_new_config(client["core"], conf_s, cfg)
+    if not ok_v:
+        lg.error(f"активация: конфиг одиночного сервера невалиден ({err_v}) — "
+                 "рабочее ядро НЕ трогаю")
+        return {"ok": False, "switched": switched, "rtt": 0,
+                "msg": f"invalid_config: {err_v}"}
+    socks_port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    live_sha = _cfg_sha(client["cfg"]) if os.path.isfile(client["cfg"]) else ""
+    if live_sha and _conf_sha(conf_s) == live_sha and _link_ok(cfg, socks_port):
+        lg.info("Активация: конфиг совпадает с работающим — перезапуска нет")
+        return {"ok": True, "switched": switched, "rtt": 0, "msg": "already_running"}
+    if not _write_json(client["cfg"], conf_s):
         return {"ok": False, "switched": switched, "rtt": 0, "msg": "config_write_failed"}
     if restart_core(client, cfg):
         ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
@@ -1498,7 +1768,15 @@ def guard_cycle(client: dict, cfg: dict, probe_timeout: float = 6.0) -> bool:
         alive.sort(key=lambda s: (s.rtt_ms or 9999, -(s.speed_kbps or 0)))
         lg.info(f"Failover: живых [AUTO]: {len(alive)}")
         for s in alive[:8]:
-            if not write_core_config(client, s, cfg):
+            conf_f = build_single_config(client, s, cfg)
+            if conf_f is None:
+                continue
+            ok_v, err_v = _validate_new_config(client["core"], conf_f, cfg)
+            if not ok_v:
+                lg.warn(f"Failover: конфиг {s.address}:{s.port} невалиден "
+                        f"({err_v}) — пробую следующий")
+                continue
+            if not _write_json(client["cfg"], conf_f):
                 continue
             if not restart_core(client, cfg):
                 continue
@@ -1539,11 +1817,30 @@ class StateStore:
                 pass
         return {}
 
-    def save(self):
+    def save(self, merge: bool = True):
+        """Атомарная запись состояния.
+
+        ``merge=True`` не теряет ключи, которые параллельно записал другой
+        экземпляр StateStore (в цикле состояния живут два: свой в run_cycle и
+        свой в ensure_balancer) — без этого «отпечаток» пула и его подпись,
+        записанные при подъёме балансировщика, затирались финальным
+        ``save()`` цикла, и заморозка пула переставала работать.
+        """
+        data = dict(self.data)
+        if merge and os.path.isfile(self.path):
+            try:
+                with open(self.path, encoding="utf-8") as f:
+                    disk = json.load(f)
+                for k, v in (disk or {}).items():
+                    if k not in data:
+                        data[k] = v
+            except Exception:
+                pass
         tmp = self.path + ".tmp"
         with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(self.data, f, ensure_ascii=False, indent=1)
+            json.dump(data, f, ensure_ascii=False, indent=1)
         os.replace(tmp, self.path)
+        self.data = data
 
 
 def update_hotcache(client: dict, cfg: dict, servers: list):

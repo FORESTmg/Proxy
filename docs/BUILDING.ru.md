@@ -148,9 +148,15 @@ python src\v2ray_updater.py --once --dry-run
 python src\v2ray_updater.py --selftest
 ```
 
-`--install` из дерева исходников копирует `.py`-файлы в
-`%LOCALAPPDATA%\ForestProxyUpdater\src`, создаёт ярлык в меню «Пуск» и запись в
-автозапуске и выполняет первый цикл.
+`--install` из дерева исходников копирует **сам `.exe`** (если он собран — ищется
+рядом с репозиторием и в `packaging\dist`) в `%LOCALAPPDATA%\ForestProxyUpdater`
+и регистрирует запуск ровно как `"<каталог установки>\ForestProxyUpdater.exe"
+--run` — без лишних аргументов; если готового `.exe` нет, раскладываются
+`.py`-файлы в `%LOCALAPPDATA%\ForestProxyUpdater\src` и запуск идёт через
+`pythonw.exe` + установленный скрипт. В обоих случаях создаётся ярлык в меню
+«Пуск» и запись в автозапуске, после чего выполняется первый цикл. Для проверки
+без изменения реального автозапуска есть переменные `FOREST_REG_RUN_KEY`,
+`FOREST_RUN_VALUE`, `FOREST_SHORTCUT_DIR` и `FOREST_EXE_SRC`.
 
 ## Опубликовать релиз на GitHub
 

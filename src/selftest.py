@@ -277,6 +277,85 @@ def main() -> int:
 
     print()
     print("=" * 64)
+    print("10. Бесшовное переключение: хэш конфига, проверка до остановки ядра")
+    print("=" * 64)
+    c1 = {"a": 1, "b": [1, 2, {"c": 3}]}
+    c2 = {"b": [1, 2, {"c": 3}], "a": 1}
+    check("_conf_sha не зависит от порядка ключей",
+          CW._conf_sha(c1) == CW._conf_sha(c2) and bool(CW._conf_sha(c1)))
+    check("_conf_sha различает разные конфиги",
+          CW._conf_sha(c1) != CW._conf_sha({"a": 2, "b": [1, 2, {"c": 3}]}))
+    check("_cfg_sha читает конфиг с диска",
+          CW._cfg_sha(cfg_path) == CW._conf_sha(ruconf),
+          f"{CW._cfg_sha(cfg_path)[:8]} != {CW._conf_sha(ruconf)[:8]}")
+    check("_cfg_sha(нет файла) -> ''", CW._cfg_sha(os.path.join(_TMP, "nope.json")) == "")
+    check("_test_config_by_core без ядра -> unsupported (есть фолбэк)",
+          CW._test_config_by_core("", {"x": 1}, cfg2) == (False, "unsupported"))
+    check("_validate_new_config есть (проверка конфига до остановки ядра)",
+          callable(CW._validate_new_config))
+    check("_restart_core_timed есть (замер разрыва в мс)",
+          callable(CW._restart_core_timed))
+    check("build_single_config вернул конфиг с inbounds/outbounds",
+          isinstance(CW.build_single_config(client, srv, {"client": {}}), dict))
+
+    print()
+    print("=" * 64)
+    print("11. Установщик: копирование .exe и команда запуска без лишних аргументов")
+    print("=" * 64)
+    import v2ray_updater as VU
+    check("app_root подменён (FOREST_ROOT)",
+          CFG.app_root().replace("\\", "/").lower() == _TMP.replace("\\", "/").lower())
+    # изоляция от переменных окружения вызывающей оболочки
+    for _v in ("FOREST_REG_RUN_KEY", "FOREST_RUN_VALUE", "FOREST_EXE_SRC",
+               "FOREST_SHORTCUT_DIR"):
+        os.environ.pop(_v, None)
+    check("ветка автозапуска по умолчанию — HKCU\\...\\Run",
+          VU._run_key_path() == VU.RUN_KEY_DEFAULT)
+    os.environ["FOREST_REG_RUN_KEY"] = r"Software\ForestSelftest\Run"
+    check("ветка автозапуска переопределяется (песочница)",
+          VU._run_key_path() == r"Software\ForestSelftest\Run")
+    os.environ.pop("FOREST_REG_RUN_KEY", None)
+    # подделка «собранного .exe»: 2 МБ, начинается с MZ
+    fake_exe = os.path.join(_TMP, "fake", "ForestProxyUpdater.exe")
+    os.makedirs(os.path.dirname(fake_exe), exist_ok=True)
+    with open(fake_exe, "wb") as f:
+        f.write(b"MZ" + b"\0" * (2 * 1024 * 1024))
+    check("_is_pe принимает MZ+размер", VU._is_pe(fake_exe) is True)
+    check("_is_pe отвергает мелкий файл",
+          VU._is_pe(os.path.join(_TMP, "xray.exe")) is False)
+    os.environ["FOREST_EXE_SRC"] = fake_exe
+    try:
+        tgt, argstr, mode = VU.prepare_install_launch(cfg2)
+    finally:
+        os.environ.pop("FOREST_EXE_SRC", None)
+    want = os.path.join(cfg2["paths"]["root"], VU.APP_EXE_NAME)
+    check("режим exe: цель — exe в каталоге УСТАНОВКИ", tgt == want, tgt)
+    check("режим exe: скопирован в каталог установки", os.path.isfile(want))
+    check("режим exe: команда запуска ровно '--run'", argstr == "--run", argstr)
+    check("режим exe: лишнего аргумента-скрипта нет",
+          ".py" not in argstr and argstr.count("--") == 1)
+    check("_schedule_delete без путей -> False", VU._schedule_delete([], "") is False)
+
+    print()
+    print("=" * 64)
+    print("12. StateStore: save() не теряет ключи чужого экземпляра")
+    print("=" * 64)
+    st_a = CW.StateStore(cfg2)
+    st_a.data["k_from_a"] = 1
+    st_a.save()
+    st_b = CW.StateStore(cfg2)          # загрузился ДО записи st_a? нет — после
+    st_b.data["k_from_b"] = 2
+    st_b.data["k_from_a"] = 1           # устаревшая копия-снимок
+    st_b.save()
+    disk = json.load(open(st_a.path, encoding="utf-8"))
+    check("ключи обоих экземпляров на диске",
+          disk.get("k_from_a") == 1 and disk.get("k_from_b") == 2, str(disk))
+    st_c = CW.StateStore(cfg2)
+    check("после merge-записи чтение видит оба ключа",
+          st_c.data.get("k_from_b") == 2 and st_c.data.get("k_from_a") == 1)
+
+    print()
+    print("=" * 64)
     if FAILED:
         print(f"{i18n.t('selftest.failed')}: {len(FAILED)}")
         for f in FAILED:
