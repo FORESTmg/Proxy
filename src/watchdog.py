@@ -43,22 +43,29 @@ import subprocess
 import sys
 import time
 
+import instancelock as IL
 import log
 
 # ─────────────────────────────────────────────────────── константы ───
 APP_EXE_NAME = "ForestProxyUpdater.exe"
 TASK_NAME_DEFAULT = "ForestProxyUpdater-Watchdog"
+# Замок супервизора. Имя историческое (маркер) — файл тот же, но теперь это
+# НАСТОЯЩИЙ эксклюзивный замок ОС, а не файл-маркер с PID. Файл НЕ удаляется
+# при выходе: замок снимает ядро ОС вместе с процессом, а удаление файла
+# позволило бы двум экземплярам держать замки на разных (старом и новом) файлах.
 MARKER_NAME = "supervisor.lock"
 ENSURE_LOCK_NAME = "ensure.lock"
+# Пометка «этот процесс и есть супервизор» — единое правило самоконтроля:
+# ни один поток супервизора не имеет права поднимать вторую копию.
+SELF_ENV = "FOREST_SUPERVISOR"
 # Повтор триггера задачи по умолчанию (минуты) — требование замысла: 5 минут.
 DEFAULT_INTERVAL_MIN = 5
-# Маркер считаем «свежим» (его кто-то прямо сейчас пишет) столько секунд.
-MARKER_FRESH_S = 20.0
-# Замок --ensure переживает свой процесс не дольше этого (защита от зависания).
-ENSURE_LOCK_STALE_S = 120.0
 # Pid процесса, который УЖЕ стал супервизором в этой своей жизни (см.
-# claim_supervisor): не даёт одному процессу занять маркер дважды.
+# claim_supervisor): не даёт одному процессу занять замок дважды.
 _CLAIMED_PID = 0
+# Замок супервизора, удерживаемый этим процессом (объект InstanceLock).
+_SUP_LOCK = None
+_SUP_LOCK_PATH = ""
 
 _NOWINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
@@ -282,13 +289,41 @@ def _self_family_pids(rows: list, cfg: dict) -> set:
     return out
 
 
+def _install_markers(cfg: dict) -> list:
+    """Строки, по которым процесс ОТНОСИТСЯ к ЭТОЙ установке (корень/конфиг).
+
+    Нужны, чтобы установки (рабочая, песочница, автотест с временным корнем)
+    не принимали чужие процессы за свои: путь `.exe` лежит ВНУТРИ корня
+    установки, поэтому у настоящего супервизора корень всегда есть в командной
+    строке, а у чужого — нет.
+    """
+    out = []
+    try:
+        root = os.path.normcase(os.path.abspath(cfg["paths"]["root"]))
+        if root:
+            out.append(root)
+    except Exception:
+        pass
+    try:
+        p = os.path.normcase(os.path.abspath(str(cfg.get("_config_path") or "")))
+        if p:
+            out.append(p)
+    except Exception:
+        pass
+    return out
+
+
 def _scan_our_supervisors(cfg: dict) -> list:
     """Pid процессов ``--run`` ЭТОЙ установки (без своих), по списку процессов.
 
-    Нужен как страховка: у старой версии могло не быть файла-маркера, а также
-    если маркер потерялся. Ничего не трогает — только читает список.
+    Нужен как СТРАХОВКА/диагностика: у старой версии нет замка, а также когда
+    замок деградирован. Ничего не трогает — только читает список. Решение о
+    запуске второго экземпляра по этому скану НЕ принимается (см.
+    claim_supervisor): скан неатомарен и именно он раньше приводил к двум
+    экземплярам и к «не выживает никто».
     """
     toks = _identity_tokens(cfg)
+    marks = _install_markers(cfg)
     rows = _proc_rows_win() if os.name == "nt" else _proc_rows_posix()
     if not rows:
         return []
@@ -301,8 +336,12 @@ def _scan_our_supervisors(cfg: dict) -> list:
         pth = os.path.normcase(path)
         if "--run" not in cmd:
             continue
-        if any(t in cmd for t in toks) or (pth and any(t == pth for t in toks)):
-            out.append(pid)
+        if not (any(t in cmd for t in toks) or (pth and any(t == pth for t in toks))):
+            continue
+        # принадлежность установке: корень (или путь конфига) обязан быть виден
+        if marks and not any(m in cmd for m in marks):
+            continue
+        out.append(pid)
     return out
 
 
@@ -337,7 +376,74 @@ def _marker_matches(d: dict, cfg: dict) -> bool:
         return False
 
 
+# ══════════════════════════════════════════════ замок супервизора ═══
+def supervisor_lock(cfg: dict) -> IL.InstanceLock:
+    """Замок супервизора этой установки (один объект на процесс, до выхода).
+
+    Файл тот же, что был у маркера (``state/supervisor.lock``), поэтому и
+    документация, и каталог состояния остаются привычными. Но теперь это
+    НАСТОЯЩИЙ замок: его держит ядро ОС, пока жив процесс.
+    """
+    global _SUP_LOCK, _SUP_LOCK_PATH
+    p = marker_path(cfg)
+    if _SUP_LOCK is None or _SUP_LOCK_PATH != p:
+        _SUP_LOCK = IL.InstanceLock(p, tag="supervisor")
+        _SUP_LOCK_PATH = p
+    return _SUP_LOCK
+
+
+def we_are_supervisor() -> bool:
+    """Этот процесс УЖЕ супервизор? Единое правило самоконтроля."""
+    return (_CLAIMED_PID == os.getpid()
+            or os.environ.get(SELF_ENV) == "1")
+
+
+def supervisor_lock_held(cfg: dict) -> bool:
+    """Занят ли замок супервизора (нами или другим живым экземпляром)."""
+    if we_are_supervisor() and _SUP_LOCK is not None and _SUP_LOCK.held:
+        return True
+    return IL.held(marker_path(cfg))
+
+
+def _info_for_marker(cfg: dict, argv=None) -> dict:
+    """Данные владельца замка — ТОЛЬКО для диагностики (решения — по замку)."""
+    return {
+        "pid": os.getpid(),
+        "ts": time.time(),
+        "exe": our_exe(cfg),
+        "root": cfg["paths"]["root"],
+        "argv": list(argv if argv is not None else sys.argv[1:]),
+        "frozen": bool(getattr(sys, "frozen", False)),
+        "lock": True,
+    }
+
+
 def _marker_live_pid(cfg: dict) -> int:
+    """Pid живого супервизора ЭТОЙ установки, иначе 0.
+
+    Источник истины — замок: занят, значит экземпляр жив (ОС снимает замок
+    ровно тогда, когда процесс кончился). PID берём из диагностики; если её
+    нет — 0 (вызывающий сам решает, что делать: см. find_live_supervisor).
+    """
+    if supervisor_lock_held(cfg):
+        d = IL.read_info(marker_path(cfg))
+        if d and _marker_matches(d, cfg) is False:
+            return 0
+        try:
+            pid = int(d.get("pid") or 0)
+        except Exception:
+            pid = 0
+        return pid if pid > 0 else 0
+    return _legacy_marker_pid(cfg)
+
+
+def _legacy_marker_pid(cfg: dict) -> int:
+    """Старый признак (маркер без замка) — только для перехода и отчётов.
+
+    Нужен, чтобы ``--status``/``--watchdog status`` честно показывали экземпляр
+    прежней версии, который замка ещё не держит. Решение о запуске второй копии
+    по этому признаку НЕ принимается.
+    """
     d = read_marker(cfg)
     if not d or not _marker_matches(d, cfg):
         return 0
@@ -355,22 +461,22 @@ def _marker_live_pid(cfg: dict) -> int:
         if img:
             want = os.path.normcase(os.path.abspath(our_exe(cfg)))
             if os.path.normcase(os.path.abspath(img)) != want:
-                # pid переиспользован чужим процессом -> маркер мёртв
                 return 0
     return pid
 
 
 def write_marker(cfg: dict, argv=None) -> None:
-    """Пишет маркер атомарно (os.replace)."""
+    """Пишет диагностику владельца замка (JSON). Замок это не заменяет.
+
+    Если замок у нас — пишем в его файл; если нет (проверки/переход) — просто
+    пишем файл, как раньше, чтобы отчёты и тесты читали те же данные.
+    """
     p = marker_path(cfg)
-    d = {
-        "pid": os.getpid(),
-        "ts": time.time(),
-        "exe": our_exe(cfg),
-        "root": cfg["paths"]["root"],
-        "argv": list(argv or sys.argv[1:]),
-        "frozen": bool(getattr(sys, "frozen", False)),
-    }
+    d = _info_for_marker(cfg, argv)
+    lk = _SUP_LOCK
+    if lk is not None and lk.held and lk.path == p:
+        lk.write_info(d)
+        return
     try:
         os.makedirs(os.path.dirname(p), exist_ok=True)
         tmp = f"{p}.{os.getpid()}.tmp"
@@ -382,8 +488,17 @@ def write_marker(cfg: dict, argv=None) -> None:
 
 
 def clear_marker(cfg: dict) -> None:
-    """Удаляет маркер, только если он принадлежит НАШЕМУ процессу."""
+    """Убирает файл замка — только у СВОЕГО процесса (иначе чужой замок цел).
+
+    В обычной работе файл замка не удаляется: ОС снимает сам замок при выходе
+    процесса, а удаление файла могло бы «разъехаться» с замком (см.
+    instancelock.InstanceLock.release). Здесь — для проверок и явного сброса.
+    """
+    lk = _SUP_LOCK
     try:
+        if lk is not None and lk.held and lk.path == marker_path(cfg):
+            lk.release()
+            return
         d = read_marker(cfg)
         if d and int(d.get("pid") or 0) == os.getpid():
             os.unlink(marker_path(cfg))
@@ -393,11 +508,23 @@ def clear_marker(cfg: dict) -> None:
 
 # ══════════════════════════════════════════════ поиск живого супервизора ═══
 def find_live_supervisor(cfg: dict, exclude=()) -> int:
-    """Pid живого супервизора ЭТОЙ установки, иначе 0. Ничего не меняет."""
+    """Pid живого супервизора ЭТОЙ установки, иначе 0. Ничего не меняет.
+
+    Источник истины — ЗАМОК. Скан процессов нужен только чтобы НАЗВАТЬ pid,
+    когда замок занят, а данных владельца ещё нет. Решение о запуске второй
+    копии по этому признаку не принимается (см. claim_supervisor/ensure).
+    """
     ex = set(int(x) for x in (exclude or ()))
     pid = _marker_live_pid(cfg)
-    if pid and pid not in ex:
-        return pid
+    if pid:
+        return pid if pid not in ex else 0
+    if supervisor_lock_held(cfg) or we_are_supervisor():
+        # замок занят/держим нами, а pid неизвестен — уточняем сканом
+        for p in _scan_our_supervisors(cfg):
+            if p not in ex:
+                return p
+        return 0
+    # переход: экземпляр прежней версии (замка ещё нет)
     for p in _scan_our_supervisors(cfg):
         if p not in ex:
             return p
@@ -407,86 +534,54 @@ def find_live_supervisor(cfg: dict, exclude=()) -> int:
 def claim_supervisor(cfg: dict) -> bool:
     """Стать супервизором. False — живой супервизор уже есть (второй не нужен).
 
-    Атомарность: маркер создаётся эксклюзивно (O_CREAT|O_EXCL). Если он уже
-    есть и принадлежит живому нашему процессу — отказ. Если свежий (кто-то
-    стартует прямо сейчас) — отказ. Если устаревший/чужой — забираем.
+    Проверка РОВНО одна и она атомарна: эксклюзивный замок файла, который
+    держит ядро ОС всё время жизни процесса. Гонки на старте нет: при
+    одновременном запуске замок достаётся ровно одному — второй видит живой
+    замок и тихо выходит. Список процессов для этого решения НЕ используется:
+    он неатомарен и раньше приводил и к двум экземплярам, и к тому, что не
+    выживал никто.
     """
     global _CLAIMED_PID
     lg = log.get_logger()
     me = os.getpid()
-    if _CLAIMED_PID == me:
-        return False            # этот процесс уже стал супервизором
-    p = marker_path(cfg)
-    os.makedirs(os.path.dirname(p), exist_ok=True)
-
-    # Сначала дешёвая проверка по живому супервизору (маркер + скан процессов).
-    live = find_live_supervisor(cfg, exclude=(me,))
-    if live:
-        lg.info(f"watchdog: супервизор уже работает (pid {live}) — второй не запускаю")
-        return False
-
-    for attempt in (0, 1):
+    if we_are_supervisor():
+        return False            # этот процесс уже супервизор
+    lk = supervisor_lock(cfg)
+    if not lk.acquire(_info_for_marker(cfg)):
+        d = lk.read_info()
         try:
-            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        except FileExistsError:
-            d = read_marker(cfg)
-            try:
-                pid = int(d.get("pid") or 0)
-            except Exception:
-                pid = 0
-            try:
-                age = time.time() - os.path.getmtime(p)
-            except Exception:
-                age = MARKER_FRESH_S + 1
-            if pid:
-                # маркер уже кому-то принадлежит
-                if pid != me and pid_alive(pid) and _marker_matches(d, cfg):
-                    lg.info(f"watchdog: супервизор уже работает (pid {pid}) — "
-                            "второй не запускаю")
-                    return False
-                # pid есть, но он не наш живой процесс -> маркер мёртвый/чужой
-                if attempt == 0:
-                    lg.warn(f"watchdog: маркер мёртвого/чужого процесса "
-                            f"(pid {pid}, age={age:.1f}s) — забираю")
-                    try:
-                        os.unlink(p)
-                    except Exception:
-                        pass
-                    continue
-                lg.warn("watchdog: маркер занят мёртвым процессом — "
-                        "супервизор не запускаю")
-                return False
-            # pid ещё не записан: кто-то стартует прямо сейчас (гонка)
-            if age < MARKER_FRESH_S:
-                lg.info("watchdog: супервизор стартует прямо сейчас — второй не нужен")
-                return False
-            if attempt == 0:
-                lg.warn(f"watchdog: пустой устаревший маркер (age={age:.1f}s) — забираю")
-                try:
-                    os.unlink(p)
-                except Exception:
-                    pass
-                continue
-            lg.warn("watchdog: маркер занят — супервизор не запускаю")
-            return False
-        else:
-            try:
-                os.write(fd, os.fsencode(json.dumps({
-                    "pid": me, "ts": time.time(), "exe": our_exe(cfg),
-                    "root": cfg["paths"]["root"],
-                    "argv": list(sys.argv[1:])})) )
-            finally:
-                os.close(fd)
-            _CLAIMED_PID = me
-            lg.info(f"watchdog: маркер супервизора занят (pid {me}, {p})")
-            return True
-    return False
+            owner = int(d.get("pid") or 0)
+        except Exception:
+            owner = 0
+        lg.info("watchdog: супервизор уже работает (pid %s; замок %s) — "
+                "второй не запускаю" % (owner or "?", marker_path(cfg)))
+        return False
+    _CLAIMED_PID = me
+    os.environ[SELF_ENV] = "1"
+    if lk.degraded:
+        lg.warn("watchdog: замок супервизора деградирован (файл недоступен) — "
+                "работаю без него")
+    lg.info(f"watchdog: замок супервизора занят (pid {me}, {marker_path(cfg)})")
+    return True
 
 
 def release_supervisor(cfg: dict) -> None:
+    """Отпускает замок. Файл не удаляем — замок снимает ОС вместе с процессом."""
     global _CLAIMED_PID
     _CLAIMED_PID = 0
-    clear_marker(cfg)
+    try:
+        os.environ.pop(SELF_ENV, None)
+    except Exception:
+        pass
+    lk = _SUP_LOCK
+    if lk is not None and lk.held:
+        lk.release(unlink=False)
+    try:
+        with open(marker_path(cfg), "w", encoding="utf-8") as f:
+            json.dump({"pid": 0, "ts": time.time(), "released": True,
+                       "root": cfg["paths"]["root"], "exe": our_exe(cfg)}, f)
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════════ --ensure ═══
@@ -494,33 +589,19 @@ def _ensure_lock_path(cfg: dict) -> str:
     return os.path.join(cfg["paths"]["state_dir"], ENSURE_LOCK_NAME)
 
 
-def _acquire_ensure_lock(cfg: dict) -> bool:
-    p = _ensure_lock_path(cfg)
-    try:
-        os.makedirs(os.path.dirname(p), exist_ok=True)
-        fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o644)
-        try:
-            os.write(fd, os.fsencode(f"{os.getpid()} {time.time()}\n"))
-        finally:
-            os.close(fd)
-        return True
-    except FileExistsError:
-        try:
-            if time.time() - os.path.getmtime(p) > ENSURE_LOCK_STALE_S:
-                os.unlink(p)
-                return _acquire_ensure_lock(cfg)
-        except Exception:
-            pass
-        return False
-    except Exception:
-        return True          # не мешаем работать из-за проблем с замком
+def _acquire_ensure_lock(cfg: dict):
+    """Короткий замок «сейчас идёт запуск супервизора». None — запуск уже идёт.
+
+    Замок эксклюзивный и снимается ядром ОС вместе с процессом, поэтому
+    «зависших» замков не бывает и ждать/чистить устаревшие файлы не нужно
+    (в отличие от прежнего файла-маркера с проверкой возраста).
+    """
+    return IL.try_spawn_lock(_ensure_lock_path(cfg))
 
 
-def _release_ensure_lock(cfg: dict) -> None:
-    try:
-        os.unlink(_ensure_lock_path(cfg))
-    except Exception:
-        pass
+def _release_ensure_lock(lock) -> None:
+    if lock is not None:
+        lock.release(unlink=False)
 
 
 def launch_command(cfg: dict) -> list:
@@ -570,7 +651,14 @@ def _spawn_detached(cmd: list, root: str, cfg: dict) -> tuple:
     (последний, чтобы смерть дерева процессов родителя — например, обновление
     среды — не уносила супервизор). Если job не даёт breakaway — повтор без него.
     POSIX: setsid (новая сессия), без управляющего терминала.
+
+    Единое правило самоконтроля: процесс, который САМ является супервизором,
+    не поднимает вторую копию ни при каких обстоятельствах.
     """
+    if we_are_supervisor():
+        log.get_logger().error("watchdog: отказ от запуска — этот процесс сам "
+                               "супервизор (второй копии быть не должно)")
+        return False, 0
     env = dict(os.environ)
     env["FOREST_ROOT"] = cfg["paths"]["root"]
     if cfg.get("_config_path"):
@@ -611,12 +699,11 @@ def _spawn_detached(cmd: list, root: str, cfg: dict) -> tuple:
 
 
 def _wait_supervisor(cfg: dict, timeout_s: float = 12.0) -> int:
-    """Ждёт появления маркера живого супервизора. -> pid|0. Только для сверки."""
+    """Ждёт появления ЖИВОГО замка супервизора. -> pid|0. Только для сверки."""
     t0 = time.time()
     while time.time() - t0 < timeout_s:
-        pid = _marker_live_pid(cfg)
-        if pid:
-            return pid
+        if supervisor_lock_held(cfg):
+            return find_live_supervisor(cfg, exclude=(os.getpid(),))
         time.sleep(0.25)
     return 0
 
@@ -626,15 +713,31 @@ def ensure(cfg: dict, spawn: bool = True) -> int:
 
     Вывод — только в лог. Возврат: 0 — всё в порядке (супервизор есть или
     поднят), 1 — поднять не удалось.
+
+    Правила (одинаковые для задачи Планировщика, ручного вызова и любых
+    внутренних проверок):
+
+    1. живой замок супервизора -> НИЧЕГО не делаем (лишний тик/вызов безвреден);
+    2. этот процесс сам супервизор -> вторую копию не поднимаем никогда;
+    3. запуск сериализован коротким замком «идёт запуск» (гонка двух --ensure).
     """
     lg = log.get_logger()
-    if not _acquire_ensure_lock(cfg):
-        lg.info("watchdog: другой --ensure уже идёт — выхожу")
+    if we_are_supervisor():
+        lg.info("watchdog: я и есть супервизор — вторую копию не поднимаю")
+        return 0
+    if supervisor_lock_held(cfg):
+        pid = find_live_supervisor(cfg, exclude=(os.getpid(),))
+        lg.info("watchdog: супервизор жив (pid %s; замок занят) — ничего не делаю"
+                % (pid or "?"))
+        return 0
+    spawn_lock = _acquire_ensure_lock(cfg)
+    if spawn_lock is None:
+        lg.info("watchdog: другой --ensure/запуск уже идёт — выхожу")
         return 0
     try:
-        pid = find_live_supervisor(cfg, exclude=(os.getpid(),))
-        if pid:
-            lg.info(f"watchdog: супервизор жив (pid {pid}) — ничего не делаю")
+        if supervisor_lock_held(cfg):      # перепроверка уже под замком запуска
+            lg.info("watchdog: супервизор появился, пока брал замок запуска — "
+                    "ничего не делаю")
             return 0
         cmd = launch_command(cfg)
         lg.info("watchdog: супервизора нет — запускаю отвязанно: %s" % " ".join(cmd))
@@ -647,14 +750,16 @@ def ensure(cfg: dict, spawn: bool = True) -> int:
             return 1
         lg.info(f"watchdog: супервизор запущен (pid {new_pid})")
         got = _wait_supervisor(cfg)
-        if got:
-            lg.info(f"watchdog: маркер супервизора подтверждён (pid {got})")
+        if got or supervisor_lock_held(cfg):
+            pid = got or find_live_supervisor(cfg, exclude=(os.getpid(),))
+            lg.info("watchdog: замок супервизора подтверждён" +
+                    (f" (pid {pid})" if pid else ""))
         else:
-            lg.warn("watchdog: маркер не появился за отведённое время "
+            lg.warn("watchdog: замок супервизора не появился за отведённое время "
                     "(супервизор мог ещё стартовать)")
         return 0
     finally:
-        _release_ensure_lock(cfg)
+        _release_ensure_lock(spawn_lock)
 
 
 # ══════════════════════════════════════════════ задача Планировщика ═══
@@ -938,9 +1043,13 @@ def apply_watchdog(cfg: dict, log_msg: bool = True) -> dict:
 
 
 def watchdog_report(cfg: dict) -> dict:
-    """Сводка для ``--watchdog status`` / ``--status`` (без побочных эффектов)."""
+    """Сводка для ``--watchdog status`` / ``--status`` (без побочных эффектов).
+
+    «Работает ли программа» решает ЗАМОК (он не врёт: его снимает ядро ОС
+    вместе с процессом), а pid из диагностики замка/скана — только для показа.
+    """
     st = settings(cfg)
-    rep = {"settings": st, "task": task_status(cfg),
-           "supervisor_pid": find_live_supervisor(cfg, exclude=(os.getpid(),))}
-    rep["supervisor_alive"] = bool(rep["supervisor_pid"])
+    pid = find_live_supervisor(cfg, exclude=(os.getpid(),))
+    rep = {"settings": st, "task": task_status(cfg), "supervisor_pid": pid}
+    rep["supervisor_alive"] = bool(pid) or supervisor_lock_held(cfg)
     return rep

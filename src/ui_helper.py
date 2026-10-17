@@ -29,6 +29,49 @@ IS_WIN = sys.platform.startswith("win")
 NAME_WIN = "forest-ui.exe"
 NAME_POSIX = "forest-ui"
 STOP_FLAG = "ui_stop.flag"
+# Замок помощника: НАСТОЯЩАЯ эксклюзивная блокировка файла, держится всё время
+# жизни помощника (см. instancelock.py). Решает по факту, а не по PID в пульсе:
+# раньше два супервизора могли одновременно поднять по помощнику, и в трее
+# оказывалось два значка.
+LOCK_NAME = "forest-ui.lock"
+SPAWN_LOCK_NAME = "forest-ui.ensure.lock"
+# Пометка «этот процесс и есть помощник» — единое правило самоконтроля.
+HELPER_ENV = "FOREST_UI"
+
+
+def we_are_helper() -> bool:
+    return os.environ.get(HELPER_ENV) == "1"
+
+
+def _state_dir(cfg: dict) -> str:
+    try:
+        return ((cfg or {}).get("paths") or {}).get("state_dir") or ""
+    except Exception:
+        return ""
+
+
+def lock_path(cfg: dict) -> str:
+    d = _state_dir(cfg)
+    return os.path.join(d, LOCK_NAME) if d else ""
+
+
+def spawn_lock_path(cfg: dict) -> str:
+    d = _state_dir(cfg)
+    return os.path.join(d, SPAWN_LOCK_NAME) if d else ""
+
+
+def helper_lock_held(cfg: dict) -> bool:
+    """Занят ли замок помощника живым процессом (источник истины)."""
+    if we_are_helper():
+        return True
+    p = lock_path(cfg)
+    if not p:
+        return False
+    try:
+        import instancelock as IL
+        return IL.held(p)
+    except Exception:
+        return False
 
 
 def helper_name() -> str:
@@ -150,11 +193,19 @@ def running_pid(cfg: dict) -> int:
 
 
 def running(cfg: dict) -> bool:
+    """Работает ли помощник: ЗАМОК (источник истины) либо живой пульс."""
+    if we_are_helper():
+        return True
+    if helper_lock_held(cfg):
+        return True
     return running_pid(cfg) > 0
 
 
 def launch(cfg: dict, log_msg: bool = True) -> bool:
     """Запускает помощник отвязанно. -> True, если процесс стартовал."""
+    if we_are_helper():
+        _info("помощник интерфейса: я и есть помощник — вторую копию не запускаю")
+        return True
     cmd = command(cfg)
     if not cmd:
         return False
@@ -249,13 +300,45 @@ def _clear(cfg: dict) -> None:
         pass
 
 
+def _spawn_lock(cfg: dict):
+    """Короткий замок «сейчас запускаю помощника» (None — запуск уже идёт)."""
+    p = spawn_lock_path(cfg)
+    if not p:
+        return None
+    try:
+        import instancelock as IL
+        return IL.try_spawn_lock(p)
+    except Exception:
+        return None
+
+
 def ensure(cfg: dict) -> bool:
-    """Держит помощник живым: запускает, если его нет. Тихо, только в лог."""
+    """Держит помощник живым: запускает, если его нет. Тихо, только в лог.
+
+    Единые правила (те же, что у супервизора в ``watchdog.ensure``):
+
+    1. живой замок помощника -> ничего не делаем (лишний вызов безвреден);
+    2. этот процесс сам помощник -> вторую копию не поднимаем никогда;
+    3. запуск сериализован коротким замком: два супервизора, зовущие ensure()
+       одновременно, не поднимут двух помощников (раньше поднимали — отсюда
+       два значка в трее).
+    """
+    if we_are_helper():
+        return True
     if not enabled(cfg):
         return False
     if running(cfg):
         return True
-    return launch(cfg)
+    lk = _spawn_lock(cfg)
+    if lk is None:
+        _info("помощник интерфейса: другой запуск уже идёт — второй не поднимаю")
+        return True
+    try:
+        if running(cfg):            # перепроверка уже под замком запуска
+            return True
+        return launch(cfg)
+    finally:
+        lk.release(unlink=False)
 
 
 def restart(cfg: dict) -> bool:

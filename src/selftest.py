@@ -556,7 +556,8 @@ def main() -> int:
           "--ensure" in WD.install_args({"watchdog": {}}) and
           "--config" in WD.install_args({"_config_path": r"C:\x\config.json"}))
 
-    # 14.3 маркер супервизора: живой и мёртвый pid
+    import instancelock as IL
+    # 14.3 маркер/ЗАМОК супервизора: эксклюзивная блокировка файла
     me = os.getpid()
     if getattr(sys, "frozen", False):
         root_wd = os.path.dirname(os.path.abspath(sys.executable))
@@ -577,32 +578,147 @@ def main() -> int:
     check("своя семья: родитель-bootloader не считается чужим супервизором",
           me in skip and 4242 in skip)
     check("своя семья: посторонний процесс не исключается", 9999 not in skip)
-    WD.write_marker(cfg_wd, argv=["--run"])
+    # 14.3b сам замок: эксклюзивность подтверждается НЕЗАВИСИМОЙ попыткой
+    probe_lock = os.path.join(_TMP, "ilock", "probe.lock")
+    ok_x, det_x = IL.exclusivity_check(probe_lock)
+    check("замок эксклюзивен: независимая вторая попытка получает отказ",
+          ok_x, det_x)
+    lk_tmp = IL.InstanceLock(probe_lock)
+    check("замок: повторный захват своим объектом идемпотентен",
+          lk_tmp.acquire() is True)
+    lk_tmp.write_info({"pid": me, "ts": time.time()})
+    check("замок: занятость видна пробой (vtoroy дескриптор)", IL.held(probe_lock))
+    check("замок: владелец виден как pid", IL.holder_pid(probe_lock) == me,
+          str(IL.holder_pid(probe_lock)))
+    check("замок: вторая независимая попытка при живом владельце — отказ",
+          IL.exclusivity_check(probe_lock)[0] is False)
+    lk_tmp.release()
+    check("замок: после снятия владельцем файл убран", not os.path.exists(probe_lock))
+    check("замок: мёртвого владельца не бывает (ОС снимает) — путь снова свободен",
+          not IL.held(probe_lock))
+    # 14.3c замок супервизора этой установки
+    check("замок супервизора: путь = state/supervisor.lock",
+          WD.marker_path(cfg_wd).endswith("supervisor.lock"))
+    WD.clear_marker(cfg_wd)
+    check("замок супервизора: до захвата не занят",
+          WD.supervisor_lock_held(cfg_wd) is False)
+    got1 = WD.claim_supervisor(cfg_wd)
+    check("claim: первый экземпляр становится супервизором", got1 is True)
+    check("claim: замок супервизора занят", WD.supervisor_lock_held(cfg_wd) is True)
+    check("claim: процесс помечен как супервизор (единое правило)",
+          WD.we_are_supervisor() is True)
+    got2 = WD.claim_supervisor(cfg_wd)
+    check("claim: второй отказывается (нет второго --run)", got2 is False)
     d = WD.read_marker(cfg_wd)
-    check("маркер записан (pid/root/exe)",
-          d.get("pid") == me and d.get("root") == cfg_wd["paths"]["root"])
-    check("живой маркер распознан", WD._marker_live_pid(cfg_wd) == me)
-    check("find_live_supervisor видит супервизора по маркеру",
+    check("замок: диагностика владельца записана (pid/root)",
+          d.get("pid") == me and d.get("root") == cfg_wd["paths"]["root"], str(d))
+    check("pid живого супервизора читается из замка",
+          WD._marker_live_pid(cfg_wd) == me)
+    check("find_live_supervisor видит супервизора (замок занят)",
           WD.find_live_supervisor(cfg_wd) == me)
     check("find_live_supervisor исключает свой pid",
           WD.find_live_supervisor(cfg_wd, exclude=(me,)) == 0)
+    # 14.3d единое правило самоконтроля: супервизор НИКОГДА не поднимает копию
+    orig_spawn = WD._spawn_detached
+    calls = []
+    WD._spawn_detached = lambda *a, **k: (calls.append(a), (False, 0))[1]
+    try:
+        rc_a = WD.ensure(cfg_wd)
+        rc_b = WD.ensure(cfg_wd)
+    finally:
+        WD._spawn_detached = orig_spawn
+    check("ensure: живой супервизор (замок занят) — запуска не было",
+          not calls, str(calls))
+    check("ensure: тихо возвращает 0", rc_a == 0 and rc_b == 0)
+    WD.release_supervisor(cfg_wd)
+    check("release: замок освобождён", WD.supervisor_lock_held(cfg_wd) is False)
+    check("release: процесс больше не супервизор",
+          WD.we_are_supervisor() is False)
+    check("release: живого супервизора нет", WD._marker_live_pid(cfg_wd) == 0)
+
+    # 14.4 запуск: один, под замком запуска, и уважает живой замок
+    check("ensure без супервизора (пробно, без запуска) -> 0",
+          WD.ensure(cfg_wd, spawn=False) == 0)
+    calls2 = []
+    WD._spawn_detached = lambda *a, **k: (calls2.append(a), (False, 0))[1]
+    try:
+        rc3 = WD.ensure(cfg_wd, spawn=True)
+    finally:
+        WD._spawn_detached = orig_spawn
+    check("ensure: супервизора нет — запуск вызван ровно один раз",
+          len(calls2) == 1, str(len(calls2)))
+    lk_hold = IL.InstanceLock(WD.marker_path(cfg_wd))
+    check("внешний владелец занял замок супервизора",
+          lk_hold.acquire({"pid": 424242}) is True)
+    calls3 = []
+    WD._spawn_detached = lambda *a, **k: (calls3.append(a), (False, 0))[1]
+    try:
+        rc4 = WD.ensure(cfg_wd, spawn=True)
+    finally:
+        WD._spawn_detached = orig_spawn
+    check("ensure: живой ЧУЖОЙ замок -> второй экземпляр не поднимается",
+          not calls3 and rc4 == 0, str(calls3))
+    check("watchdog_report: программа работает (замок занят)",
+          WD.watchdog_report(cfg_wd)["supervisor_alive"] is True)
+    lk_hold.release(unlink=False)
+    # переходный случай: маркер прежней версии без замка
+    WD.clear_marker(cfg_wd)
     with open(WD.marker_path(cfg_wd), "w", encoding="utf-8") as f:
         json.dump({"pid": 999999, "ts": time.time(), "exe": WD.our_exe(cfg_wd),
                    "root": cfg_wd["paths"]["root"]}, f)
-    check("мёртвый pid -> супервизора нет", WD._marker_live_pid(cfg_wd) == 0)
-    check("ensure без супервизора (пробно, без запуска) -> 0",
-          WD.ensure(cfg_wd, spawn=False) == 0)
+    check("старый маркер с мёртвым pid -> супервизора нет",
+          WD._marker_live_pid(cfg_wd) == 0)
+    check("старый маркер с мёртвым pid не мешает запуску (замок свободен)",
+          WD.supervisor_lock_held(cfg_wd) is False)
 
-    # 14.4 захват: двух --run быть не должно
-    WD.clear_marker(cfg_wd)
-    got1 = WD.claim_supervisor(cfg_wd)
-    got2 = WD.claim_supervisor(cfg_wd)
-    check("claim: первый экземпляр становится супервизором", got1 is True)
-    check("claim: второй отказывается (нет второго --run)", got2 is False)
-    WD.release_supervisor(cfg_wd)
-    check("release убрал маркер", WD._marker_live_pid(cfg_wd) == 0)
+    # 14.5 помощник интерфейса: ОДИН на установку — тоже замок, а не пульс
+    import ui_helper as UH
+    check("помощник: путь замка = state/forest-ui.lock",
+          UH.lock_path(cfg_wd).endswith("forest-ui.lock"))
+    check("помощник: замок свободен -> running() = False",
+          UH.running(cfg_wd) is False)
+    hk = IL.InstanceLock(UH.lock_path(cfg_wd))
+    check("помощник: владелец занял замок", hk.acquire({"pid": 424242}) is True)
+    check("помощник: running() видит живой замок даже без пульса",
+          UH.running(cfg_wd) is True)
+    check("помощник: второй экземпляр помощника получает отказ",
+          IL.exclusivity_check(UH.lock_path(cfg_wd))[0] is False)
+    cfg_wd.setdefault("ui", {})["helper"] = "on"      # запускать разрешено
+    orig_launch = UH.launch
+    launched = []
+    UH.launch = lambda cfg, log_msg=True: (launched.append(1), True)[1]
+    try:
+        UH.ensure(cfg_wd)
+    finally:
+        UH.launch = orig_launch
+    check("помощник: пока замок занят, второй НЕ запускается", not launched,
+          str(launched))
+    hk.release(unlink=False)
+    launched2 = []
+    UH.launch = lambda cfg, log_msg=True: (launched2.append(1), True)[1]
+    try:
+        UH.ensure(cfg_wd)
+    finally:
+        UH.launch = orig_launch
+    check("помощник: свободный замок -> запуск ровно один раз",
+          len(launched2) == 1, str(len(launched2)))
+    os.environ[UH.HELPER_ENV] = "1"
+    launched3 = []
+    UH.launch = lambda cfg, log_msg=True: (launched3.append(1), True)[1]
+    try:
+        UH.ensure(cfg_wd)
+    finally:
+        UH.launch = orig_launch
+        os.environ.pop(UH.HELPER_ENV, None)
+    check("помощник: процесс-помощник не поднимает вторую копию", not launched3,
+          str(launched3))
+    for _l in (UH.lock_path(cfg_wd), UH.spawn_lock_path(cfg_wd)):
+        try:
+            os.unlink(_l)
+        except Exception:
+            pass
 
-    # 14.5 отчёт/статус задачи (только чтение)
+    # 14.6 отчёт/статус задачи (только чтение)
     os.environ["FOREST_TASK_NAME"] = "ForestSelftest-NoSuchTask-QZ"
     rep = WD.watchdog_report(cfg_wd)
     os.environ.pop("FOREST_TASK_NAME", None)

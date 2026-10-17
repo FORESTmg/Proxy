@@ -31,7 +31,7 @@ for _f in (_ICON, _EXAMPLE, os.path.join(_SRC, "forest_ui.py")):
 HIDDEN = [
     "config", "i18n", "log", "notify", "theme", "tray_icon", "tray_menu",
     "tray_status", "ui_cmd", "ui_helper", "clientwrite", "clientwrite_posix",
-    "clientwrite_v2rayn", "watchdog", "parser", "netfilters",
+    "clientwrite_v2rayn", "instancelock", "watchdog", "parser", "netfilters",
 ]
 
 DATAS = [(_ICON, "."), (_EXAMPLE, ".")]

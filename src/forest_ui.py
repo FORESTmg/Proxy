@@ -901,6 +901,38 @@ def selftest(cfg: dict) -> int:
 
     print()
     print("=" * 64)
+    print("4б. одноэкземплярность: ЗАМОК помощника (не PID в пульсе)")
+    print("=" * 64)
+    try:
+        import tempfile
+        import shutil as _sh
+        import instancelock as IL
+        import ui_helper as UH
+        tmpdir = tempfile.mkdtemp(prefix="forest_ui_lock_")
+        lockp = _lock_path({"paths": {"state_dir": tmpdir}})
+        print(f"  путь замка: {os.path.basename(lockp)}")
+        ok_x, det_x = IL.exclusivity_check(lockp)
+        chk("замок эксклюзивен: независимая вторая попытка получает отказ",
+            ok_x, det_x)
+        cfg2 = dict(cfg)
+        cfg2["paths"] = dict(cfg.get("paths") or {})
+        cfg2["paths"]["state_dir"] = tmpdir
+        got = single_instance_guard(cfg2)
+        chk("single_instance_guard занимает замок", got is True and IL.held(lockp),
+            f"guard={got}")
+        second = IL.InstanceLock(lockp)
+        chk("второй экземпляр помощника получит отказ (замок занят)",
+            second.acquire() is False)
+        chk("ui_helper.running() видит помощника по замку (без пульса)",
+            UH.running(cfg2) is True)
+        chk("ui_helper.ensure() не поднимает второго при живом замке",
+            UH.ensure(cfg2) is True and IL.held(lockp) is True)
+        _sh.rmtree(tmpdir, ignore_errors=True)
+    except Exception as e:
+        chk("проверки замка помощника прошли", False, str(e))
+
+    print()
+    print("=" * 64)
     print("5. уведомление: анимация, кадры, фокус")
     print("=" * 64)
     fg_before = foreground()
@@ -1057,12 +1089,47 @@ def proc_cpu_ms() -> float:
 
 
 # ═══════════════════════════════════════════════ запуск ═══
+_LOCK = None            # замок помощника, удерживаемый этим процессом
+
+
+def _lock_path(cfg: dict) -> str:
+    d = ((cfg or {}).get("paths") or {}).get("state_dir") or ""
+    return os.path.join(d, "forest-ui.lock") if d else ""
+
+
 def single_instance_guard(cfg: dict) -> bool:
-    """True — работаем; False — помощник уже запущен (тихо выходим)."""
-    p = UC.ping_path(cfg)
+    """True — работаем; False — помощник уже запущен (тихо выходим).
+
+    Решение принимает ЗАМОК (эксклюзивная блокировка файла, см.
+    ``src/instancelock.py``), а не PID в файле пульса. Пульс появляется с
+    задержкой, поэтому два одновременных запуска проходили старую проверку
+    оба — теперь замок достаётся ровно одному, второй тихо выходит.
+    Если замок недоступен (деградация), работает прежний признак по пульсу.
+    """
+    global _LOCK
+    os.environ["FOREST_UI"] = "1"        # этот процесс — помощник
+    p = _lock_path(cfg)
+    locked = False
     try:
-        if os.path.isfile(p):
-            with open(p, encoding="utf-8") as f:
+        import instancelock as IL
+        lk = IL.InstanceLock(p, tag="forest-ui")
+        if lk.acquire({"pid": os.getpid(), "ts": time.time(),
+                       "exe": sys.executable,
+                       "root": ((cfg or {}).get("paths") or {}).get("root", "")}):
+            _LOCK = lk
+            locked = True
+            if lk.degraded:
+                locked = False           # замок не работает — решаем по пульсу
+    except Exception:
+        _LOCK = None
+    if locked:
+        UC.write_ping(cfg, os.getpid(), "qt")
+        return True
+    # деградация: прежний признак (живой pid в пульсе)
+    try:
+        pp = UC.ping_path(cfg)
+        if os.path.isfile(pp):
+            with open(pp, encoding="utf-8") as f:
                 d = json.load(f)
             pid = int(d.get("pid", 0) or 0)
             if pid and pid != os.getpid() and _alive(pid):

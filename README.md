@@ -130,6 +130,27 @@ The check itself is the `--ensure` mode: it is quick, writes only to the log,
 already running — two running programs would fight over the same port and break
 your connection.
 
+Single-instance operation is held by an **exclusive file lock**
+(`state/supervisor.lock`, module `src/instancelock.py`), not by a marker file
+with a process id. The program takes the lock and holds it for its whole life;
+the operating-system kernel releases it together with the process. Three
+consequences, all verified on a live machine:
+
+* when two copies are started **at the same instant**, exactly one survives — the
+  other sees a live lock and exits quietly (previously **zero** survived: the
+  copies saw each other in the process list and both refused to start);
+* process ids are no longer *guessed* at: while the lock is held no second copy
+  appears, and a dead owner leaves no stale lock behind;
+* a Task Scheduler tick and a repeated `--ensure` do **nothing** while the
+  program runs — an extra call is harmless.
+
+The interface helper has the same lock (`state/forest-ui.lock`): that is why the
+tray always shows **one** icon, even after a helper restart or a double start.
+No thread of the program ever brings up a second copy of it. The built-in
+(reserve) icon does not compete with the helper either: while the helper lives the
+program draws no icon of its own, and if the helper appears later it removes its
+own.
+
 > **Read this.** If the task is not created, or you switch it off, the program
 > **will not restart itself**. After a crash or an accidental close you will have
 > to start it by hand. That is the only mechanical difference between supervised

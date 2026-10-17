@@ -216,6 +216,67 @@ def main() -> int:
 
     print()
     print("=" * 64)
+    print("P8б. Одноэкземплярный ЗАМОК на POSIX (flock) — как на Windows")
+    print("=" * 64)
+    # Здесь важно, что на Linux это ТОТ ЖЕ механизм, что на Windows:
+    # эксклюзивная блокировка файла, которую держит ядро ОС и снимает при
+    # завершении процесса. Проверяем независимой попыткой (fork).
+    import instancelock as IL
+    import watchdog as WD
+    lockp = os.path.join(_TMP, "p8b", "supervisor.lock")
+    ok_x, det_x = IL.exclusivity_check(lockp)
+    check("замок эксклюзивен: независимый потомок (fork) получает отказ", ok_x, det_x)
+    lk = IL.InstanceLock(lockp)
+    check("замок захватывается", lk.acquire({"pid": os.getpid()}) is True)
+    check("замок: занятость видна пробой (flock на другом fd)",
+          IL.held(lockp) is True)
+    check("замок: владелец виден как pid", IL.holder_pid(lockp) == os.getpid(),
+          str(IL.holder_pid(lockp)))
+    lk.release(unlink=False)
+    check("замок: после снятия путь свободен", IL.held(lockp) is False)
+    # мёртвый владелец: замок снимает ядро (проверяем потомком, который умирает)
+    script = (
+        "import os,sys;sys.path.insert(0,sys.argv[1]);import instancelock as IL;"
+        "lk=IL.InstanceLock(sys.argv[2]);lk.acquire();"
+        "os._exit(0)"
+    )
+    subprocess.run([sys.executable, "-c", script,
+                    os.path.join(os.path.dirname(_HERE), "src"), lockp],
+                   timeout=60)
+    check("замок: после смерти владельца он свободен (ОС снимает сама)",
+          IL.held(lockp) is False)
+    cfg_l = {"paths": {"root": _TMP, "state_dir": os.path.dirname(lockp)},
+             "watchdog": {"enabled": True, "interval_min": 5,
+                          "task_name": "ForestSelftest-Linux-Lock"}}
+    check("watchdog: путь замка супервизора — state/supervisor.lock",
+          WD.marker_path(cfg_l).endswith("supervisor.lock"))
+    check("watchdog (Linux): замок свободен до захвата",
+          WD.supervisor_lock_held(cfg_l) is False)
+    got1 = WD.claim_supervisor(cfg_l)
+    got2 = WD.claim_supervisor(cfg_l)
+    check("watchdog (Linux): первый становится супервизором", got1 is True)
+    check("watchdog (Linux): второй отказывается", got2 is False)
+    check("watchdog (Linux): ensure при живом замке не поднимает копию",
+          WD.ensure(cfg_l, spawn=False) == 0)
+    WD.release_supervisor(cfg_l)
+    check("watchdog (Linux): release освобождает замок",
+          WD.supervisor_lock_held(cfg_l) is False)
+    try:
+        import ui_helper as UH
+        check("помощник (Linux): путь замка — forest-ui.lock",
+              UH.lock_path(cfg_l).endswith("forest-ui.lock"))
+        check("помощник (Linux): до захвата running() = False",
+              UH.running(cfg_l) is False)
+        hk = IL.InstanceLock(UH.lock_path(cfg_l))
+        hk.acquire({"pid": os.getpid()})
+        check("помощник (Linux): running() видит живой замок",
+              UH.running(cfg_l) is True)
+        hk.release(unlink=False)
+    except Exception as e:
+        check("помощник (Linux): проверки замка", False, str(e))
+
+    print()
+    print("=" * 64)
     if FAILED:
         print(f"POSIX-тесты НЕ пройдены: {len(FAILED)}")
         for f in FAILED:

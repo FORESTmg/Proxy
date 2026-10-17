@@ -184,6 +184,14 @@ def ensure(cfg: dict) -> int:
     if not systemd_available():
         lg.info("watchdog(Linux): systemd недоступен — ничего не делаю")
         return 0
+    # Единое правило, как на Windows: живой замок супервизора -> ничего не делаем.
+    try:
+        import watchdog as WD
+        if WD.we_are_supervisor() or WD.supervisor_lock_held(cfg):
+            lg.info("watchdog(Linux): замок супервизора занят — второй не поднимаю")
+            return 0
+    except Exception as e:
+        lg.warn(f"watchdog(Linux): проверка замка не удалась ({e}) — продолжаю")
     _rc, out = _systemctl(["is-active", UNIT_SERVICE])
     state = (out or "").strip()
     if state.startswith("active"):

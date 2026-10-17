@@ -61,7 +61,8 @@ HIDDEN = [
     "clientwrite", "clientwrite_posix", "clientwrite_v2rayn",
     "config", "i18n", "log", "netfilters", "notify", "parser", "selftest",
     "sources", "theme", "tray", "tray_check", "tray_icon", "tray_menu",
-    "tray_status", "v2ray_updater", "watch", "watchdog", "xraytest",
+    "instancelock", "tray_status", "v2ray_updater", "watch", "watchdog",
+    "xraytest",
 ]
 
 # данные, которые должны лежать рядом с exe ВНУТРИ onefile-пакета

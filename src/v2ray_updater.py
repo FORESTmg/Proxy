@@ -787,7 +787,12 @@ def _print_watchdog_status(cfg: dict, rep: dict) -> None:
         print(i18n.t("watchdog.task_present") + ": " + i18n.t("watchdog.no"))
     running = (i18n.t("watchdog.program_running") if rep["supervisor_alive"]
                else i18n.t("watchdog.program_stopped"))
-    extra = f" (pid {rep['supervisor_pid']})" if rep["supervisor_alive"] else ""
+    if not rep["supervisor_alive"]:
+        extra = ""
+    elif rep["supervisor_pid"]:
+        extra = f" (pid {rep['supervisor_pid']})"
+    else:
+        extra = " (замок занят)"
     print(i18n.t("watchdog.program") + ": " + running + extra)
     # Честный итог: включено и задача есть / включено, а задачи нет / выключено.
     if not st["enabled"]:

@@ -620,16 +620,25 @@ def run_tray(cfg: dict, stop_event=None, poll_s: float = 2.0,
     ``stop_event`` — ``threading.Event``: его установка убирает значок и
     завершает цикл сообщений. ``on_refresh`` — необязательный колбэк,
     вызываемый по пункту «Обновить серверы сейчас» (триггер всё равно пишется).
+
+    Правило «один значок»: интерфейс ведёт помощник (forest-ui). Пока он жив,
+    встроенный значок НЕ создаётся; если помощника нет — создаём встроенный и,
+    как только помощник появится, свой значок убираем. Иначе в трее оказалось бы
+    два значка (помощник поднимается на секунду-две позже старта супервизора).
     """
     lg = log.get_logger()
     if not IS_WIN:
         return _run_tray_fallback(cfg, stop_event, poll_s)
-    # Если работает помощник интерфейса (forest-ui, Qt) — интерфейс у него:
-    # своего значка не создаём. Иначе в трее было бы ДВА значка, а уведомления
-    # дублировались бы. Помощник ушёл — поднимаем встроенный значок: это и есть
-    # резервный путь (программа работает без помощника).
     try:
         import ui_helper as UH
+        if UH.enabled(cfg):
+            # Помощник поднимается самим супервизором сразу после старта: даём
+            # ему срок объявиться, прежде чем рисовать свой значок.
+            t0 = time.time()
+            while not UH.running(cfg) and time.time() - t0 < 20.0:
+                if stop_event is not None and stop_event.is_set():
+                    return 0
+                time.sleep(0.5)
         if UH.running(cfg):
             lg.info("трей: интерфейс ведёт помощник (forest-ui) — встроенный "
                     "значок ждёт в резерве")
@@ -644,6 +653,26 @@ def run_tray(cfg: dict, stop_event=None, poll_s: float = 2.0,
     actions = TM.TrayActions(cfg, on_refresh=on_refresh)
     host = _TrayHost(actions, poll_s=poll_s, stop_event=stop_event)
     actions.on_exit = host.stop
+
+    def _watch_helper():
+        """Помощник появился уже при работающем встроенном значке — убираем свой."""
+        while not (stop_event is not None and stop_event.is_set()):
+            try:
+                import ui_helper as _UH
+                if _UH.running(cfg):
+                    lg.info("трей: помощник интерфейса поднялся — убираю "
+                            "встроенный значок (интерфейс один)")
+                    host.stop()
+                    return
+            except Exception:
+                pass
+            time.sleep(1.0)
+
+    try:
+        threading.Thread(target=_watch_helper, name="tray-handover",
+                         daemon=True).start()
+    except Exception:
+        pass
     try:
         return host.run()
     except Exception as e:

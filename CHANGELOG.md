@@ -4,6 +4,69 @@ All notable changes to **FOREST's Proxy Auto-updater** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] — 2026-10-17
+
+### Fixed
+
+- **Two copies of the program and two helpers (two tray icons) could run at
+  once.** The single-instance guard was a *marker file with a process id* plus a
+  process-list scan, and both sides of that heuristic were wrong on a live
+  machine:
+  * starting two copies **at the same instant** ended with **zero** survivors —
+    each copy saw the other `--run` process in the list and both refused to
+    start;
+  * when the recorded pid was judged dead (a killed/restarted supervisor, a
+    dead-recorded marker) a new launch **took the marker over** while the old
+    supervisor kept running, and its `watch`/`tray` threads launched a **second
+    helper** as well — the log shows two supervisors and two helper launches at
+    the same second, hence two tray icons and two supervisors competing for
+    `state/state.json` (`WinError 32`, `state.json.tmp`).
+
+### Added
+
+- **`src/instancelock.py` — a real single-instance lock.** An exclusive file lock
+  held for the whole life of the process: `msvcrt.locking` (`LockFile`) on
+  Windows, `fcntl.flock` on POSIX. The kernel releases the lock together with the
+  process, so there are no stale locks and no start-up race. Locking is
+  non-blocking: a second attempt gets an immediate refusal. The file also carries
+  JSON with pid/exe/root/argv, but that is **diagnostics only** — every decision
+  is made by the lock itself. `--selftest` proves exclusivity with an independent
+  attempt (a forked child on POSIX, a second handle on Windows) and checks that a
+  dead owner leaves no held lock.
+
+### Changed
+
+- **`watchdog.py`** — `state/supervisor.lock` is now that lock (the name and the
+  diagnostics JSON stay, so `--status` and the docs keep working). `claim_supervisor`
+  makes exactly one atomic decision — the lock — and no longer scans the process
+  list to decide whether a second copy is needed. `find_live_supervisor`,
+  `_marker_live_pid` and `watchdog_report` report the pid from the lock (with the
+  old marker/scan path kept only as a transition/compat path), and the process
+  scan additionally requires the process to belong to *this* installation (its
+  root or config path must appear in the command line), so installations, the
+  sandbox and the self-test can no longer see each other.
+- **One rule for self-control.** `run_supervisor` marks its process
+  (`FOREST_SUPERVISOR=1`); `watchdog.ensure()` refuses to start anything from
+  such a process, and `_spawn_detached()` refuses as a second line of defence.
+  `--ensure`, the Task Scheduler action and every internal caller therefore share
+  one rule: **a live lock means do nothing**; the start-up itself is serialised by
+  a short `state/ensure.lock` (also a real lock, no stale-age heuristics).
+- **`ui_helper.py` / `forest_ui.py` / `tray.py` — one helper, one tray icon.** The
+  helper now holds an exclusive lock (`state/forest-ui.lock`) for its whole life,
+  which it takes before building the interface; `ui_helper.running()` decides by
+  that lock (the heartbeat JSON is only used to show the pid), `ui_helper.ensure()`
+  is serialised by a short lock and never launches a copy from inside a helper. A
+  second helper now exits quietly instead of adding a second icon. The built-in
+  (reserve) tray icon no longer competes with the helper: the tray thread waits up
+  to 20 s for the helper — which comes up a second or two after the supervisor —
+  and then does not create its own icon at all, and if the helper appears later it
+  removes its own icon (`tray-handover`).
+- **Linux**: `posix_platform.ensure()` respects the same supervisor lock, and the
+  POSIX self-test gained lock checks (`--selftest` covers the lock on both
+  platforms).
+- Documentation (README, README.ru, ARCHITECTURE, ARCHITECTURE.ru) explains the
+  lock and the three properties it guarantees.
+
 ## [1.2.0] — 2026-10-17
 
 ### Added
