@@ -6,7 +6,9 @@
       2. поднимает изолированное окружение packaging\.build-venv и ставит в него
          PyInstaller (пин из requirements-build.txt), если его ещё нет;
       3. добивает входные данные: ядро Xray-core (fetch_core.py, только
-         официальные релизы XTLS) и иконку (make_icon.py, чистый Python);
+         официальные релизы XTLS) и ПРОВЕРЯЕТ иконку пользователя app.ico
+         (её хеш записан в app.ico.sha256); если иконки нет — сборка
+         останавливается, а не подменяет рисунок сгенерированным;
       4. запускает PyInstaller по спеке ForestProxyUpdater.spec;
       5. кладёт результат в packaging\dist\ и печатает размер и SHA256.
 
@@ -21,7 +23,8 @@
 param(
     [switch]$Clean,     # снести .build-venv, build\, dist\ перед сборкой
     [switch]$NoVenv,    # ставить PyInstaller в системный Python, без venv
-    [string]$Python = '' # явный путь к python.exe
+    [string]$Python = '', # явный путь к python.exe
+    [switch]$GenerateIcon # ЯВНО разрешить нарисовать app.ico (make_icon.py)
 )
 
 # ВНИМАНИЕ: именно 'Continue'. При 'Stop' любой вывод нативного процесса в stderr
@@ -147,10 +150,37 @@ if (-not (Test-Path -LiteralPath $CoreExe)) {
     Info 'ядро xray уже на месте (vendor\bin\xray)'
 }
 if (-not (Test-Path -LiteralPath $IconPath)) {
-    Info 'иконки нет — генерирую app.ico'
-    Invoke-Py $py @((Join-Path $Here 'make_icon.py'))
+    if ($GenerateIcon) {
+        Info 'иконки нет — рисую app.ico (make_icon.py, ЯВНО разрешено -GenerateIcon)'
+        Invoke-Py $py @((Join-Path $Here 'make_icon.py'))
+    } else {
+        Die ("нет иконки пользователя: $IconPath`n" +
+             "        Это РИСУНОК ПОЛЬЗОВАТЕЛЯ, а не сгенерированная картинка.`n" +
+             "        Верните её из репозитория:  git checkout -- packaging/app.ico`n" +
+             "        (или соберите .ico из PNG и положите в packaging\app.ico).`n" +
+             "        Осознанно нарисовать новую:  build.ps1 -GenerateIcon")
+    }
 } else {
-    Info 'иконка app.ico уже на месте'
+    # Сверка с записанным хешем: молчаливая подмена иконки ломала значок трея
+    # (пользователь видел чужой рисунок), и это замечалось только глазами.
+    $IconHash = (Get-FileHash -LiteralPath $IconPath -Algorithm SHA256).Hash.ToLower()
+    $IconPin = Join-Path $Here 'app.ico.sha256'
+    $wantIcon = ''
+    if (Test-Path -LiteralPath $IconPin) {
+        foreach ($l in @(Get-Content -LiteralPath $IconPin -ErrorAction SilentlyContinue)) {
+            $s = ([string]$l).Trim()
+            if ($s -and -not $s.StartsWith('#')) { $wantIcon = ($s -split '\s+')[0].ToLower(); break }
+        }
+    }
+    if ($wantIcon -and $wantIcon -ne $IconHash) {
+        Info ("ВНИМАНИЕ: app.ico НЕ совпадает с записанным хешем!`n" +
+              "        ожидалось $wantIcon`n" +
+              "        получено  $IconHash`n" +
+              "        Если иконку обновили СОЗНАТЕЛЬНО — впишите новый хеш в packaging\app.ico.sha256.")
+    } else {
+        Info "иконка app.ico на месте, хеш совпадает с app.ico.sha256"
+    }
+    Info "  app.ico sha256=$IconHash"
 }
 
 # ────────────────────────────────────── 4. сборка ───

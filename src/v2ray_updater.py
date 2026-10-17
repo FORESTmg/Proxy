@@ -50,10 +50,21 @@ else:
     import clientwrite_posix as CW
 
 import config as CFG
+import safestdio as SD
 import i18n
 import log
 
 APP_RUN_VALUE = "ForestProxyUpdater"
+
+
+def _say(text="") -> None:
+    """Печать в stdout через безопасный слой (см. src/safestdio.py).
+
+    Оконная сборка не имеет консоли, а её «кодировка» на Windows — cp1251:
+    печать символа вне cp1251 давала UnicodeEncodeError и МОДАЛЬНОЕ ОКНО
+    PyInstaller на рабочем столе. Никакая печать здесь упасть не может.
+    """
+    SD.say(text)
 
 
 def _no_window() -> int:
@@ -713,11 +724,11 @@ def run_watchdog_command(cfg: dict, action: str) -> int:
             _print_watchdog_status_linux(cfg, st)
             return 0
         if not pp:
-            print("Надзор Linux доступен только на Linux (systemd).")
+            _say("Надзор Linux доступен только на Linux (systemd).")
             return 1
         want = (action == "on")
         _set_config_value(cfg, "watchdog", "enabled", want)
-        print(i18n.t("watchdog.linux_note"))
+        _say(i18n.t("watchdog.linux_note"))
         return 0
 
     import watchdog
@@ -732,12 +743,12 @@ def run_watchdog_command(cfg: dict, action: str) -> int:
         lg.warn("watchdog: настройка не записана в config.json — применяю как есть")
     res = watchdog.apply_watchdog(cfg)
     if want:
-        print(i18n.t("watchdog.turned_on") if res["ok"] else
+        _say(i18n.t("watchdog.turned_on") if res["ok"] else
               i18n.t("watchdog.turn_on_failed", err=res["detail"]))
     else:
-        print(i18n.t("watchdog.turned_off") if res["ok"] else
+        _say(i18n.t("watchdog.turned_off") if res["ok"] else
               i18n.t("watchdog.turn_off_failed", err=res["detail"]))
-    print(i18n.t("watchdog.off_warning") if not want else i18n.t("watchdog.on_note"))
+    _say(i18n.t("watchdog.off_warning") if not want else i18n.t("watchdog.on_note"))
     return 0 if res["ok"] else 1
 
 
@@ -770,21 +781,21 @@ def _set_config_value(cfg: dict, section: str, key: str, value) -> bool:
 
 def _print_watchdog_status(cfg: dict, rep: dict) -> None:
     st, task = rep["settings"], rep["task"]
-    print("=" * 60)
-    print(i18n.t("watchdog.status_title"))
-    print("=" * 60)
-    print(i18n.t("watchdog.setting") + ": " +
+    _say("=" * 60)
+    _say(i18n.t("watchdog.status_title"))
+    _say("=" * 60)
+    _say(i18n.t("watchdog.setting") + ": " +
           (i18n.t("watchdog.enabled") if st["enabled"] else i18n.t("watchdog.disabled")))
-    print(i18n.t("watchdog.interval") % st["interval_min"])
-    print(i18n.t("watchdog.task_name") + f": {st['task_name']}")
+    _say(i18n.t("watchdog.interval") % st["interval_min"])
+    _say(i18n.t("watchdog.task_name") + f": {st['task_name']}")
     if task.get("exists"):
-        print(i18n.t("watchdog.task_present") + ": " + i18n.t("watchdog.yes") +
+        _say(i18n.t("watchdog.task_present") + ": " + i18n.t("watchdog.yes") +
               f"  [{task.get('state', '')}]")
-        print(i18n.t("watchdog.task_action") + f": {task.get('action', '')}")
-        print(i18n.t("watchdog.last_run") + f": {task.get('last_run', '') or '—'}")
-        print(i18n.t("watchdog.next_run") + f": {task.get('next_run', '') or '—'}")
+        _say(i18n.t("watchdog.task_action") + f": {task.get('action', '')}")
+        _say(i18n.t("watchdog.last_run") + f": {task.get('last_run', '') or '—'}")
+        _say(i18n.t("watchdog.next_run") + f": {task.get('next_run', '') or '—'}")
     else:
-        print(i18n.t("watchdog.task_present") + ": " + i18n.t("watchdog.no"))
+        _say(i18n.t("watchdog.task_present") + ": " + i18n.t("watchdog.no"))
     running = (i18n.t("watchdog.program_running") if rep["supervisor_alive"]
                else i18n.t("watchdog.program_stopped"))
     if not rep["supervisor_alive"]:
@@ -793,24 +804,24 @@ def _print_watchdog_status(cfg: dict, rep: dict) -> None:
         extra = f" (pid {rep['supervisor_pid']})"
     else:
         extra = " (замок занят)"
-    print(i18n.t("watchdog.program") + ": " + running + extra)
+    _say(i18n.t("watchdog.program") + ": " + running + extra)
     # Честный итог: включено и задача есть / включено, а задачи нет / выключено.
     if not st["enabled"]:
-        print(i18n.t("watchdog.off_warning"))
+        _say(i18n.t("watchdog.off_warning"))
     elif not task.get("exists"):
-        print(i18n.t("watchdog.task_missing_warn"))
+        _say(i18n.t("watchdog.task_missing_warn"))
     else:
-        print(i18n.t("watchdog.on_note"))
+        _say(i18n.t("watchdog.on_note"))
 
 
 def _print_watchdog_status_linux(cfg: dict, st: dict) -> None:
-    print("=" * 60)
-    print(i18n.t("watchdog.status_title"))
-    print("=" * 60)
-    print(i18n.t("watchdog.setting") + ": " +
+    _say("=" * 60)
+    _say(i18n.t("watchdog.status_title"))
+    _say("=" * 60)
+    _say(i18n.t("watchdog.setting") + ": " +
           (i18n.t("watchdog.enabled") if st["enabled"] else i18n.t("watchdog.disabled")))
-    print(i18n.t("watchdog.service") + f": {st.get('service', '')}")
-    print(i18n.t("watchdog.linux_note"))
+    _say(i18n.t("watchdog.service") + f": {st.get('service', '')}")
+    _say(i18n.t("watchdog.linux_note"))
 
 
 # ══════════════════════════════════════════ установка / удаление ═══
@@ -1200,14 +1211,14 @@ def install(cfg: dict) -> int:
                         "автоматически — вмешательство не требуется.")
         except Exception as e:
             lg.warn(f"  первый цикл: {e}")
-    print(i18n.t("install.done"))
-    print(i18n.t("install.proxy_note"))
+    _say(i18n.t("install.done"))
+    _say(i18n.t("install.proxy_note"))
     # Понятное предупреждение про надзор — пользователь обязан знать (без англицизмов).
     if wd.get("ok") and wd.get("action") in ("created", "unchanged") and \
             watchdog.settings(cfg)["enabled"]:
-        print(i18n.t("watchdog.install_notice_on"))
+        _say(i18n.t("watchdog.install_notice_on"))
     else:
-        print(i18n.t("watchdog.install_notice_off"))
+        _say(i18n.t("watchdog.install_notice_off"))
     return 0
 
 
@@ -1237,7 +1248,7 @@ def uninstall(cfg: dict) -> int:
     ok_t, detail_t = watchdog.delete_task(cfg=cfg)
     lg.info(f"  надзор (задача Планировщика): "
             f"{'снят' if ok_t else 'ОШИБКА'} — {detail_t}")
-    print(i18n.t("watchdog.uninstall_notice") if ok_t
+    _say(i18n.t("watchdog.uninstall_notice") if ok_t
           else i18n.t("watchdog.uninstall_failed", err=detail_t))
     _remove_autostart()
     left = _read_autostart()
@@ -1260,8 +1271,8 @@ def uninstall(cfg: dict) -> int:
         # себя удалить нельзя — откладываем нашим внутренним «чистильщику»
         if _schedule_delete([exe], root):
             lg.info(f"  exe удалится после выхода программы (запущен сейчас): {exe}")
-            print(i18n.t("install.uninstalled"))
-            print(i18n.t("install.proxy_note"))
+            _say(i18n.t("install.uninstalled"))
+            _say(i18n.t("install.proxy_note"))
             return 0
         lg.warn(f"  exe занят запущенным процессом — удалите вручную: {exe}")
     else:
@@ -1288,8 +1299,8 @@ def uninstall(cfg: dict) -> int:
                 lg.info(f"  каталог удалён: {root}")
     except Exception as e:
         lg.warn(f"  каталог: {e}")
-    print(i18n.t("install.uninstalled"))
-    print(i18n.t("install.proxy_note"))
+    _say(i18n.t("install.uninstalled"))
+    _say(i18n.t("install.proxy_note"))
     return 0
 
 
@@ -1298,7 +1309,7 @@ def show_status(cfg: dict) -> int:
     """``--status``: печатает отчёт И кладёт его файлом в каталог состояния.
 
     Файл нужен по двум причинам: у оконной сборки нет консоли (``sys.stdout``
-    равен None и print() уходит в никуда), а в прежней надстройке пункт меню
+    равен None и _say() уходит в никуда), а в прежней надстройке пункт меню
     «Открыть статус» открывал именно файл отчёта — состав данных тот же.
     """
     import contextlib
@@ -1326,15 +1337,20 @@ def show_status(cfg: dict) -> int:
 
     with contextlib.redirect_stdout(_Tee()):
         rc = _show_status(cfg)
+    full = ""
     try:
         d = (cfg.get("paths") or {}).get("state_dir") or ""
         if d:
             os.makedirs(d, exist_ok=True)
-            with open(os.path.join(d, "status.txt"), "w",
-                      encoding="utf-8") as f:
+            full = os.path.join(d, "status.txt")
+            with open(full, "w", encoding="utf-8") as f:
                 f.write(buf.getvalue())
     except Exception:
-        pass
+        full = ""
+    # stdout в собранном приложении — ТОЛЬКО ASCII (см. src/safestdio.py),
+    # поэтому полный человекочитаемый отчёт лежит файлом в UTF-8.
+    if full:
+        _say(f"full report (UTF-8): {full}")
     return rc
 
 
@@ -1350,55 +1366,55 @@ def _show_status(cfg: dict) -> int:
     if core_run and CW.port_listening(port, timeout=0.5):
         ok, rtt = CW.probe_client(client, timeout=6, strict=False)
         link = (i18n.t("status.link_ok") + f" (rtt={rtt} мс)") if ok else i18n.t("status.link_down")
-    print("=" * 60)
-    print(f"{i18n.t('app.name')} — {i18n.t('status.title')}")
-    print("=" * 60)
-    print(f"{i18n.t('status.mode')}: {client.get('mode')}")
-    print(f"{i18n.t('status.core')}: {core or i18n.t('status.core_missing')}")
-    print(f"core dir: {CFG.core_dir()}")
+    _say("=" * 60)
+    _say(f"{i18n.t('app.name')} — {i18n.t('status.title')}")
+    _say("=" * 60)
+    _say(f"{i18n.t('status.mode')}: {client.get('mode')}")
+    _say(f"{i18n.t('status.core')}: {core or i18n.t('status.core_missing')}")
+    _say(f"core dir: {CFG.core_dir()}")
     if core_run:
-        print(f"{i18n.t('status.core_running')}: {CFG.core_pid_path(cfg)} -> да")
+        _say(f"{i18n.t('status.core_running')}: {CFG.core_pid_path(cfg)} -> да")
     else:
-        print(i18n.t("status.core_stopped"))
-    print(f"{i18n.t('status.pool')}: {pool_n}")
-    print(f"{i18n.t('status.proxy')}: "
+        _say(i18n.t("status.core_stopped"))
+    _say(f"{i18n.t('status.pool')}: {pool_n}")
+    _say(f"{i18n.t('status.proxy')}: "
           f"{i18n.t('status.proxy_on') + ' ' + srv if en else i18n.t('status.proxy_off')}")
     if link:
-        print(f"{i18n.t('status.link')}: {link}")
-    print(f"config: {cfg.get('_config_path')}")
-    print(f"root:   {cfg['paths']['root']}")
+        _say(f"{i18n.t('status.link')}: {link}")
+    _say(f"config: {cfg.get('_config_path')}")
+    _say(f"root:   {cfg['paths']['root']}")
     try:                      # помощник интерфейса: есть ли, работает ли
         import ui_helper as UH
-        print(f"{i18n.t('ui.helper')}: {UH.status_text(cfg)}")
+        _say(f"{i18n.t('ui.helper')}: {UH.status_text(cfg)}")
     except Exception as e:
-        print(f"{i18n.t('ui.helper')}: {i18n.t('error.generic', err=e)}")
+        _say(f"{i18n.t('ui.helper')}: {i18n.t('error.generic', err=e)}")
     if os.name == "nt":
         # Честная строка про надзор: включён ли, есть ли задача, работает ли программа.
         try:
             import watchdog
             rep = watchdog.watchdog_report(cfg)
             st, task = rep["settings"], rep["task"]
-            print(i18n.t("watchdog.status_line") + ": " +
+            _say(i18n.t("watchdog.status_line") + ": " +
                   ((i18n.t("watchdog.enabled") + f", {i18n.t('watchdog.task_word')}: " +
                     (i18n.t("watchdog.yes") if task.get("exists") else i18n.t("watchdog.no")))
                    if st["enabled"] else i18n.t("watchdog.disabled")))
-            print("  " + i18n.t("watchdog.program") + ": " +
+            _say("  " + i18n.t("watchdog.program") + ": " +
                   (i18n.t("watchdog.program_running") if rep["supervisor_alive"]
                    else i18n.t("watchdog.program_stopped")))
         except Exception as e:
-            print(f"{i18n.t('watchdog.status_line')}: {i18n.t('error.generic', err=e)}")
+            _say(f"{i18n.t('watchdog.status_line')}: {i18n.t('error.generic', err=e)}")
     if os.name != "nt":
         # Linux: вместо трея — состояние systemd-юнита и файл индикации
         pp = posix_platform()
-        print(f"state:  {cfg['paths']['state_dir']}")
-        print(f"logs:   {cfg['paths']['log_dir']}")
+        _say(f"state:  {cfg['paths']['state_dir']}")
+        _say(f"logs:   {cfg['paths']['log_dir']}")
         if pp is not None:
-            print(f"systemd: {pp.service_state()}")
+            _say(f"systemd: {pp.service_state()}")
             ind = pp.indicator_path(cfg)
             if os.path.isfile(ind):
-                print(f"indicator: {ind}")
+                _say(f"indicator: {ind}")
             if not pp.notify_available():
-                print("notify-send: недоступен — уведомления только в лог "
+                _say("notify-send: недоступен — уведомления только в лог "
                       "(мягкая деградация)")
     return 0
 
@@ -1460,6 +1476,12 @@ def show_terms_notice(cfg: dict) -> None:
 
 # ══════════════════════════════════════════ main ═══
 def main(argv=None) -> int:
+    SD.safe_stdio()
+    # КРЮЧОК ПРОВЕРКИ: искусственное исключение внутри main — им проверяют, что
+    # на рабочем столе НЕ появляется модальное окно PyInstaller, а трассировка
+    # уходит в журнал (crash.log) и код возврата ненулевой.
+    if os.environ.get("FOREST_TEST_CRASH") == "1":
+        raise RuntimeError("FOREST_TEST_CRASH: искусственное исключение внутри main")
     if sys.stdout is None:
         sys.stdout = open(os.devnull, "w")
     if sys.stderr is None:
@@ -1550,4 +1572,6 @@ def main(argv=None) -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    # ЛЮБОЕ необработанное исключение -> журнал + код 70, БЕЗ модального окна
+    # PyInstaller: см. src/safestdio.py.
+    sys.exit(SD.guarded(main, where="forest-proxy-updater"))

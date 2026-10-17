@@ -193,8 +193,19 @@ def build_ico(path: str, sizes=SIZES) -> str:
 
 def main(argv=None) -> int:
     argv = list(sys.argv[1:] if argv is None else argv)
+    force = "--force" in argv
+    argv = [a for a in argv if a != "--force"]
     out = argv[0] if argv else os.path.join(os.path.dirname(os.path.abspath(__file__)),
                                             "app.ico")
+    # Защита от подмены: app.ico — РИСУНОК ПОЛЬЗОВАТЕЛЯ (собран из его PNG).
+    # Молчаливая перерисовка делала значок трея «не его», и это замечали только
+    # глазами. Поэтому поверх существующего файла пишем лишь по явному --force.
+    if os.path.exists(out) and not force:
+        print(f"make_icon: {out} уже существует — НЕ перезаписываю.\n"
+              f"  Это может быть рисунок пользователя (см. app.ico.sha256).\n"
+              f"  Осознанно перерисовать: python make_icon.py {out} --force",
+              file=sys.stderr)
+        return 2
     build_ico(out)
     print(f"icon written: {out} ({os.path.getsize(out)} bytes, "
           f"sizes={','.join(str(s) for s in SIZES)})")

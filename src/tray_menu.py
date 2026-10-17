@@ -385,6 +385,25 @@ class TrayActions:
                      % ("включено" if new else "выключено"))
         return I.tr("tray.msg.cf_on" if new else "tray.msg.cf_off")
 
+    def set_ru_direct(self, on: bool) -> str:
+        """Ставит «РФ — напрямую» по КОНКРЕТНОМУ значению (не «наоборот»).
+
+        Помощник интерфейса присылает желаемое состояние галочки, поэтому здесь
+        именно установка: повторный выбор того же пункта ничего не меняет.
+        Применение к ядру — тот же штатный путь, что и у переключения.
+        """
+        on = bool(on)
+        if on == self.ru_direct():
+            return I.tr("tray.msg.ru_on" if on else "tray.msg.ru_off")
+        return self.toggle_ru_direct()
+
+    def set_cloudflare(self, on: bool) -> str:
+        """Ставит «Cloudflare — обход» по КОНКРЕТНОМУ значению (не «наоборот»)."""
+        on = bool(on)
+        if on == self.cloudflare():
+            return I.tr("tray.msg.cf_on" if on else "tray.msg.cf_off")
+        return self.toggle_cloudflare()
+
     # ─────────────────────────────────────── надзор за программой ───
     def watchdog_enabled(self) -> bool:
         return bool((self.cfg.get("watchdog") or {}).get("enabled", True))

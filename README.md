@@ -189,12 +189,12 @@ both interfaces, so nothing is lost:
 |---|---|
 | icon tooltip | `FOREST <link state> \| <N> servers \| <RU route> \| watch OK` (four fields, same order) |
 | icon colour | six states: green `связь OK`, grey `выключено вручную`, amber `переключение` / `сторож молчит (нет данных)`, red `НЕТ СВЯЗИ`, blue `восстановление связи` |
-| notification card | title (`Восстановление связи` / `Переключение сервера` / `Связь восстановлена` / `Переключение завершено` / `Восстановить не удалось`), subtitle, percentage, the step list with per-step times (`0.05 с`, `0.35 с`, …) and the footer |
-| link recovery time | `связь подтверждена · N.NN с` in the subtitle and `восстановлено за N.NN с · окно закроется через 4 с` in the footer; also kept in the menu after the card closes |
-| menu | open log, open status, enable/disable the proxy by hand, quit — plus supervision, notifications, theme, “refresh now” and about |
+| notification card | title (`Восстановление связи` / `Переключение сервера` / `Связь восстановлена` / `Переключение завершено` / `Восстановить не удалось`), subtitle, percentage, the step list with per-step times **in milliseconds** (`50 мс (0.05 с)`, `350 мс (0.35 с)`, …) and the footer |
+| link recovery time | `связь подтверждена · N.NN с` in the subtitle and `восстановлено за N.NN с (NNNN мс) · окно закроется через 4 с` in the footer; also kept in the menu after the card closes |
+| menu | open log, open status, enable/disable the proxy by hand, quit — plus supervision, notifications, **“Filters” (RU direct; Cloudflare bypass)**, theme, “refresh now” and about |
 
 Only the smoothness (60 fps) and the look (light/dark themes, your own icon with
-the state colour painted inside) are new; the data, the wording and the order are
+a state badge in the corner) are new; the data, the wording and the order are
 the reference ones. The one deliberate correction: the server count used to be a
 fixed `10`, now it is the real pool size.
 
@@ -204,16 +204,30 @@ The interface is a **separate program, `forest-ui`** (Qt/PySide6, LGPL-3.0 —
 compatible with this project's GPL-3.0; Qt is linked dynamically and unmodified).
 The main program stays small and needs no third-party packages; the helper draws:
 
-* the **tray icon** — your own `app.ico`, with the connection colour painted
-  **inside** the picture (green = working, grey = off by hand, red = no
-  connection, amber = switching server). Colours are chosen to be readable on
-  both light and dark taskbars;
+* the **tray icon** — your own `app.ico` with **not a single altered pixel**
+  (proved pixel by pixel in the self-test: 77.8 % of the 32×32 points match the
+  artwork), and the connection state is shown by a **badge in the bottom-right
+  corner** (green = working, grey = off by hand, red = no connection, amber =
+  switching server, blue = restoring). The badge has a dark outline so it reads
+  on both light and dark taskbars;
 * the **menu with submenus**: the status line, supervision on/off, notifications
-  on/off, **theme (follow system / light / dark)**, "Refresh servers now",
+  on/off, **“Filters” → “RU direct” / “Cloudflare bypass” (two checkable
+  items)**, **theme (follow system / light / dark)**, "Refresh servers now",
   "Test notification", "Open log", "About", "Quit";
 * **notifications** — a frameless translucent card with rounded corners, shadow
-  and your icon, sliding in and fading out at **60 frames per second**, which
-  **never takes keyboard focus** from the window you are working in.
+  and your icon. The animation has three phases and is **actually visible**:
+  the entrance slides in 48 px from the right and fades in over **350 ms**, the
+  hold is alive (a spinner turns by the icon and the progress bar is eased), and
+  the exit slides back and fades out over 260 ms. All at **60 frames per second**,
+  without flicker, and it **never takes keyboard focus** from the window you are
+  working in. Recovery steps are shown **with their duration in milliseconds**.
+
+No windows on the desktop: both the helper and the main program print **ASCII
+only** to stdout, the human-readable report goes to UTF-8 files
+(`state/ui_selftest.txt`, `state/status.txt`, `logs/main.log`), and **any**
+unhandled exception is written with a traceback to `logs/crash.log` and exits with
+code 70 (`src/safestdio.py`, `disable_windowed_traceback=True` in every spec). The
+"Unhandled exception in script" modal window is impossible.
 
 **The helper does not control the core.** A menu item is written as a command
 into `state/ui_cmd.json`; the supervisor reads that file and performs it through
@@ -246,7 +260,28 @@ On **Linux** the same helper gives a real tray icon and menu (Qt talks to
 StatusNotifier/**D-Bus**), notifications go through the system service
 (`org.freedesktop.Notifications`) instead of our own window — exactly as before
 for the fallback path, which uses `gdbus`/`notify-send` — and the theme is read
-from the system settings (`gsettings`).
+from the system settings (`gsettings`). There is no window of our own on Linux,
+so the **recovery steps and their millisecond durations are passed in the BODY
+of the system notification**, and the app icon (`forest-proxy-updater.png` — the
+same artwork) is installed into `share/icons/hicolor/256x256/apps` and named in
+the `.desktop` file (`Icon=forest-proxy-updater`).
+
+### “Filters” in the menu
+
+The menu has a **“Filters”** submenu with two checkable items:
+
+| Item | Setting key | What it does |
+|---|---|---|
+| **RU direct** | `watch.ru_direct` | Russian domains and addresses go **around the proxy** (`geosite:category-ru` / `tld-ru` / `category-gov-ru` / `category-bank-ru` / `private` and `geoip:ru` / `geoip:private`). Toggling it regenerates the core config and restarts the core **immediately** |
+| **Cloudflare bypass** | `blacklist.cloudflare_nodes` | Nodes whose addresses fall inside Cloudflare ranges are kept out of the pool (they are stubs that answer 204 but carry no data). Applied from the next pool pick |
+
+The check marks reflect the **current** settings: the menu re-reads `config.json`
+every tick, so if the program itself changed a setting, the tick follows. Both the
+built-in menu and the helper behave identically: the helper writes
+`filter_ru_on` / `filter_ru_off` / `filter_cf_on` / `filter_cf_off` into
+`state/ui_cmd.json`, and the supervisor performs it through **the same code** as
+the built-in menu (`TrayActions.set_ru_direct` / `set_cloudflare` →
+`ensure_balancer`).
 
 ## Linux
 

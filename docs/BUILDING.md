@@ -51,7 +51,9 @@ manual steps. In order it:
    PyInstaller into it (pin from `requirements-build.txt`) if it is not already
    there;
 3. if the core is missing, downloads the official XTLS/Xray-core release
-   (`fetch_core.py`); if the icon is missing, draws `app.ico` (`make_icon.py`);
+   (`fetch_core.py`); verifies the user's icon `app.ico` against the hash in
+   `app.ico.sha256` and **stops** if the file is missing (it never silently
+   substitutes a generated picture — pass `-GenerateIcon` to allow that);
 4. runs PyInstaller with the spec `ForestProxyUpdater.spec`;
 5. puts the result in `packaging\dist\` and prints its size and SHA-256, also
    writing them to `dist\build-report.json` and

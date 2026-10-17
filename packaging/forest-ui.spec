@@ -32,6 +32,7 @@ HIDDEN = [
     "config", "i18n", "log", "notify", "theme", "tray_icon", "tray_menu",
     "tray_status", "ui_cmd", "ui_helper", "clientwrite", "clientwrite_posix",
     "clientwrite_v2rayn", "instancelock", "watchdog", "parser", "netfilters",
+    "safestdio",
 ]
 
 DATAS = [(_ICON, "."), (_EXAMPLE, ".")]
@@ -99,7 +100,7 @@ exe = EXE(
     upx=False,
     runtime_tmpdir=None,
     console=False,             # оконная программа: без консольного окна
-    disable_windowed_traceback=False,
+    disable_windowed_traceback=True,  # БЕЗ модального окна с трейсбеком
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,

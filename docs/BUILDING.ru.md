@@ -52,7 +52,9 @@ $env:FOREST_PYTHON='C:\Path\to\python.exe'; powershell -File packaging\build.ps1
 2. создаёт изолированное окружение сборки `packaging\.build-venv` и ставит в
    него PyInstaller (пин из `requirements-build.txt`), если его там ещё нет;
 3. если нет ядра — качает официальный релиз XTLS/Xray-core (`fetch_core.py`);
-   если нет иконки — рисует `app.ico` (`make_icon.py`);
+   сверяет иконку пользователя `app.ico` с хешем из `app.ico.sha256` и
+   **останавливается**, если файла нет (молча другую картинку не подставляет —
+   для этого нужно явно передать `-GenerateIcon`);
 4. запускает PyInstaller по спеке `ForestProxyUpdater.spec`;
 5. кладёт результат в `packaging\dist\` и печатает его размер и SHA-256, дублируя
    их в `dist\build-report.json` и `dist\ForestProxyUpdater.exe.sha256`.

@@ -87,6 +87,28 @@ $base = Get-PythonExe -Explicit $Python
 if (-not $base) { Die 'не найден 64-битный Python 3' }
 Info "базовый Python: $($base.Path)"
 
+# ── иконка пользователя: не терять и не подменять ──
+$IconPath = Join-Path $Here 'app.ico'
+if (-not (Test-Path -LiteralPath $IconPath)) {
+    Die ("нет иконки пользователя: $IconPath`n" +
+         "        Верните её из репозитория:  git checkout -- packaging/app.ico")
+}
+$IconHash = (Get-FileHash -LiteralPath $IconPath -Algorithm SHA256).Hash.ToLower()
+$IconPin = Join-Path $Here 'app.ico.sha256'
+$wantIcon = ''
+if (Test-Path -LiteralPath $IconPin) {
+    foreach ($l in @(Get-Content -LiteralPath $IconPin -ErrorAction SilentlyContinue)) {
+        $s = ([string]$l).Trim()
+        if ($s -and -not $s.StartsWith('#')) { $wantIcon = ($s -split '\s+')[0].ToLower(); break }
+    }
+}
+if ($wantIcon -and $wantIcon -ne $IconHash) {
+    Info ("ВНИМАНИЕ: app.ico НЕ совпадает с записанным хешем (ожидалось $wantIcon, " +
+          "получено $IconHash) — проверьте, что это рисунок пользователя")
+} else {
+    Info "иконка app.ico на месте, хеш совпадает с app.ico.sha256"
+}
+
 if ($NoVenv) {
     $py = $base
     $where = 'системный Python'

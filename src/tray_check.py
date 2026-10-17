@@ -228,9 +228,11 @@ def main() -> int:
     _write_state("ok")
     check("state=ok -> значок ok", act.icon_state() == "ok", act.icon_state())
     _write_state("switch")
-    check("state=switch -> ok (работает)", act.icon_state() == "ok")
+    check("state=switch -> busy (идёт переключение)",
+          act.icon_state() == "busy", act.icon_state())
     _write_state("restoring")
-    check("state=restoring -> ok (работает)", act.icon_state() == "ok")
+    check("state=restoring -> busy (идёт восстановление)",
+          act.icon_state() == "busy", act.icon_state())
     _write_state("down")
     check("state=down -> error (обрыв)", act.icon_state() == "error", act.icon_state())
     _write_state("error")

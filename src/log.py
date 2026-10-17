@@ -80,15 +80,15 @@ class Logger:
     def log(self, msg: str):
         ts = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {msg}"
+        # stdout в собранном приложении — ТОЛЬКО ASCII и без исключений:
+        # раньше здесь был print(), и не-ASCII символ в сообщении (на Windows
+        # консольная кодировка cp1251) валил программу МОДАЛЬНЫМ ОКНОМ
+        # PyInstaller. Полный текст всегда идёт в файл журнала ниже.
         try:
-            print(line, flush=True)
+            import safestdio as SD
+            SD.say(line)
         except Exception:
-            # cp1251 fallback для unattended stdout
-            enc = sys.stdout.encoding or "utf-8"
-            try:
-                print(line.encode(enc, "replace").decode(enc, "replace"), flush=True)
-            except Exception:
-                pass
+            pass
         try:
             if self._fh is not None:
                 self._fh.write(line + "\n")

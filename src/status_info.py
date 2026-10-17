@@ -215,7 +215,11 @@ def notif(proc: dict) -> dict:
     return {"title": title, "sub": sub, "pct": max(0, min(100, pct)),
             "steps": steps, "footer": footer, "elapsed": elapsed,
             "eta_s": eta_s, "final": final, "failed": failed,
-            "kind": "restore" if is_restore else "switch"}
+            "kind": "restore" if is_restore else "switch",
+            # ДОБАВЛЕНО (состав эталона не меняем): те же числа в миллисекундах —
+            # их просил показывать пользователь, а эталон показывал только секунды.
+            "elapsed_ms": int(round(elapsed * 1000.0)),
+            "eta_ms": int(round(eta_s * 1000.0))}
 
 
 def step_lines(proc: dict) -> list:
@@ -225,6 +229,30 @@ def step_lines(proc: dict) -> list:
         mark = "х" if s["failed"] else ("v" if s["done"] else "·")
         out.append(f"{mark} {s['nm']}   {s['t']:.2f} с")
     return out
+
+
+def step_lines_ms(proc: dict) -> list:
+    """Список этапов строками с длительностью В МИЛЛИСЕКУНДАХ (как просил
+    пользователь): '✓ Обрыв обнаружен (пульс порта)   50 мс'.
+
+    Состав данных тот же, что в :func:`step_lines` (эталон), меняется только
+    единица измерения — секунды эталона тут же, рядом, в скобках.
+    """
+    out = []
+    for s in (notif(proc).get("steps") or []):
+        mark = "х" if s["failed"] else ("✓" if s["done"] else "·")
+        ms = int(round(s["t"] * 1000.0))
+        out.append(f"{mark} {s['nm']}   {ms} мс ({s['t']:.2f} с)")
+    return out
+
+
+def recovery_ms_text(proc: dict, lang: str = "ru") -> str:
+    """ИТОГОВОЕ ВРЕМЯ ВОССТАНОВЛЕНИЯ СВЯЗИ — и в секундах, и в миллисекундах."""
+    n = notif(proc)
+    ms = n["elapsed_ms"]
+    if lang == "en":
+        return f"recovered in {n['elapsed']:.2f} s ({ms} ms)"
+    return f"восстановлено за {n['elapsed']:.2f} с ({ms} мс)"
 
 
 # ── сведения для меню / «Открыть статус» ──────────────────────────────────

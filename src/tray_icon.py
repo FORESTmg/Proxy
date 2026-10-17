@@ -31,6 +31,14 @@
     make_hicon(ico_bytes, size)               -> (HICON|None, err)
     destroy_hicon(hicon)                      -> None
     render_state(size, ring_rgb, dot_rgb)     -> bytes   # BGRA, top-down
+    mark_state(px, w, h, rgb, rim)            -> (pixels, доля метки)
+    user_state_ico(ico, state, sizes, mark)   -> bytes   # рисунок + метка
+    artwork_share(state_ico, app_ico, size)   -> float   # доказательство по пикселям
+    badge_color_share(state_ico, rgb, size)   -> float
+
+Значок трея — РИСУНОК ПОЛЬЗОВАТЕЛЯ (``app.ico``) без единого изменённого
+пикселя; состояние связи показывает метка-кружок в правом нижнем углу
+(:func:`mark_state`), а не перекраска всего рисунка.
 """
 from __future__ import annotations
 
@@ -222,9 +230,12 @@ def render_state(size: int, ring_rgb, dot_rgb,
     return bytes(px)
 
 
-# ═══════════════════════════ иконка ПОЛЬЗОВАТЕЛЯ + цвет состояния внутри ═══
-# Значок трея — рисунок пользователя (app.ico), а состояние связи показывается
-# ЦВЕТОМ ВНУТРИ рисунка (заливка внутренней области), не отдельной точкой сбоку.
+# ═══════════════════════════ иконка ПОЛЬЗОВАТЕЛЯ + метка состояния ═══
+# Значок трея — рисунок пользователя (app.ico) БЕЗ ЕДИНОГО ИЗМЕНЁННОГО ПИКСЕЛЯ;
+# состояние связи показывает отдельная метка-кружок в правом нижнем углу
+# (mark_state) цветом состояния. Прежний вариант заливал рисунок цветом
+# состояния на 90 % — значок превращался в одноцветную плитку и переставал быть
+# иконкой пользователя.
 # Если файла нет/он битый — молча откатываемся на нарисованный значок.
 _APP_ICO_CACHE = {"key": None, "data": b""}
 
@@ -397,70 +408,69 @@ def _dib_to_pixels(payload: bytes):
         return None
 
 
-def tint_inside(px: bytes, w: int, h: int, rgb, radius_frac: float = 0.42,
-                blend: float = 0.90, rim=None):
-    """Заливает ВНУТРЕННЮЮ область рисунка цветом состояния.
+def mark_state(px: bytes, w: int, h: int, rgb, rim=None, radius_frac: float = 0.26,
+               ss: int = _SS):
+    """Рисует ЗНАЧОК СОСТОЯНИЯ (кружок в правом нижнем углу), НЕ портя рисунок.
 
-    Сначала красим только непрозрачные пиксели (внутри силуэта рисунка). Если
-    рисунок полый и внутри центра почти нет непрозрачных пикселей — заливаем
-    весь диск, иначе цвет состояния не читался бы на 16x16. Затем по краю диска
-    рисуется тонкая обводка ``rim`` — чтобы цвет читался и на светлой, и на
-    тёмной панели задач.
+    Прежняя версия заливала рисунок пользователя цветом состояния на 90 % — и
+    значок трея превращался в одноцветную плитку, теряя сам рисунок. Теперь
+    рисунок остаётся КАК ЕСТЬ, а состояние показывает отдельная метка-кружок
+    поверх него (как значки-наложения Windows): цвет состояния + тонкая тёмная
+    обводка, чтобы читалось и на светлой, и на тёмной панели задач.
 
-    -> (pixels, доля окрашенных пикселей внутри диска 0..1)
+    -> (pixels, доля пикселей метки от всех пикселей значка 0..1)
     """
-    cx = cy = (w - 1) / 2.0
-    r = max(1.0, radius_frac * w)
+    out = bytearray(px)
+    if not rgb:
+        return bytes(out), 0.0
+    r = max(2.0, radius_frac * w)
+    cx = cy = (w - 1) - r * 0.78          # правый нижний угол, чуть внутрь
+    ring = max(1.0, w * 0.045)            # тёмная обводка метки
+    rc = rim or (16, 16, 18)
+    inv = 1.0 / (ss * ss)
+    hit = 0
     r2 = r * r
-    disc = 0
-    idx = []
+    r_in2 = (r - ring) * (r - ring)
     for y in range(h):
         for x in range(w):
-            dx, dy = x - cx, y - cy
-            if dx * dx + dy * dy <= r2:
-                disc += 1
-                idx.append((y * w + x) * 4)
-    out = bytearray(px)
-    tinted = 0
-
-    def paint(clip_alpha: bool) -> int:
-        n = 0
-        for i in idx:
-            if clip_alpha and out[i + 3] == 0:
+            a_core = a_ring = 0.0
+            for sy in range(ss):
+                fy = y + (sy + 0.5) / ss
+                for sx in range(ss):
+                    fx = x + (sx + 0.5) / ss
+                    dx, dy = fx - cx, fy - cy
+                    d2 = dx * dx + dy * dy
+                    if d2 <= r2:
+                        a_ring += 1.0
+                        if d2 <= r_in2:
+                            a_core += 1.0
+            a_core *= inv
+            a_ring *= inv
+            if a_ring <= 0.002:
                 continue
-            # пиксели в BGRA: r->+2, g->+1, b->+0
-            for ci, cc in ((2, rgb[0]), (1, rgb[1]), (0, rgb[2])):
+            # цвет метки = состояние (ядро) поверх тёмной обводки (кольцо)
+            t = (a_core / a_ring) if a_ring else 0.0
+            mr = rc[0] + (rgb[0] - rc[0]) * t
+            mg = rc[1] + (rgb[1] - rc[1]) * t
+            mb = rc[2] + (rgb[2] - rc[2]) * t
+            i = (y * w + x) * 4
+            for ci, cc in ((2, mr), (1, mg), (0, mb)):
                 out[i + ci] = max(0, min(255, int(round(
-                    out[i + ci] * (1.0 - blend) + cc * blend))))
-            out[i + 3] = max(out[i + 3], 240)
-            n += 1
-        return n
-
-    if disc:
-        tinted = paint(True)
-        if tinted < disc * 0.25:        # полый рисунок — заливаем весь диск
-            out = bytearray(px)
-            tinted = paint(False)
-    # тонкая обводка по краю диска — читаемость на любой панели задач
-    if rim:
-        r_in = r * 0.90
-        r_out = r * 1.06
-        for y in range(h):
-            for x in range(w):
-                dx, dy = x - cx, y - cy
-                d = math.sqrt(dx * dx + dy * dy)
-                if r_in <= d <= r_out:
-                    i = (y * w + x) * 4
-                    if out[i + 3] == 0 and not (tinted >= disc * 0.25):
-                        continue
-                    out[i], out[i + 1], out[i + 2] = rim[2], rim[1], rim[0]
-                    out[i + 3] = 255
-    return bytes(out), (tinted / disc if disc else 0.0)
+                    out[i + ci] * (1.0 - a_ring) + cc * a_ring))))
+            out[i + 3] = max(out[i + 3], int(round(255 * a_ring)))
+            hit += 1
+    return bytes(out), (hit / (w * h) if w * h else 0.0)
 
 
 def user_state_ico(ico: bytes, state: str, sizes=(16, 32), mark: bool = True,
                    cfg: dict = None):
-    """``.ico`` состояния из иконки пользователя (b'' — если собрать нельзя)."""
+    """``.ico`` состояния из иконки пользователя (b'' — если собрать нельзя).
+
+    Рисунок пользователя переносится БЕЗ ИЗМЕНЕНИЙ (ни одного перекрашенного
+    пикселя); состояние показывает метка-кружок в правом нижнем углу
+    (:func:`mark_state`). Так значок трея остаётся иконкой пользователя, а не
+    цветной заливкой.
+    """
     st = states(cfg)
     ring, dot = st.get(state, st["off"])
     try:
@@ -476,7 +486,7 @@ def user_state_ico(ico: bytes, state: str, sizes=(16, 32), mark: bool = True,
             continue
         w, h, px = d
         if mark:
-            px, _frac = tint_inside(px, w, h, dot, rim=rim)
+            px, _frac = mark_state(px, w, h, dot, rim=rim)
         imgs.append((w, h, px))
     if not imgs:
         return b""
@@ -490,6 +500,69 @@ def state_mark_enabled(cfg: dict = None) -> bool:
         return bool(v)
     except Exception:
         return True
+
+
+# ── доказательства по пикселям (для проверок) ──────────────────────────────
+def artwork_share(state_ico: bytes, app_ico: bytes, size: int = 32) -> float:
+    """Доля пикселей значка состояния, СОВПАДАЮЩИХ с рисунком пользователя.
+
+    Сравниваем растр значка состояния и исходной иконки пиксель-в-пиксель.
+    1.0 — значок не отличается от рисунка; меньше 1.0 ровно на площадь метки
+    состояния. Так проверка доказывает, что значок трея — РИСУНОК ПОЛЬЗОВАТЕЛЯ,
+    а не одноцветная заливка.
+    """
+    try:
+        a = ico_image_payload(state_ico, size)
+        b = ico_image_payload(app_ico, size)
+        pa = _dib_to_pixels(a) if a else None
+        pb = _dib_to_pixels(b) if b else None
+        if not pa or not pb:
+            return 0.0
+        _w, _h, x = pa
+        _w2, _h2, y = pb
+        n = min(len(x), len(y)) // 4
+        if not n:
+            return 0.0
+        same = 0
+        for i in range(0, n * 4, 4):
+            if x[i:i + 3] == y[i:i + 3]:
+                same += 1
+        return same / n
+    except Exception:
+        return 0.0
+
+
+def badge_center(state_ico: bytes, size: int = 32):
+    """Центр метки состояния (x, y) в растре значка размера ``size``."""
+    r = max(2.0, 0.26 * size)
+    c = int(round((size - 1) - r * 0.78))
+    return c, c
+
+
+def badge_color_share(state_ico: bytes, rgb, size: int = 32,
+                      tol: int = 90, half: int = 2) -> float:
+    """Доля пикселей вокруг центра метки, близких к цвету состояния ``rgb``."""
+    try:
+        pay = ico_image_payload(state_ico, size)
+        d = _dib_to_pixels(pay) if pay else None
+        if not d:
+            return 0.0
+        w, h, px = d
+        cx, cy = badge_center(state_ico, size)
+        hit = tot = 0
+        for dy in range(-half, half + 1):
+            for dx in range(-half, half + 1):
+                x, y = cx + dx, cy + dy
+                if not (0 <= x < w and 0 <= y < h):
+                    continue
+                i = (y * w + x) * 4
+                b, g, r = px[i], px[i + 1], px[i + 2]
+                tot += 1
+                if abs(r - rgb[0]) + abs(g - rgb[1]) + abs(b - rgb[2]) < tol:
+                    hit += 1
+        return (hit / tot) if tot else 0.0
+    except Exception:
+        return 0.0
 
 
 def state_ico(state: str, sizes=(16, 32), cfg: dict = None) -> bytes:

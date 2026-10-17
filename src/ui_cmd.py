@@ -14,6 +14,9 @@
   * ``watchdog_on/off``  — задача автономного надзора (``watchdog``);
   * ``notify_on/off``    — ``notify.enabled`` в ``config.json``;
   * ``theme_*``          — ``ui.theme`` (auto|light|dark);
+  * ``filter_ru_on/off`` — фильтр «РФ — напрямую» (``watch.ru_direct``);
+  * ``filter_cf_on/off`` — фильтр «Cloudflare — обход»
+    (``blacklist.cloudflare_nodes``);
   * ``exit``             — штатная остановка (``state/stop.flag``).
 
 Так у программы остаётся РОВНО один хозяин состояния: помощник может упасть,
@@ -47,6 +50,10 @@ COMMANDS = (
     "theme_auto",
     "theme_light",
     "theme_dark",
+    "filter_ru_on",   # фильтр «РФ — напрямую»: включить
+    "filter_ru_off",  # фильтр «РФ — напрямую»: выключить
+    "filter_cf_on",   # фильтр «Cloudflare — обход»: включить
+    "filter_cf_off",  # фильтр «Cloudflare — обход»: выключить
     "exit",
 )
 
@@ -199,6 +206,10 @@ def apply(cfg: dict, rec: dict) -> tuple:
             msg = actions.set_notify(cmd == "notify_on")
         elif cmd in ("theme_auto", "theme_light", "theme_dark"):
             msg = actions.set_theme(cmd.split("_", 1)[1])
+        elif cmd in ("filter_ru_on", "filter_ru_off"):
+            msg = actions.set_ru_direct(cmd.endswith("_on"))
+        elif cmd in ("filter_cf_on", "filter_cf_off"):
+            msg = actions.set_cloudflare(cmd.endswith("_on"))
         elif cmd == "exit":
             msg = _request_exit(cfg)
         else:

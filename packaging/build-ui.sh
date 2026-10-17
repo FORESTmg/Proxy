@@ -29,6 +29,9 @@ done
 
 PY=${PYI_PYTHON:-python3}
 
+echo "== 0/3 иконка пользователя (app.ico) =="
+sh "$HERE/check_icon.sh" || exit 1
+
 echo "== 1/3 окружение сборки (PyInstaller + PySide6-Essentials) =="
 if [ "$SKIP_VENV" -eq 1 ]; then
     PYEXE="$PY"

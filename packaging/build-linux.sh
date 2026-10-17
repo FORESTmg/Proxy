@@ -32,6 +32,9 @@ done
 
 PY=${PYI_PYTHON:-python3}
 
+echo "== 0/4 иконка пользователя (app.ico) =="
+sh "$HERE/check_icon.sh" || exit 1
+
 echo "== 1/4 ядро Xray-core (Linux x64) =="
 if [ "$SKIP_CORE" -eq 1 ]; then
     "$PY" "$HERE/fetch_core_linux.py" --verify

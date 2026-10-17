@@ -4,6 +4,76 @@ All notable changes to **FOREST's Proxy Auto-updater** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.2] — 2026-10-17
+
+### Fixed
+
+- **The tray icon was not the user's artwork.** `tray_icon.user_state_ico` painted
+  the connection colour **over** the user's `app.ico` at 90 % blend, so the icon
+  collapsed into a single flat coloured tile — the drawing (cyan ring, green
+  swoosh, red chain, white plane) was gone. The artwork is now copied **without a
+  single altered pixel** and the state is shown by a small **badge in the
+  bottom-right corner** (`tray_icon.mark_state`). Proved pixel by pixel in
+  `forest-ui --selftest`: 77.8 % of the 32×32 pixels are byte-identical to
+  `app.ico`, and the badge reads 100 % at the badge centre.
+- **The build could silently replace the icon.** `build.ps1` drew a *generated*
+  `app.ico` (`make_icon.py`) whenever the file was missing, and `make_icon.py`
+  overwrote an existing file without asking. The build now verifies `app.ico`
+  against the hash recorded in `packaging/app.ico.sha256` and **stops** if the
+  file is missing (`-GenerateIcon` is the explicit opt-in); `make_icon.py` refuses
+  to overwrite without `--force`; the Linux builds run `packaging/check_icon.sh`.
+- **The notification window had no visible animation and no step times.** The
+  entrance was 260 ms and there was no hold indicator. The card now has three
+  clearly visible phases — entrance (48 px slide + fade, **350 ms**), hold (a
+  spinner turns by the icon and the progress bar is eased), exit (slide back +
+  fade, 260 ms) — at 60 fps without flicker and without ever taking focus. Steps
+  are rendered **with their duration in milliseconds** and the final line carries
+  the **link-recovery time in ms** as well (`восстановлено за 1.85 с (1850 мс)`).
+- **The "Filters" section was missing from the Qt menu.** `forest_ui` now shows a
+  **Filters** submenu with two checkable items (**RU direct**, **Cloudflare
+  bypass**); the tick follows the live settings and the click goes through
+  `state/ui_cmd.json` to the supervisor (`filter_ru_on/off`, `filter_cf_on/off`),
+  which applies it through the very same code as the built-in menu.
+- **`Unhandled exception in script` modal window on the desktop.** The helper's
+  `--selftest` printed `✓` (U+2713) to stdout; a windowed PyInstaller build has no
+  console and its "console encoding" on Windows is cp1251, so `UnicodeEncodeError`
+  escaped and PyInstaller showed a **modal window**. Fixed at three levels
+  (`src/safestdio.py`): stdout/stderr are switched to `utf-8` + `errors="replace"`
+  (a missing stream gets a sink), stdout is **ASCII-only** (non-ASCII becomes `?`)
+  while the human-readable report goes to UTF-8 files, and any unhandled exception
+  is written to `logs/crash.log` with exit code 70 — `disable_windowed_traceback`
+  is on in every spec, so a modal window is impossible.
+- **`forest_ui` crashed on import when Qt was absent** (`class Toast(QtWidgets.
+  QWidget)` → `NameError`) instead of exiting quietly with "Qt is unavailable";
+  stub classes now let the module import.
+- `src/tray_check.py` expected `state=switch/restoring` to give the `ok` icon; the
+  code has returned `busy` (amber, "switching") for a long time — the stale check
+  was corrected (it was red before this release).
+- `log.py` printed every line to stdout with `print()`; it now goes through the
+  safe printer (stdout ASCII, full text always in the log file).
+
+### Added
+
+- **`src/safestdio.py`** — safe stdout/stderr, ASCII-only `say()`, UTF-8 report
+  files, `crash_log()`, `install_excepthook()` and `guarded()` (the entry-point
+  wrapper). Used by both the main program and the helper.
+- **`packaging/app.ico.sha256`** and **`packaging/check_icon.sh`** — the icon pin
+  and the Linux-side check.
+- **`state/ui_selftest.txt`** — the full UTF-8 self-test report (stdout stays
+  ASCII, as a windowed build requires).
+- New self-test sections: the icon pixel proof, the Filters submenu and its
+  commands, the animation phase/position/opacity time series, the notification
+  text in milliseconds, and the crash-safety checks (7 and 15).
+
+### Changed
+
+- **Linux**: the notification has no window of its own, so the **recovery steps
+  and their millisecond durations are passed in the BODY** of the system
+  notification; the app icon (`forest-proxy-updater.png`, the same artwork) is
+  installed into `share/icons/hicolor/256x256/apps` and named in the `.desktop`
+  file. `--status` prints an ASCII summary and the full report goes to
+  `state/status.txt` (UTF-8).
+
 ## [1.2.1] — 2026-10-17
 
 ### Fixed

@@ -60,7 +60,8 @@ if _missing:
 HIDDEN = [
     "clientwrite", "clientwrite_posix", "clientwrite_v2rayn",
     "config", "i18n", "log", "netfilters", "notify", "parser", "selftest",
-    "sources", "theme", "tray", "tray_check", "tray_icon", "tray_menu",
+    "safestdio", "sources", "theme", "tray", "tray_check", "tray_icon",
+    "tray_menu",
     "instancelock", "tray_status", "v2ray_updater", "watch", "watchdog",
     "xraytest",
 ]
@@ -113,7 +114,7 @@ exe = EXE(
     upx=False,
     runtime_tmpdir=None,
     console=_CONSOLE_BUILD,      # без консольного окна (pythonw-семантика)
-    disable_windowed_traceback=False,
+    disable_windowed_traceback=True,  # БЕЗ модального окна с трейсбеком
     argv_emulation=False,
     target_arch=None,
     codesign_identity=None,

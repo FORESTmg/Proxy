@@ -146,9 +146,11 @@ packaging\.build-venv\Scripts\python.exe packaging\fetch_core.py --force
 |---|---|
 | `ForestProxyUpdater.spec` | спека PyInstaller: onefile, без консоли (с `FOREST_CONSOLE_BUILD=1` — консольный отладочный вариант), иконка+версия |
 | `build.ps1` / `build.bat` | сборка (идемпотентно), кладёт .exe в `dist\` |
-| `version_info.txt` | ресурс версии: ProductName «FOREST's Proxy Auto-updater», 1.2.0, CompanyName пустой |
-| `make_icon.py` | генератор `app.ico` на чистом Python (без PIL): 16…256 px |
-| `app.ico` | иконка приложения (сгенерирована `make_icon.py`) |
+| `version_info.txt` | ресурс версии: ProductName «FOREST's Proxy Auto-updater», 1.2.2, CompanyName пустой |
+| `make_icon.py` | генератор запасной `app.ico` на чистом Python (без PIL): 16…256 px. Поверх существующего файла пишет только с `--force` |
+| `app.ico` | **иконка ПОЛЬЗОВАТЕЛЯ** (собрана из его PNG 1024×1024, 7 размеров). Хеш записан в `app.ico.sha256`; сборка его сверяет и предупреждает о подмене |
+| `app.ico.sha256` | пин хеша иконки пользователя (чтобы сборка не подменила рисунок молча) |
+| `check_icon.sh` | проверка иконки перед Linux-сборкой (нет файла/хеш не тот → стоп) |
 | `fetch_core.py` | скачивание официального ядра в `vendor\bin\xray\`, проверка SHA256 |
 | `core_version.txt`, `core.lock.json` | пин версии и хешей релиза |
 | `verify_bundle.py` | сверка вшитых в .exe файлов с пином |
@@ -169,8 +171,13 @@ packaging\.build-venv\Scripts\python.exe packaging\fetch_core.py --force
   шагов.
 * **CompanyName в свойствах файла пустой** — по требованию. Если понадобится,
   впишите его в `version_info.txt` и пересоберите.
-* Иконка сгенерирована программно; чтобы изменить мотив, правьте `make_icon.py`
-  и запускайте `python make_icon.py`.
+* **`app.ico` — рисунок ПОЛЬЗОВАТЕЛЯ, а не сгенерированная картинка.** Значок трея
+  берёт его как есть и добавляет лишь метку состояния в углу (см.
+  `src/tray_icon.py`, `mark_state`). Сборка (`build.ps1`/`build-ui.ps1`,
+  `build-linux.sh`/`build-ui.sh`) сверяет хеш с `app.ico.sha256` и, если файла
+  нет, останавливается — раньше она молча рисовала другую иконку, и значок
+  переставал быть иконкой пользователя. Запасную картинку можно нарисовать
+  явно: `build.ps1 -GenerateIcon` или `python make_icon.py app.ico --force`.
 * Проверен и отлажен основной путь `build.ps1`/`build.bat` через
   `packaging\.build-venv` (включая установку PyInstaller с нуля). Флаг `-NoVenv`
   (PyInstaller в системный Python) в этой итерации не прогонялся.

@@ -35,6 +35,7 @@ if os.name == "nt":
 else:
     import clientwrite_posix as CW  # noqa: E402
 import config as CFG  # noqa: E402
+import safestdio as SD
 import i18n  # noqa: E402
 import log  # noqa: E402
 import parser as P  # noqa: E402
@@ -43,16 +44,26 @@ FAILED = []
 
 
 def check(name: str, cond: bool, detail: str = "") -> None:
-    print(f"  {'OK  ' if cond else 'FAIL'} {name}" + (f" — {detail}" if detail and not cond else ""))
+    _say(f"  {'OK  ' if cond else 'FAIL'} {name}" + (f" — {detail}" if detail and not cond else ""))
     if not cond:
         FAILED.append(name)
 
 
+def _say(text="") -> None:
+    """Печать в stdout через безопасный слой (см. src/safestdio.py).
+
+    Оконная сборка не имеет консоли, а её «кодировка» на Windows — cp1251:
+    печать символа вне cp1251 давала UnicodeEncodeError и МОДАЛЬНОЕ ОКНО
+    PyInstaller на рабочем столе.
+    """
+    SD.say(text)
+
+
 def main() -> int:
     log.reset_logger(os.path.join(_TMP, "logs"))
-    print("=" * 64)
-    print("1. API-поверхность (имена, которые зовут v2ray_updater/watch)")
-    print("=" * 64)
+    _say("=" * 64)
+    _say("1. API-поверхность (имена, которые зовут v2ray_updater/watch)")
+    _say("=" * 64)
     needed = ["AUTO_TAG", "StateStore", "probe_client", "measure_speed_kbps",
               "ensure_port_free", "ensure_balancer", "update_hotcache",
               "row_to_server", "read_db_rows", "read_active_id", "write_active_id",
@@ -65,10 +76,10 @@ def main() -> int:
     for n in needed:
         check(f"есть {n}", hasattr(CW, n))
 
-    print()
-    print("=" * 64)
-    print("2. server_to_row -> row_to_server (round-trip по протоколам)")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("2. server_to_row -> row_to_server (round-trip по протоколам)")
+    _say("=" * 64)
     cases = [("vless", "1.2.3.4", 443, "ws"),
              ("vmess", "5.6.7.8", 8443, "raw"),
              ("trojan", "9.9.9.9", 2053, "grpc"),
@@ -95,10 +106,10 @@ def main() -> int:
         check(f"{proto}: адрес/порт/протокол/транспорт", ok,
               f"got {s2.protocol if s2 else None} {s2.address if s2 else None}")
 
-    print()
-    print("=" * 64)
-    print("3. Стор серверов (запись/чтение, [AUTO]-тег)")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("3. Стор серверов (запись/чтение, [AUTO]-тег)")
+    _say("=" * 64)
     store = os.path.join(_TMP, "servers.json")
     s = P.Server(protocol="vless", address="1.1.1.1", port=443)
     s.password = "uuid-1"
@@ -117,10 +128,10 @@ def main() -> int:
     CW.write_active_id(os.path.join(_TMP, "forest_xray.json"), "1")
     check("write/read_active_id (standalone)", CW.read_active_id(os.path.join(_TMP, "forest_xray.json")) == "1")
 
-    print()
-    print("=" * 64)
-    print("4. Генерация конфига ядра (один сервер)")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("4. Генерация конфига ядра (один сервер)")
+    _say("=" * 64)
     cfg_path = os.path.join(_TMP, "xray_config.json")
     client = {"cfg": cfg_path, "socks_port": 11808, "torrent_port": 11820, "mode": "standalone"}
     srv = P.Server(protocol="vless", address="1.2.3.4", port=443)
@@ -142,10 +153,10 @@ def main() -> int:
     ob = [o for o in conf["outbounds"] if o.get("tag") == "proxy"][0]
     check("outbound vless использует settings.vnext", "vnext" in ob.get("settings", {}))
 
-    print()
-    print("=" * 64)
-    print("5. Генерация конфига балансировщика (пул + observatory)")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("5. Генерация конфига балансировщика (пул + observatory)")
+    _say("=" * 64)
     pool = []
     for i in range(3):
         x = P.Server(protocol="vless", address=f"10.0.0.{i+1}", port=443)
@@ -179,10 +190,10 @@ def main() -> int:
           len(rules_b) > 1 and rules_b[1].get("inboundTag") == ["torrent-in"]
           and rules_b[1].get("balancerTag") == "bal")
 
-    print()
-    print("=" * 64)
-    print("6. РФ-маршрутизация включается только при наличии гео-баз")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("6. РФ-маршрутизация включается только при наличии гео-баз")
+    _say("=" * 64)
     geo_tmp = os.path.join(_TMP, "geo")
     os.makedirs(geo_tmp, exist_ok=True)
     open(os.path.join(geo_tmp, "geosite.dat"), "wb").close()
@@ -235,10 +246,10 @@ def main() -> int:
         else:
             os.environ["XRAY_LOCATION_ASSET"] = old_env
 
-    print()
-    print("=" * 64)
-    print("7. Диспетчер режимов (standalone / v2rayn)")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("7. Диспетчер режимов (standalone / v2rayn)")
+    _say("=" * 64)
     if os.name == "nt":
         check("_mode_of по client.mode=v2rayn", CW._mode_of({"mode": "v2rayn"}) == "v2rayn")
     else:
@@ -262,10 +273,10 @@ def main() -> int:
     except Exception as e:
         check("POSIX-бэкенд импортируется", False, str(e))
 
-    print()
-    print("=" * 64)
-    print("8. Конфиг: первый запуск создаёт файл из config.example.json")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("8. Конфиг: первый запуск создаёт файл из config.example.json")
+    _say("=" * 64)
     ex = CFG.example_config_path()
     check("config.example.json доступен", bool(ex), str(ex))
     fresh = os.path.join(_TMP, "fresh_root", "config.json")
@@ -281,10 +292,10 @@ def main() -> int:
           cfg2["client"]["socks_port"] == 10808 and cfg2["client"]["torrent_port"] == 10820)
     check("paths развёрнуты (state_dir/log_dir)", "state_dir" in cfg2["paths"] and "log_dir" in cfg2["paths"])
 
-    print()
-    print("=" * 64)
-    print("9. Поиск ядра и прочее")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("9. Поиск ядра и прочее")
+    _say("=" * 64)
     dummy = os.path.join(_TMP, "xray.exe")
     open(dummy, "wb").close()
     check("find_core берёт явный путь из конфига",
@@ -306,10 +317,10 @@ def main() -> int:
     en, srv_p = CW._sys_proxy_state()
     check("системный прокси читается (не изменяется)", isinstance(en, bool))
 
-    print()
-    print("=" * 64)
-    print("10. Бесшовное переключение: хэш конфига, проверка до остановки ядра")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("10. Бесшовное переключение: хэш конфига, проверка до остановки ядра")
+    _say("=" * 64)
     c1 = {"a": 1, "b": [1, 2, {"c": 3}]}
     c2 = {"b": [1, 2, {"c": 3}], "a": 1}
     check("_conf_sha не зависит от порядка ключей",
@@ -329,10 +340,10 @@ def main() -> int:
     check("build_single_config вернул конфиг с inbounds/outbounds",
           isinstance(CW.build_single_config(client, srv, {"client": {}}), dict))
 
-    print()
-    print("=" * 64)
-    print("11. Установщик: копирование .exe и команда запуска без лишних аргументов")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("11. Установщик: копирование .exe и команда запуска без лишних аргументов")
+    _say("=" * 64)
     import v2ray_updater as VU
     check("app_root подменён (FOREST_ROOT)",
           CFG.app_root().replace("\\", "/").lower() == _TMP.replace("\\", "/").lower())
@@ -367,10 +378,10 @@ def main() -> int:
           ".py" not in argstr and argstr.count("--") == 1)
     check("_schedule_delete без путей -> False", VU._schedule_delete([], "") is False)
 
-    print()
-    print("=" * 64)
-    print("12. StateStore: save() не теряет ключи чужого экземпляра")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("12. StateStore: save() не теряет ключи чужого экземпляра")
+    _say("=" * 64)
     st_a = CW.StateStore(cfg2)
     st_a.data["k_from_a"] = 1
     st_a.save()
@@ -385,10 +396,10 @@ def main() -> int:
     check("после merge-записи чтение видит оба ключа",
           st_c.data.get("k_from_b") == 2 and st_c.data.get("k_from_a") == 1)
 
-    print()
-    print("=" * 64)
-    print("13. Постоянная копия ядра (вне временного _MEI) и уборка распаковок")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("13. Постоянная копия ядра (вне временного _MEI) и уборка распаковок")
+    _say("=" * 64)
     # Ядро, запущенное из каталога распаковки onefile (_MEIPASS), переживает
     # выход программы, файл занят — уборщик PyInstaller не может снести каталог
     # (модальное окно). Поэтому ядро и гео-базы обязаны уезжать в ПОСТОЯННЫЙ
@@ -507,10 +518,10 @@ def main() -> int:
             except AttributeError:
                 pass
         shutil.rmtree(fake_mei, ignore_errors=True)
-    print()
-    print("=" * 64)
-    print("14. Автономный надзор: --ensure, защита от второго экземпляра, задача")
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("14. Автономный надзор: --ensure, защита от второго экземпляра, задача")
+    _say("=" * 64)
     import watchdog as WD
     # 14.1 настройки (дефолты и переопределение); тест НЕ трогает систему
     check("watchdog в дефолтах: enabled=True", cfg2["watchdog"]["enabled"] is True)
@@ -745,16 +756,59 @@ def main() -> int:
     check("i18n: ключи надзора заполнены (ru/en)",
           all(k not in comp["missing"] for k in wd_keys))
 
-    print()
-    print("=" * 64)
+    _say()
+    _say("=" * 64)
+    _say("15. безопасный вывод и защита от необработанных исключений")
+    _say("=" * 64)
+    raised = None
+    try:
+        SD.say("✓ символ вне cp1251")      # не должно бросить НИКОГДА
+    except Exception as e:                      # pragma: no cover
+        raised = e
+    check("печать символа вне cp1251 не бросает исключения (нет окна PyInstaller)",
+          raised is None, str(raised))
+    check("кодировка stdout запомнена до перевода в utf-8",
+          isinstance(SD._ORIG_ENCODING, str), SD._ORIG_ENCODING)
+
+    def _boom(_argv=None):
+        raise RuntimeError("искусственное исключение проверки")
+    rc = SD.guarded(_boom, where="forest-proxy-updater-selftest")
+    cpath = os.path.join(SD.log_dir(), "crash.log")
+    ctxt = ""
+    try:
+        ctxt = open(cpath, encoding="utf-8").read()
+    except Exception:
+        ctxt = ""
+    check("guarded(): исключение внутри main -> код 70 (окна не будет)", rc == 70,
+          str(rc))
+    check("guarded(): трассировка в crash.log (UTF-8)",
+          "искусственное исключение проверки" in ctxt, cpath)
+    check("глобальный перехватчик исключений установлен",
+          callable(getattr(sys, "excepthook", None)))
+    _tp = SD.write_report("_probe_utf8_main.txt", "✓ проверка UTF-8 — ок")
+    _tt = ""
+    try:
+        _tt = open(_tp, encoding="utf-8").read()
+    except Exception:
+        _tt = ""
+    check("человекочитаемый отчёт пишется в UTF-8-ФАЙЛ", bool(_tp) and "✓ проверка" in _tt,
+          _tp)
+    try:
+        if _tp:
+            os.unlink(_tp)
+    except Exception:
+        pass
+
+    _say()
+    _say("=" * 64)
     if FAILED:
-        print(f"{i18n.t('selftest.failed')}: {len(FAILED)}")
+        _say(f"{i18n.t('selftest.failed')}: {len(FAILED)}")
         for f in FAILED:
-            print(f"  - {f}")
+            _say(f"  - {f}")
         _cleanup()
         return 1
-    print(i18n.t("selftest.passed"))
-    print("=" * 64)
+    _say(i18n.t("selftest.passed"))
+    _say("=" * 64)
     _cleanup()
     return 0
 
