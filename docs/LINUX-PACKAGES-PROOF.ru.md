@@ -14,11 +14,11 @@
 
 | Файл | Размер, Б | sha256 |
 | --- | --- | --- |
-| `forest-proxy-updater_1.1.0_amd64.deb` | 33 457 552 | `039307c807bd1a27056396fb51379ee780f3707647fbbc0ac915dd4d39bc3d5e` |
+| `forest-proxy-updater_1.1.0_amd64.deb` | 33 457 724 | `bbef11be0d871a95dec7d9b2b157a33717f0cd9515073ccd1d985e95350ef653` |
 | `forest-proxy-updater-1.1.0-1.x86_64.rpm` | 33 510 589 | `762e5702446c10c309365ca80623cb92f913355098e5fe72e32ec37d84b9a5b1` |
-| `forest-proxy-updater-1.1.0-1-x86_64.pkg.tar.zst` | 33 790 512 | `b7c895ad14c0875a8b868108b1a8e998f5f6e56918f2722b0570e2f239b91f8b` |
-| `forest-proxy-updater-1.1.0-linux-x86_64.tar.gz` | 33 569 801 | `9eeaf5778aed2a1328d6852a25473e463227840c6fbe50eda002eaa1acbd3300` |
-| `ForestProxyUpdater-1.1.0-x86_64.AppImage` | 34 544 120 | `f8411715334ed6bac97a77c06c31170e2d7f24c7f0ec273343529ce2d708e44c` |
+| `forest-proxy-updater-1.1.0-1-x86_64.pkg.tar.zst` | 33 790 517 | `32406caac7d7d1cebff65f41a51bff5d97ad423de0674bd70a27e655276c9b53` |
+| `forest-proxy-updater-1.1.0-linux-x86_64.tar.gz` | 33 569 800 | `1e650196cbe62040330090ac1d9f62900992f02320d1fd25526639c906db2e0e` |
+| `ForestProxyUpdater-1.1.0-x86_64.AppImage` | 34 544 120 | `a21057d590856579100f179ceb58d6c42414a1e9399bfb2ef001467e407ff863` |
 
 Рядом с каждым файлом лежит `.sha256`. Файлы — в `packaging-linux/out/`
 (каталог в `.gitignore`: артефакты пересобираются одной командой).
@@ -126,11 +126,11 @@ curl -s -m 20 -x http://127.0.0.1:11808 -o /dev/null -w '%{http_code}' \
 
 | Пакет | Ubuntu 26.04 | Debian 13 | openSUSE Tumbleweed | Rocky Linux 10.2 | Arch Linux |
 | --- | --- | --- | --- | --- | --- |
-| `.deb` | ✅ 13/13 (204 через ~168 с) | ✅ 13/13 (204 через ~168 с) | — | — | — |
-| `.rpm` | — | — | ✅ 13/13 (204 через ~174 с) | ✅ 13/13 (204 через ~174 с) | — |
-| `.pkg.tar.zst` | — | — | — | — | ✅ 13/13 (204 через ~162 с) |
-| `.tar.gz` (системная установка) | ✅ 13/13 (204 через ~174 с) | — | — | — | ✅ 13/13 (204 через ~159 с) |
-| `.AppImage` (`--as-user tester`) | ✅ 14/14 (204 через ~162 с) | — | — | — | — |
+| `.deb` | ✅ 13/13 (204 через ~174 с) | ✅ 13/13 (204 через ~174 с) | — | — | — |
+| `.rpm` | — | — | ✅ 13/13 (204 через ~180 с) | ✅ 13/13 (204 через ~177 с) | — |
+| `.pkg.tar.zst` | — | — | — | — | ✅ 13/13 (204 через ~165 с) |
+| `.tar.gz` (системная установка) | ✅ 13/13 (204 через ~165 с) | — | — | — | ✅ 13/13 (204 через ~168 с) |
+| `.AppImage` (`--as-user tester`) | ✅ 14/14 (204 через ~171 с) | — | — | — | — |
 
 Точные дистрибутивы из журналов прогонов:
 
@@ -196,7 +196,7 @@ inner verdict: ALL PASS
 5    install            PASS   forest-proxy-updater installed (/usr/lib/forest-proxy-updater/forest-proxy-updater)
 6    unit-present       PASS   systemd unit 'forest-proxy-updater.service' installed and visible
 7    service-active     PASS   forest-proxy-updater.service is active
-8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~168s
+8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~174s
 9    uninstall          PASS   forest-proxy-updater removed
 10   residue-pkg        PASS   not registered in the package DB and payload gone
 11   residue-files      PASS   no payload files left behind
@@ -253,7 +253,7 @@ inner verdict: ALL PASS
 5    install            PASS   forest-proxy-updater installed (/usr/lib/forest-proxy-updater/forest-proxy-updater)
 6    unit-present       PASS   systemd unit 'forest-proxy-updater.service' installed and visible
 7    service-active     PASS   forest-proxy-updater.service is active
-8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~168s
+8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~174s
 9    uninstall          PASS   forest-proxy-updater removed
 10   residue-pkg        PASS   not registered in the package DB and payload gone
 11   residue-files      PASS   no payload files left behind
@@ -425,7 +425,7 @@ inner verdict: ALL PASS
 5    install            PASS   forest-proxy-updater installed (/usr/lib/forest-proxy-updater/forest-proxy-updater)
 6    unit-present       PASS   systemd unit 'forest-proxy-updater.service' installed and visible
 7    service-active     PASS   forest-proxy-updater.service is active
-8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~162s
+8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~165s
 9    uninstall          PASS   forest-proxy-updater removed
 10   residue-pkg        PASS   not registered in the package DB and payload gone
 11   residue-files      PASS   no payload files left behind
@@ -484,7 +484,7 @@ inner verdict: ALL PASS
 5    install            PASS   forest-proxy-updater installed (/usr/lib/forest-proxy-updater/forest-proxy-updater)
 6    unit-present       PASS   systemd unit 'forest-proxy-updater.service' installed and visible
 7    service-active     PASS   forest-proxy-updater.service is active
-8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~174s
+8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~165s
 9    uninstall          PASS   forest-proxy-updater removed
 10   residue-pkg        PASS   not registered in the package DB and payload gone
 11   residue-files      PASS   no payload files left behind
@@ -543,7 +543,7 @@ inner verdict: ALL PASS
 5    install            PASS   forest-proxy-updater installed (/usr/lib/forest-proxy-updater/forest-proxy-updater)
 6    unit-present       PASS   systemd unit 'forest-proxy-updater.service' installed and visible
 7    service-active     PASS   forest-proxy-updater.service is active
-8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~159s
+8    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~168s
 9    uninstall          PASS   forest-proxy-updater removed
 10   residue-pkg        PASS   not registered in the package DB and payload gone
 11   residue-files      PASS   no payload files left behind
@@ -605,7 +605,7 @@ inner verdict: ALL PASS
 6    install            PASS   ForestProxyUpdater installed (/home/tester/.local/share/forest-proxy-updater/forest-proxy-updater)
 7    unit-present       PASS   systemd unit 'forest-proxy-updater.service' installed and visible
 8    service-active     PASS   forest-proxy-updater.service is active
-9    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~162s
+9    proxy-traffic      PASS   curl -x http://127.0.0.1:11808 -> 204 after ~171s
 10   uninstall          PASS   forest-proxy-updater removed
 11   residue-pkg        PASS   not registered in the package DB and payload gone
 12   residue-files      PASS   no payload files left behind
@@ -623,8 +623,6 @@ RESULT: PASS
 ```
 wsl: >=D83C@0F8O ?@>:A8-A5@25@0 localhost >1=0@C65=0, => =5 >B@065=0 2 WSL. WSL 2 @568<5 NAT =5 ?>445@68205B ?@>:A8-A5@25@K localhost.
 ### $ apt-get install -y ./forest-proxy-updater_1.1.0_amd64.deb
-Building dependency tree...
-Reading state information...
 Solving dependencies...
 The following NEW packages will be installed:
   forest-proxy-updater
@@ -646,17 +644,10 @@ forest-proxy-updater: программа даёт доступ ко всем с�
 active
 
 ### $ dpkg -l forest-proxy-updater
-||| Name                 Version      Architecture Description
 +++-====================-============-============-==============================================================================================
 ii  forest-proxy-updater 1.1.0        amd64        FOREST's Proxy Auto-updater — автообновляемый прокси на ядре Xray
 
 ### $ apt-get purge -y forest-proxy-updater
-Reading package lists...
-Building dependency tree...
-Reading state information...
-Solving dependencies...
-The following packages will be REMOVED:
-  forest-proxy-updater*
 0 upgraded, 0 newly installed, 1 to remove and 158 not upgraded.
 After this operation, 34.3 MB disk space will be freed.
 (Reading database ... (Reading database ... 5%(Reading database ... 10%(Reading database ... 15%(Reading database ... 20%(Reading database ... 25%(Reading database ... 30%(Reading database ... 35%(Reading database ... 40%(Reading database ... 45%(Reading database ... 50%(Reading database ... 55%(Reading database ... 60%(Reading database ... 65%(Reading database ... 70%(Reading database ... 75%(Reading database ... 80%(Reading database ... 85%(Reading database ... 90%(Reading database ... 95%(Reading database ... 100%(Reading database ... 39135 files and directories currently installed.)
@@ -780,8 +771,6 @@ UNIT FILE STATE PRESET
 ```
 wsl: >=D83C@0F8O ?@>:A8-A5@25@0 localhost >1=0@C65=0, => =5 >B@065=0 2 WSL. WSL 2 @568<5 NAT =5 ?>445@68205B ?@>:A8-A5@25@K localhost.
 ### $ pacman -U --noconfirm ./forest-proxy-updater-1.1.0-1-x86_64.pkg.tar.zst
-forest-proxy-updater  1.1.0-1       32.64 MiB
-
 Total Installed Size:  32.64 MiB
 
 :: Proceed with installation? [Y/n] 
@@ -803,10 +792,6 @@ forest-proxy-updater: программа даёт доступ ко всем с�
 active
 
 ### $ pacman -Rns --noconfirm forest-proxy-updater
-Package (1)           Old Version  Net Change
-
-forest-proxy-updater  1.1.0-1      -32.64 MiB
-
 Total Removed Size:  32.64 MiB
 
 :: Do you want to remove these packages? [Y/n] 
@@ -828,8 +813,6 @@ ls: cannot access '/var/lib/forest-proxy-updater': No such file or directory
 ```
 wsl: >=D83C@0F8O ?@>:A8-A5@25@0 localhost >1=0@C65=0, => =5 >B@065=0 2 WSL. WSL 2 @568<5 NAT =5 ?>445@68205B ?@>:A8-A5@25@K localhost.
 ### $ tar xzf forest-proxy-updater-1.1.0-linux-x86_64.tar.gz && cd forest-proxy-updater-1.1.0-linux-x86_64 && sudo ./install.sh
-  юнит: /usr/lib/systemd/system/forest-proxy-updater.service
-  юнит: /usr/lib/systemd/system/forest-proxy-updater.timer
 == конфиг ==
   создан: /etc/forest-proxy-updater/config.json
 == состояние ==
@@ -855,8 +838,6 @@ wsl: >=D83C@0F8O ?@>:A8-A5@25@0 localhost >1=0@C
 active
 
 ### $ ./uninstall.sh --yes
-  удалён: /usr/lib/forest-proxy-updater
-  удалён: /usr/share/doc/forest-proxy-updater
   удалён: /usr/share/licenses/forest-proxy-updater
   удалён: /usr/bin/forest-proxy-updater
 == состояние ==
@@ -882,18 +863,14 @@ ls: cannot access '/var/lib/forest-proxy-updater': No such file or directory
 wsl: >=D83C@0F8O ?@>:A8-A5@25@0 localhost >1=0@C65=0, => =5 >B@065=0 2 WSL. WSL 2 @568<5 NAT =5 ?>445@68205B ?@>:A8-A5@25@K localhost.
 ### setup: copy AppImage, make it executable
 ### $ ./fpu.AppImage --appimage-extract-and-run --install
-Terms of use: the program provides access to all websites, including blocked ones; complying with the laws of your jurisdiction is your responsibility.
-Полный текст: docs/TERMS.ru.md / docs/TERMS.md (в установленных пакетах — /usr/share/doc/forest-proxy-updater/).
-[2026-10-17 03:36:43] INFO  Установка (Linux, systemd --user) в /home/tester/.local/share/forest-proxy-updater
-[2026-10-17 03:36:43] INFO    бинарь установлен: /home/tester/.local/share/forest-proxy-updater/forest-proxy-updater (34124352 байт)
-[2026-10-17 03:36:43] INFO  Ядро и гео-базы перенесены в постоянный каталог /home/tester/.local/share/forest-proxy-updater/bin/xray: xray, geoip.dat, geosite.dat, LICENSE
-[2026-10-17 03:36:43] INFO    конфиг уже есть: /home/tester/.config/forest-proxy-updater/config.json
-[2026-10-17 03:36:43] INFO    юнит записан: /home/tester/.config/systemd/user/forest-proxy-updater.service
-[2026-10-17 03:36:43] INFO    юнит записан: /home/tester/.config/systemd/user/forest-proxy-updater-refresh.service
-[2026-10-17 03:36:43] INFO    юнит записан: /home/tester/.config/systemd/user/forest-proxy-updater.timer
-[2026-10-17 03:36:43] INFO    systemctl --user daemon-reload: OK
-[2026-10-17 03:36:43] INFO    systemctl --user enable --now forest-proxy-updater.service forest-proxy-updater.timer: OK
-[2026-10-17 03:36:44] INFO    автозапуск без входа в систему (linger): включён
+[2026-10-17 04:21:33] INFO  Ядро и гео-базы перенесены в постоянный каталог /home/tester/.local/share/forest-proxy-updater/bin/xray: xray, geoip.dat, geosite.dat, LICENSE
+[2026-10-17 04:21:33] INFO    конфиг уже есть: /home/tester/.config/forest-proxy-updater/config.json
+[2026-10-17 04:21:33] INFO    юнит записан: /home/tester/.config/systemd/user/forest-proxy-updater.service
+[2026-10-17 04:21:33] INFO    юнит записан: /home/tester/.config/systemd/user/forest-proxy-updater-refresh.service
+[2026-10-17 04:21:33] INFO    юнит записан: /home/tester/.config/systemd/user/forest-proxy-updater.timer
+[2026-10-17 04:21:33] INFO    systemctl --user daemon-reload: OK
+[2026-10-17 04:21:33] INFO    systemctl --user enable --now forest-proxy-updater.service forest-proxy-updater.timer: OK
+[2026-10-17 04:21:33] INFO    автозапуск без входа в систему (linger): включён
 Установка завершена (Linux).
   программа:  /home/tester/.local/share/forest-proxy-updater/forest-proxy-updater
   конфиг:     /home/tester/.config/forest-proxy-updater/config.json
@@ -905,18 +882,18 @@ Terms of use: the program provides access to all websites, including blocked one
 active
 
 ### $ ./fpu.AppImage --appimage-extract-and-run --uninstall
-[2026-10-17 03:36:44] INFO  Запуск FOREST's Proxy Auto-updater (аргументы: --uninstall)
-[2026-10-17 03:36:44] INFO  Удаление (Linux) из /home/tester/.local/share/forest-proxy-updater
-[2026-10-17 03:36:44] INFO    systemctl --user disable --now forest-proxy-updater.service: OK
-[2026-10-17 03:36:44] INFO    systemctl --user disable --now forest-proxy-updater.timer: OK
-[2026-10-17 03:36:45] INFO    systemctl --user disable --now forest-proxy-updater-refresh.service: OK
-[2026-10-17 03:36:45] INFO    юнит удалён: /home/tester/.config/systemd/user/forest-proxy-updater.service
-[2026-10-17 03:36:45] INFO    юнит удалён: /home/tester/.config/systemd/user/forest-proxy-updater-refresh.service
-[2026-10-17 03:36:45] INFO    юнит удалён: /home/tester/.config/systemd/user/forest-proxy-updater.timer
-[2026-10-17 03:36:45] INFO    конфиг удалён: /home/tester/.config/forest-proxy-updater/config.json
-[2026-10-17 03:36:45] INFO    каталог конфига удалён: /home/tester/.config/forest-proxy-updater
-[2026-10-17 03:36:45] INFO    данные программы удалён: /home/tester/.local/share/forest-proxy-updater
-[2026-10-17 03:36:45] INFO    состояние/логи удалён: /home/tester/.local/state/forest-proxy-updater
+[2026-10-17 04:21:34] INFO  Запуск FOREST's Proxy Auto-updater (аргументы: --uninstall)
+[2026-10-17 04:21:34] INFO  Удаление (Linux) из /home/tester/.local/share/forest-proxy-updater
+[2026-10-17 04:21:34] INFO    systemctl --user disable --now forest-proxy-updater.service: OK
+[2026-10-17 04:21:34] INFO    systemctl --user disable --now forest-proxy-updater.timer: OK
+[2026-10-17 04:21:34] INFO    systemctl --user disable --now forest-proxy-updater-refresh.service: OK
+[2026-10-17 04:21:34] INFO    юнит удалён: /home/tester/.config/systemd/user/forest-proxy-updater.service
+[2026-10-17 04:21:34] INFO    юнит удалён: /home/tester/.config/systemd/user/forest-proxy-updater-refresh.service
+[2026-10-17 04:21:34] INFO    юнит удалён: /home/tester/.config/systemd/user/forest-proxy-updater.timer
+[2026-10-17 04:21:34] INFO    конфиг удалён: /home/tester/.config/forest-proxy-updater/config.json
+[2026-10-17 04:21:34] INFO    каталог конфига удалён: /home/tester/.config/forest-proxy-updater
+[2026-10-17 04:21:34] INFO    данные программы удалён: /home/tester/.local/share/forest-proxy-updater
+[2026-10-17 04:21:34] INFO    состояние/логи удалён: /home/tester/.local/state/forest-proxy-updater
 Удаление завершено: юниты сняты, ядро остановлено, файлы удалены.
 
 ### residue (as tester)
@@ -932,7 +909,6 @@ UNIT FILE STATE PRESET
 ### _MEI* left in /tmp:
 ls: cannot access '/tmp/_MEI*': No such file or directory
 ```
-
 
 ## 6. Что нашлось и что стенд пришлось доработать
 
