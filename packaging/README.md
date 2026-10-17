@@ -42,6 +42,34 @@ $env:FOREST_PYTHON='C:\Path\to\python.exe'; powershell -File packaging\build.ps1
 
 Готовый файл: **`packaging\dist\ForestProxyUpdater.exe`**.
 
+### Помощник интерфейса (`forest-ui.exe`) — отдельный файл
+
+Интерфейс (значок в трее, меню с подменю, уведомления с анимацией, темы) собран
+в **отдельную** программу на Qt, чтобы основная оставалась маленькой и без
+сторонних зависимостей. Сборка:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build-ui.ps1
+:: -> packaging\dist\forest-ui.exe (~35 МиБ) + forest-ui.exe.sha256
+```
+
+Скрипт ставит `PySide6-Essentials` (пин — `requirements-ui.txt`) в то же
+`.build-venv` и собирает по спеке `forest-ui.spec`. Из пакета Qt выбрасываются
+неиспользуемые части (QML/Quick, сеть, SQL, WebEngine и т. п.) — поэтому файл
+35 МиБ, а не ~100 МиБ.
+
+Проверка после сборки (каждый пункт — с доказательствами, код возврата не 0 при
+ошибке):
+
+```powershell
+packaging\dist\forest-ui.exe --menu-dump    :: печатает всё дерево меню
+packaging\dist\forest-ui.exe --selftest     :: значки, темы, мост команд, кадры, фокус
+packaging\dist\forest-ui.exe --show error "Заголовок" "Текст"
+```
+
+Основная сборка **не** требует Qt: если помощник не собран, программа работает
+со встроенным значком и встроенными уведомлениями.
+
 ## Что внутри одного .exe
 
 Спека `ForestProxyUpdater.spec`: onefile + `console=False` (окна консоли нет),
@@ -69,9 +97,27 @@ ForestProxyUpdater.exe --status   --config config.example.json
 ```
 
 Ожидаемо: `--selftest` печатает `ВСЕ ПРОВЕРКИ ПРОЙДЕНЫ` и возвращает код 0
-(90 проверок, те же, что при запуске из исходников), а `--status` показывает
-режим, путь к **вшитому** ядру (внутри `%TEMP%\_MEI...\bin\xray\xray.exe`),
-размер пула и состояние системного прокси.
+(те же проверки, что при запуске из исходников, включая раздел 14 про автономный
+надзор), а `--status` показывает режим, путь к **встроенному** ядру — оно
+копируется из пакета в постоянный каталог
+(`%LOCALAPPDATA%\ForestProxyUpdater\bin\xray\xray.exe`), размер пула, состояние
+системного прокси и строку про надзор.
+
+### Отладочная сборка без окна ошибок (для проверок)
+
+`FOREST_CONSOLE_BUILD=1` собирает `ForestProxyUpdater-console.exe` — консольный
+вариант того же кода. У консольной сборки ошибка уборщика PyInstaller печатается
+в `stderr`, а **не** показывается модальным окном на рабочем столе. Это нужно,
+чтобы безопасно проверять поведение без риска показать пользователю окно:
+
+```powershell
+$env:FOREST_CONSOLE_BUILD='1'
+packaging\.build-venv\Scripts\python.exe -m PyInstaller --noconfirm --clean `
+    --distpath packaging\dist-console --workpath packaging\build-console `
+    packaging\ForestProxyUpdater.spec
+```
+
+Запускать её надо с флагом `CREATE_NO_WINDOW`, чтобы не мелькало консольное окно.
 
 Дополнительно можно убедиться, что ядро и гео-базы внутри .exe побайтово
 совпадают с официальным релизом:
@@ -98,9 +144,9 @@ packaging\.build-venv\Scripts\python.exe packaging\fetch_core.py --force
 
 | Файл | Зачем |
 |---|---|
-| `ForestProxyUpdater.spec` | спека PyInstaller: onefile, без консоли, иконка+версия |
+| `ForestProxyUpdater.spec` | спека PyInstaller: onefile, без консоли (с `FOREST_CONSOLE_BUILD=1` — консольный отладочный вариант), иконка+версия |
 | `build.ps1` / `build.bat` | сборка (идемпотентно), кладёт .exe в `dist\` |
-| `version_info.txt` | ресурс версии: ProductName «FOREST's Proxy Auto-updater», 1.0.0, CompanyName пустой |
+| `version_info.txt` | ресурс версии: ProductName «FOREST's Proxy Auto-updater», 1.2.0, CompanyName пустой |
 | `make_icon.py` | генератор `app.ico` на чистом Python (без PIL): 16…256 px |
 | `app.ico` | иконка приложения (сгенерирована `make_icon.py`) |
 | `fetch_core.py` | скачивание официального ядра в `vendor\bin\xray\`, проверка SHA256 |

@@ -64,7 +64,14 @@ sh packaging-linux/build-tar.sh            # только .tar.gz
 | `.tar.gz` | `tar`, `gzip` | ничего больше |
 
 Входы: `linux/dist/forest-proxy-updater` (собирается `packaging/build-linux.sh`),
-шаблоны `system/`, `docs/LINUX-INSTALL*.md`, `config.example.json`, `LICENSE`.
+шаблоны `system/`, `docs/LINUX-INSTALL*.md`, `config.example.json`, `LICENSE`,
+значок `icons/forest-proxy-updater.png` и — если собран — помощник интерфейса
+`linux/dist/forest-ui` (сборка: `sh packaging/build-ui.sh`).
+
+В каждый пакет кладутся **значок** (`/usr/share/icons/hicolor/256x256/apps/`) и
+**.desktop**-файлы: `forest-proxy-updater.desktop` (сама программа) и, если
+помощник собран, `forest-proxy-updater-ui.desktop` (значок в трее, меню,
+уведомления). Без помощника пакет собирается так же — с предупреждением.
 
 ## Что попадает в каждый пакет
 
@@ -73,6 +80,7 @@ sh packaging-linux/build-tar.sh            # только .tar.gz
 | Что | Куда |
 | --- | --- |
 | Программа (ELF; Python, ядро `xray` и гео-базы внутри) | `/usr/lib/forest-proxy-updater/forest-proxy-updater` |
+| Помощник интерфейса (Qt; если собран) | `/usr/lib/forest-proxy-updater/forest-ui` (+ симлинк `/usr/bin/forest-ui`) |
 | Команда в PATH | `/usr/bin/forest-proxy-updater` (симлинк) |
 | Юниты systemd (служба + плановый прогон + таймер) | `/usr/lib/systemd/system/forest-proxy-updater*.{service,timer}` |
 | Конфиг по умолчанию | `/etc/forest-proxy-updater/config.json` (`conffile` в .deb, `%config(noreplace)` в .rpm) |

@@ -5,6 +5,12 @@
 .build-venv/
 build/
 dist/
+build-ui/
+build-ui-linux/
+
+# отладочная (консольная) сборка: FOREST_CONSOLE_BUILD=1
+build-console/
+dist-console/
 
 # скачанное официальное ядро Xray-core: НЕ коммитим бинарники (~63 МиБ),
 # его детерминированно качает `python fetch_core.py` (пин — core.lock.json)
@@ -18,6 +24,9 @@ build-linux/
 
 # предпросмотры иконки
 icon_preview_*.png
+
+# кэш pip (чтобы не рос диск на C: при сборке помощника на Qt)
+.pipecache/
 
 # ВАЖНО: спеку и скрипты сборки держим в репозитории — отменяем
 # родительский `*.spec`, иначе спецификация выпадет из git.

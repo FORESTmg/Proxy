@@ -45,11 +45,16 @@ source=('forest-proxy-updater'
         'COPYING'
         'TERMS.md'
         'TERMS.ru.md'
-        'forest-proxy-updater.install')
+        'forest-proxy-updater.install'
+        'forest-ui'
+        'forest-proxy-updater.desktop'
+        'forest-proxy-updater-ui.desktop'
+        'forest-proxy-updater.png')
 
 sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
             'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
-            'SKIP' 'SKIP')
+            'SKIP' 'SKIP'
+            'SKIP' 'SKIP' 'SKIP' 'SKIP')
 
 package() {
   # Программа: PyInstaller-onefile ELF, ядро xray и гео-базы внутри.
@@ -79,4 +84,19 @@ package() {
   install -Dm644 "$srcdir/TERMS.md" "$pkgdir/usr/share/doc/$pkgname/TERMS.md"
   install -Dm644 "$srcdir/TERMS.ru.md" "$pkgdir/usr/share/doc/$pkgname/TERMS.ru.md"
   install -Dm644 "$srcdir/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+
+  # Помощник интерфейса (Qt): значок в трее, меню и уведомления. Отдельный файл,
+  # ядром не управляет. Программа ищет его рядом с собой (src/ui_helper.py).
+  install -Dm755 "$srcdir/forest-ui" \
+      "$pkgdir/usr/lib/$pkgname/forest-ui"
+  install -d "$pkgdir/usr/bin"
+  ln -sf "/usr/lib/$pkgname/forest-ui" "$pkgdir/usr/bin/forest-ui"
+
+  # Ярлыки в меню приложений и значок (нужен и трею, и уведомлениям)
+  install -Dm644 "$srcdir/forest-proxy-updater.desktop" \
+      "$pkgdir/usr/share/applications/forest-proxy-updater.desktop"
+  install -Dm644 "$srcdir/forest-proxy-updater-ui.desktop" \
+      "$pkgdir/usr/share/applications/forest-proxy-updater-ui.desktop"
+  install -Dm644 "$srcdir/forest-proxy-updater.png" \
+      "$pkgdir/usr/share/icons/hicolor/256x256/apps/forest-proxy-updater.png"
 }

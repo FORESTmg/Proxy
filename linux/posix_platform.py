@@ -170,6 +170,34 @@ def enable_linger() -> tuple:
         return False, str(e)
 
 
+# ══════════════════════════════════════════ надзор (Linux) ═══
+def ensure(cfg: dict) -> int:
+    """Linux ``--ensure``: поднять службу, если она не работает. Тихо, только в лог.
+
+    На Linux автономность обеспечивает сам systemd (``Restart=always``): упавший
+    процесс он поднимает сразу, а таймер периодически запускает плановое
+    обновление. ``--ensure`` нужен на случай, когда служба остановлена целиком
+    (``systemctl --user stop``, перезагрузка без linger и т. п.) — тогда её
+    включаем снова. Никаких окон; вывод только в журнал.
+    """
+    lg = log.get_logger()
+    if not systemd_available():
+        lg.info("watchdog(Linux): systemd недоступен — ничего не делаю")
+        return 0
+    _rc, out = _systemctl(["is-active", UNIT_SERVICE])
+    state = (out or "").strip()
+    if state.startswith("active"):
+        lg.info("watchdog(Linux): служба уже работает")
+        return 0
+    lg.info(f"watchdog(Linux): служба {state or 'не активна'} — включаю и запускаю")
+    ok, out2 = _systemctl(["enable", "--now", UNIT_SERVICE, UNIT_TIMER])
+    if ok:
+        lg.info("watchdog(Linux): служба включена")
+        return 0
+    lg.warn(f"watchdog(Linux): включить не удалось: {out2}")
+    return 1
+
+
 # ══════════════════════════════════════════ уведомления ═══
 _NOTIFY = None
 
@@ -182,7 +210,19 @@ def notify_available() -> bool:
 
 
 def notify(title: str, body: str, urgency: str = "normal") -> bool:
-    """Уведомление рабочего стола через notify-send (нет утилиты — тихо мимо)."""
+    """Уведомление рабочего стола: D-Bus (org.freedesktop.Notifications) или notify-send.
+
+    Единый путь — :func:`notify._posix_notify`: он сперва пробует ``gdbus``
+    (то есть саму службу D-Bus), затем ``notify-send``, умеет значок приложения
+    и точность (urgency). Нет ни того, ни другого — тихо мимо: программа
+    работает как обычно, событие остаётся в логе.
+    """
+    try:
+        import notify as N
+        kind = {"critical": "error", "low": "off"}.get(str(urgency).lower(), "ok")
+        return bool(N._posix_notify(kind, title, body, _notify_cfg()))
+    except Exception:
+        pass
     if not notify_available():
         return False
     try:
@@ -192,6 +232,15 @@ def notify(title: str, body: str, urgency: str = "normal") -> bool:
         return True
     except Exception:
         return False
+
+
+def _notify_cfg() -> dict:
+    """Конфиг для notify.py: пути и настройки уведомлений."""
+    try:
+        import config as CFG
+        return CFG.load_config()
+    except Exception:
+        return {"notify": {}}
 
 
 # ══════════════════════════════════════════ индикация (замена трея) ═══

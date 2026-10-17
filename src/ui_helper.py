@@ -1,0 +1,293 @@
+# FOREST's Proxy Auto-updater
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+"""Помощник интерфейса: запуск, остановка и присмотр за процессом ``forest-ui``.
+
+Помощник (Qt: значок в трее, меню, уведомления) — ОТДЕЛЬНАЯ программа. Этот
+модуль — единственное место, где она запускается и останавливается, чтобы
+порядок был один и тот же у ``--install``, у ``--ensure`` (задача Планировщика)
+и у сторожа.
+
+Правила
+-------
+* нет файла помощника — тихо ничего не делаем (программа работает со встроенным
+  значком и запасными уведомлениями ``notify.py``);
+* помощник уже работает (пульс ``state/ui_helper.json`` + живой pid) — второй не
+  запускаем;
+* запуск отвязанный: падение помощника не тянет за собой программу, а сам
+  помощник не держит родителя;
+* настройка ``ui.helper`` = ``auto`` (по умолчанию) | ``on`` | ``off``.
+"""
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+import time
+
+IS_WIN = sys.platform.startswith("win")
+NAME_WIN = "forest-ui.exe"
+NAME_POSIX = "forest-ui"
+STOP_FLAG = "ui_stop.flag"
+
+
+def helper_name() -> str:
+    return NAME_WIN if IS_WIN else NAME_POSIX
+
+
+def _exists(p: str) -> bool:
+    try:
+        return bool(p) and os.path.isfile(p)
+    except Exception:
+        return False
+
+
+def helper_path(cfg: dict) -> str:
+    """Где искать помощника (первым — явный путь из конфига). -> '' если нет."""
+    cfgu = (cfg or {}).get("ui") or {}
+    cands = []
+    for k in ("helper_exe", "helper"):
+        v = str(cfgu.get(k) or "")
+        if v and v.lower() not in ("auto", "on", "off", "true", "false"):
+            cands.append(v)
+    try:
+        cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                  helper_name()))
+    except Exception:
+        pass
+    try:
+        mp = getattr(sys, "_MEIPASS", "") or ""
+        if mp:
+            cands.append(os.path.join(mp, helper_name()))
+    except Exception:
+        pass
+    try:
+        root = ((cfg or {}).get("paths") or {}).get("root") or ""
+        if root:
+            cands.append(os.path.join(root, helper_name()))
+    except Exception:
+        pass
+    for c in cands:
+        if _exists(c):
+            return c
+    return ""
+
+
+def dev_script() -> str:
+    """Скрипт помощника для режима разработки (без собранного файла)."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    p = os.path.join(here, "forest_ui.py")
+    return p if _exists(p) else ""
+
+
+def command(cfg: dict) -> list:
+    """Команда запуска помощника. -> [] если запускать нечего."""
+    exe = helper_path(cfg)
+    if exe:
+        return [exe]
+    if os.environ.get("FOREST_UI_DEV") == "1":
+        s = dev_script()
+        if s:
+            pyw = os.path.join(os.path.dirname(sys.executable), "pythonw.exe")
+            return [pyw if _exists(pyw) else sys.executable, s]
+    return []
+
+
+def mode(cfg: dict) -> str:
+    v = str(((cfg or {}).get("ui") or {}).get("helper", "auto") or "auto").lower()
+    return v if v in ("auto", "on", "off") else "auto"
+
+
+def enabled(cfg: dict) -> bool:
+    """Нужно ли держать помощник: настройка + наличие файла."""
+    m = mode(cfg)
+    if m == "off":
+        return False
+    if m == "on":
+        return True
+    return bool(command(cfg))
+
+
+def _pid_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        if IS_WIN:
+            import ctypes
+            h = ctypes.windll.kernel32.OpenProcess(0x1000, False, int(pid))
+            if not h:
+                return False
+            ctypes.windll.kernel32.CloseHandle(h)
+            return True
+        os.kill(int(pid), 0)
+        return True
+    except Exception:
+        return False
+
+
+def running_pid(cfg: dict) -> int:
+    """pid работающего помощника (0 — не работает).
+
+    Смотрим на пульс (``state/ui_helper.json``) И на живой процесс: одного
+    пульса мало — файл мог остаться от упавшего помощника.
+    """
+    try:
+        import ui_cmd as UC
+        p = UC.ping_path(cfg)
+        if not p or not os.path.isfile(p):
+            return 0
+        import json
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        pid = int(d.get("pid", 0) or 0)
+        if pid == os.getpid():
+            return 0
+        if _pid_alive(pid):
+            return pid
+    except Exception:
+        return 0
+    return 0
+
+
+def running(cfg: dict) -> bool:
+    return running_pid(cfg) > 0
+
+
+def launch(cfg: dict, log_msg: bool = True) -> bool:
+    """Запускает помощник отвязанно. -> True, если процесс стартовал."""
+    cmd = command(cfg)
+    if not cmd:
+        return False
+    try:
+        cwd = os.path.dirname(os.path.abspath(cmd[0]))
+    except Exception:
+        cwd = None
+    flags = 0
+    if IS_WIN:
+        # своя группа процессов + не наследовать консоль и задания вызывающего:
+        # помощник должен жить и после выхода того, кто его поднял
+        flags = (0x00000008 | 0x02000000 | 0x00000200)   # DETACHED_PROCESS |
+        # CREATE_BREAKAWAY_FROM_JOB | CREATE_NEW_PROCESS_GROUP
+    try:
+        devnull = open(os.devnull, "wb")
+    except Exception:
+        devnull = None
+    try:
+        p = subprocess.Popen(cmd, cwd=cwd or None, stdin=subprocess.DEVNULL,
+                             stdout=devnull or subprocess.DEVNULL,
+                             stderr=subprocess.STDOUT if devnull else subprocess.DEVNULL,
+                             close_fds=True, creationflags=flags,
+                             start_new_session=(not IS_WIN))
+    except Exception as e:
+        if log_msg:
+            _warn(f"помощник интерфейса не запущен: {e}")
+        return False
+    finally:
+        try:
+            if devnull:
+                devnull.close()
+        except Exception:
+            pass
+    t0 = time.time()
+    while time.time() - t0 < 8.0:
+        if running(cfg):
+            if log_msg:
+                _info(f"помощник интерфейса запущен (pid={running_pid(cfg)}, "
+                      f"файл {cmd[0]})")
+            return True
+        time.sleep(0.2)
+    if log_msg:
+        _warn("помощник интерфейса запущен, но пульс не появился — "
+              "работаю со встроенным значком")
+    return True
+
+
+def stop(cfg: dict, wait_s: float = 8.0) -> bool:
+    """Просит помощник выйти (флаг) и, если не вышел, завершает процесс."""
+    if not running(cfg):
+        _clear(cfg)
+        return True
+    try:
+        d = ((cfg or {}).get("paths") or {}).get("state_dir") or ""
+        if d:
+            p = os.path.join(d, STOP_FLAG)
+            with open(p, "w", encoding="utf-8") as f:
+                f.write("stop")
+    except Exception:
+        pass
+    t0 = time.time()
+    while time.time() - t0 < wait_s:
+        if not running(cfg):
+            _clear(cfg)
+            return True
+        time.sleep(0.2)
+    pid = running_pid(cfg)
+    if pid:
+        try:
+            if IS_WIN:
+                subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                               capture_output=True, timeout=20)
+            else:
+                os.kill(pid, 15)
+        except Exception as e:
+            _warn(f"помощник интерфейса не остановлен: {e}")
+            return False
+    _clear(cfg)
+    return True
+
+
+def _clear(cfg: dict) -> None:
+    try:
+        import ui_cmd as UC
+        UC.clear_ping(cfg)
+        d = ((cfg or {}).get("paths") or {}).get("state_dir") or ""
+        if d:
+            p = os.path.join(d, STOP_FLAG)
+            if os.path.isfile(p):
+                os.unlink(p)
+    except Exception:
+        pass
+
+
+def ensure(cfg: dict) -> bool:
+    """Держит помощник живым: запускает, если его нет. Тихо, только в лог."""
+    if not enabled(cfg):
+        return False
+    if running(cfg):
+        return True
+    return launch(cfg)
+
+
+def restart(cfg: dict) -> bool:
+    stop(cfg)
+    return launch(cfg)
+
+
+def status_text(cfg: dict) -> str:
+    """Строка для ``--status``: что с помощником интерфейса."""
+    import i18n as I
+    if mode(cfg) == "off":
+        return I.t("ui.status.off")
+    p = helper_path(cfg)
+    if not p:
+        return I.t("ui.status.absent")
+    pid = running_pid(cfg)
+    if pid:
+        return I.t("ui.status.running", pid=pid)
+    return I.t("ui.status.stopped")
+
+
+def _info(m: str) -> None:
+    try:
+        import log as LG
+        LG.get_logger().info(m)
+    except Exception:
+        pass
+
+
+def _warn(m: str) -> None:
+    try:
+        import log as LG
+        LG.get_logger().warn(m)
+    except Exception:
+        pass

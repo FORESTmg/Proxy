@@ -92,8 +92,9 @@ The distributable is a single `.exe`. The usual flow:
 3. **Run the `.exe`.** Windows will warn about an unsigned program
    (SmartScreen) — see the security section. On first run the program creates
    its working config from `config.example.json`, lays itself out under
-   `%LOCALAPPDATA%\ForestProxyUpdater`, adds a Start Menu shortcut and an
-   autostart entry, and runs the first selection cycle.
+   `%LOCALAPPDATA%\ForestProxyUpdater`, adds a Start Menu shortcut and a
+   **Windows Task Scheduler watchdog task** (autonomous supervision — see
+   below), and runs the first selection cycle.
 4. After the first cycle, **the Windows system proxy is pointed at the local
    port** `127.0.0.1:10808` and traffic goes through the selected servers.
 
@@ -109,8 +110,122 @@ process and port checks. No administrator rights are required.
 
 Run the `.exe` with `--uninstall` (or the "uninstall" entry the packaged build
 provides). This stops the core, **restores the system proxy to the state it had
-before the first run**, removes the autostart entry and the shortcut, and
-deletes `%LOCALAPPDATA%\ForestProxyUpdater`.
+before the first run**, removes the supervision task (and any old autostart
+entry) and the shortcut, and deletes `%LOCALAPPDATA%\ForestProxyUpdater`.
+
+## Autonomous supervision: the program brings itself back
+
+By default the installer creates a **Windows Task Scheduler task**
+`ForestProxyUpdater-Watchdog` and **enables it**. This is what keeps the program
+alive without you watching it:
+
+- it starts the program **when you log in**, and
+- it **checks every 5 minutes** whether the program is running, and starts it
+  again if it is not — after a crash, after you closed it by accident, or after
+  the parent process that started it died (for example an editor, a package
+  manager or an updater that kills its own process tree).
+
+The check itself is the `--ensure` mode: it is quick, writes only to the log,
+**never shows a window**, and refuses to start a second copy while one is
+already running — two running programs would fight over the same port and break
+your connection.
+
+> **Read this.** If the task is not created, or you switch it off, the program
+> **will not restart itself**. After a crash or an accidental close you will have
+> to start it by hand. That is the only mechanical difference between supervised
+> and unsupervised operation — everything else works exactly the same.
+
+Turn it off, on, or inspect it:
+
+```bat
+ForestProxyUpdater.exe --watchdog off      :: remove the task — no auto-restart any more
+ForestProxyUpdater.exe --watchdog on       :: create it again and enable it
+ForestProxyUpdater.exe --watchdog status   :: is it on? is the task there? when did it last run?
+```
+
+From the tray icon: **Supervision → "Bring the program up automatically"**
+(a tick means on). `--status` also prints the supervision line.
+
+The setting lives in `config.json`:
+
+```json
+"watchdog": { "enabled": true, "interval_min": 5, "task_name": "ForestProxyUpdater-Watchdog" }
+```
+
+`enabled: false` makes `--install` skip creating the task (and delete a previous
+one), and it says so honestly instead of pretending the program will come back.
+`interval_min` changes the check period. On Linux this section is informational:
+supervision there is systemd's job (`Restart=always` plus the update timer), and
+`--ensure` simply starts the service if it is not running.
+
+## What the interface shows (same as the previous add-on)
+
+The tray icon and the notification card show exactly the data the earlier setup
+showed — the composition is kept in one place (`src/status_info.py`) and used by
+both interfaces, so nothing is lost:
+
+| Where | What is shown |
+|---|---|
+| icon tooltip | `FOREST <link state> \| <N> servers \| <RU route> \| watch OK` (four fields, same order) |
+| icon colour | six states: green `связь OK`, grey `выключено вручную`, amber `переключение` / `сторож молчит (нет данных)`, red `НЕТ СВЯЗИ`, blue `восстановление связи` |
+| notification card | title (`Восстановление связи` / `Переключение сервера` / `Связь восстановлена` / `Переключение завершено` / `Восстановить не удалось`), subtitle, percentage, the step list with per-step times (`0.05 с`, `0.35 с`, …) and the footer |
+| link recovery time | `связь подтверждена · N.NN с` in the subtitle and `восстановлено за N.NN с · окно закроется через 4 с` in the footer; also kept in the menu after the card closes |
+| menu | open log, open status, enable/disable the proxy by hand, quit — plus supervision, notifications, theme, “refresh now” and about |
+
+Only the smoothness (60 fps) and the look (light/dark themes, your own icon with
+the state colour painted inside) are new; the data, the wording and the order are
+the reference ones. The one deliberate correction: the server count used to be a
+fixed `10`, now it is the real pool size.
+
+## Interface: the Qt helper (tray icon, menu, notifications)
+
+The interface is a **separate program, `forest-ui`** (Qt/PySide6, LGPL-3.0 —
+compatible with this project's GPL-3.0; Qt is linked dynamically and unmodified).
+The main program stays small and needs no third-party packages; the helper draws:
+
+* the **tray icon** — your own `app.ico`, with the connection colour painted
+  **inside** the picture (green = working, grey = off by hand, red = no
+  connection, amber = switching server). Colours are chosen to be readable on
+  both light and dark taskbars;
+* the **menu with submenus**: the status line, supervision on/off, notifications
+  on/off, **theme (follow system / light / dark)**, "Refresh servers now",
+  "Test notification", "Open log", "About", "Quit";
+* **notifications** — a frameless translucent card with rounded corners, shadow
+  and your icon, sliding in and fading out at **60 frames per second**, which
+  **never takes keyboard focus** from the window you are working in.
+
+**The helper does not control the core.** A menu item is written as a command
+into `state/ui_cmd.json`; the supervisor reads that file and performs it through
+exactly the same code as the built-in menu (system proxy, supervision task,
+`config.json`, the core itself). So there is still **one owner** of the core. In
+the other direction the helper reads `state/tray_status.json` (colour and tooltip)
+and leaves a heartbeat in `state/ui_helper.json`, which `--status` prints.
+
+Everything degrades quietly:
+
+| Situation | What happens |
+|---|---|
+| helper not installed, not running or crashed | the built-in icon (ctypes) and the built-in notifications work — the program behaves exactly as before |
+| helper running | the helper owns the icon, the menu and the notifications; the built-in tray waits **in reserve** and takes over within seconds if the helper stops |
+| no tray on the desktop at all | notifications still appear; the program keeps working (only the menu is missing) |
+| `"ui": {"helper": "off"}` | the helper is never started |
+
+The helper is raised by the program itself — at `--install`, by the **scheduled
+task** (its action is `--ensure`) and by the supervisor's keep-alive loop every
+30 s — so a helper that crashes comes back on its own, and a second copy is never
+started.
+
+Settings: `ui.helper` = `auto` (default; start it if the file is present) |
+`on` | `off`, and `ui.helper_exe` — an explicit path to the file.
+Build it with `packaging\build-ui.ps1` (Windows) or
+`sh packaging/build-ui.sh` (Linux); it ships as a separate artefact
+(`forest-ui.exe` / `forest-ui`, ~80 MB — Qt is big, that is expected).
+
+On **Linux** the same helper gives a real tray icon and menu (Qt talks to
+StatusNotifier/**D-Bus**), notifications go through the system service
+(`org.freedesktop.Notifications`) instead of our own window — exactly as before
+for the fallback path, which uses `gdbus`/`notify-send` — and the theme is read
+from the system settings (`gsettings`).
 
 ## Linux
 
@@ -123,11 +238,11 @@ Every package installs with **one command**:
 
 | Format | Distributions | Install | Root |
 | --- | --- | --- | --- |
-| `.deb` | Debian, Ubuntu, Linux Mint | `sudo apt install ./forest-proxy-updater_1.1.0_amd64.deb` | yes |
-| `.rpm` | Fedora, RHEL, Rocky, Alma, openSUSE | `sudo dnf install ./forest-proxy-updater-1.1.0-1.x86_64.rpm` | yes |
-| `.pkg.tar.zst` | Arch, Manjaro, EndeavourOS | `sudo pacman -U ./forest-proxy-updater-1.1.0-1-x86_64.pkg.tar.zst` | yes |
-| `.AppImage` | any glibc x86_64 | `./ForestProxyUpdater-1.1.0-x86_64.AppImage --install` | **no** |
-| `.tar.gz` | any | `tar xzf forest-proxy-updater-1.1.0-linux-x86_64.tar.gz && cd forest-proxy-updater-1.1.0-linux-x86_64 && sudo ./install.sh` | yes |
+| `.deb` | Debian, Ubuntu, Linux Mint | `sudo apt install ./forest-proxy-updater_1.2.0_amd64.deb` | yes |
+| `.rpm` | Fedora, RHEL, Rocky, Alma, openSUSE | `sudo dnf install ./forest-proxy-updater-1.2.0-1.x86_64.rpm` | yes |
+| `.pkg.tar.zst` | Arch, Manjaro, EndeavourOS | `sudo pacman -U ./forest-proxy-updater-1.2.0-1-x86_64.pkg.tar.zst` | yes |
+| `.AppImage` | any glibc x86_64 | `./ForestProxyUpdater-1.2.0-x86_64.AppImage --install` | **no** |
+| `.tar.gz` | any | `tar xzf forest-proxy-updater-1.2.0-linux-x86_64.tar.gz && cd forest-proxy-updater-1.2.0-linux-x86_64 && sudo ./install.sh` | yes |
 
 Check it once the first selection cycle has finished (a few minutes — the
 program is downloading and testing hundreds of public servers):
@@ -304,14 +419,21 @@ of these:
 
 ```
 --install     lay out under %LOCALAPPDATA%\ForestProxyUpdater (the .exe itself is
-              copied there), create the Start Menu shortcut and the autostart
-              entry "<install dir>\ForestProxyUpdater.exe" --run, run the first cycle
---uninstall   stop the core, restore the system proxy, remove the autostart entry,
-              the shortcut, the installed .exe and the program directory
+              copied there), create the Start Menu shortcut and the watchdog
+              task (autonomous supervision, on by default), run the first cycle
+--uninstall   stop the core, restore the system proxy, remove the supervision task,
+              the autostart entry (if any), the shortcut, the installed .exe and
+              the program directory
 --run         normal run: the supervisor with its worker threads (until stopped)
+--ensure      start the supervisor if it is not running (this is what the watchdog
+              task calls); quiet, log only, never shows a window, never starts a
+              second copy
+--watchdog on|off|status
+              autonomous supervision: create+enable the task, remove it, or report
+              its honest state (setting, task, last run, is the program running)
 --once        one full server-selection cycle            (alias: --auto)
 --guard       one quick self-check / recovery pass
---status      show the current state
+--status      show the current state (including the supervision line)
 --selftest    run the built-in test suite
 --watch       run only the watchdog (one process)
 --dry-run     run a cycle without writing anything or starting the core
@@ -320,7 +442,8 @@ of these:
 ```
 
 Background work runs without console windows (`CREATE_NO_WINDOW` / `pythonw`
-semantics).
+semantics). The watchdog task is registered as hidden, runs as the current user
+and is configured **not to start a new instance while it is already running**.
 
 ## Files and logs
 

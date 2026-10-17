@@ -19,6 +19,7 @@ RPM_DIR="$PACKAGING_LINUX_DIR/rpm"
 
 step "проверка входов"
 check_inputs
+require_ui
 require_tool rpmbuild "openSUSE: zypper install rpm-build; Fedora: dnf install rpm-build"
 require_tool rpm "нужен для проверки результата"
 say "ELF:      $ELF ($(du -h "$ELF" | cut -f1))"

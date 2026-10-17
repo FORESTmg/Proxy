@@ -79,12 +79,14 @@ _STRINGS = {
     "tray.state.ok": {"ru": "работает", "en": "running"},
     "tray.state.off": {"ru": "выключен вручную", "en": "manually disabled"},
     "tray.state.error": {"ru": "нет связи", "en": "no connectivity"},
+    "tray.state.busy": {"ru": "переключение/проверка", "en": "switching / checking"},
 
     # ──────────────────────────────────────── подсказки значка ───
     "tray.tip.ok": {"ru": "FOREST: прокси работает", "en": "FOREST: proxy is running"},
     "tray.tip.off": {"ru": "FOREST: прокси выключен вручную",
                      "en": "FOREST: proxy manually disabled"},
     "tray.tip.error": {"ru": "FOREST: нет связи", "en": "FOREST: no connectivity"},
+    "tray.tip.busy": {"ru": "FOREST: переключение/проверка", "en": "FOREST: switching / checking"},
     "tray.tip.unknown": {"ru": "FOREST: нет данных о состоянии",
                          "en": "FOREST: no status data"},
 
@@ -150,6 +152,136 @@ _STRINGS = {
     "error.proxy_change": {"ru": "Не удалось изменить системный прокси.",
                            "en": "Could not change the system proxy."},
     "error.generic": {"ru": "Ошибка: {err}", "en": "Error: {err}"},
+
+    # ───────────────────────────── автономный надзор (задача Планировщика) ───
+    "watchdog.status_title": {"ru": "Автономный надзор (задача Планировщика заданий)",
+                              "en": "Autonomous supervision (Task Scheduler task)"},
+    "watchdog.setting": {"ru": "Настройка надзора", "en": "Supervision setting"},
+    "watchdog.enabled": {"ru": "включён", "en": "enabled"},
+    "watchdog.disabled": {"ru": "выключен", "en": "disabled"},
+    "watchdog.interval": {"ru": "Проверка каждые %d минут(ы)", "en": "Check every %d minute(s)"},
+    "watchdog.task_name": {"ru": "Имя задачи", "en": "Task name"},
+    "watchdog.task_present": {"ru": "Задача в Планировщике", "en": "Scheduler task"},
+    "watchdog.task_action": {"ru": "Что запускает", "en": "Runs"},
+    "watchdog.last_run": {"ru": "Последний запуск", "en": "Last run"},
+    "watchdog.next_run": {"ru": "Следующий запуск", "en": "Next run"},
+    "watchdog.yes": {"ru": "есть", "en": "present"},
+    "watchdog.no": {"ru": "нет", "en": "absent"},
+    "watchdog.task_word": {"ru": "задача", "en": "task"},
+    "watchdog.program": {"ru": "Программа", "en": "Program"},
+    "watchdog.program_running": {"ru": "работает сейчас", "en": "running now"},
+    "watchdog.program_stopped": {"ru": "сейчас не работает", "en": "not running now"},
+    "watchdog.status_line": {"ru": "Надзор", "en": "Supervision"},
+    "watchdog.service": {"ru": "Служба systemd", "en": "systemd service"},
+    "watchdog.linux_note": {"ru": "На Linux надзор обеспечивает systemd: служба "
+                                  "перезапускается сама (Restart=always), плюс таймер "
+                                  "планового обновления. Отдельная задача не нужна.",
+                            "en": "On Linux supervision is provided by systemd: the service "
+                                  "restarts itself (Restart=always), plus a scheduled-update "
+                                  "timer. No separate task is needed."},
+    "watchdog.on_note": {"ru": "Надзор включён: при входе в систему и раз в несколько минут "
+                               "программа поднимется сама, если не работает.",
+                         "en": "Supervision on: the program will bring itself back at logon "
+                               "and every few minutes if it is not running."},
+    "watchdog.task_missing_warn": {
+        "ru": "Внимание: настройка надзора включена, но задачи в Планировщике заданий нет — "
+              "программа сама не перезапустится. Создайте её: --watchdog on.",
+        "en": "Note: supervision is enabled in the config, but there is no Task Scheduler "
+              "task — the program will not restart itself. Create it with: --watchdog on."},
+    "watchdog.off_warning": {"ru": "Внимание: если надзор выключен, программа НЕ поднимется "
+                                   "сама после падения или случайного закрытия — её придётся "
+                                   "запускать вручную.",
+                             "en": "Note: with supervision off the program will NOT bring "
+                                   "itself back after a crash or accidental close — you will "
+                                   "have to start it by hand."},
+    "watchdog.turned_on": {"ru": "Надзор включён.", "en": "Supervision enabled."},
+    "watchdog.turned_off": {"ru": "Надзор выключен.", "en": "Supervision disabled."},
+    "watchdog.turn_on_failed": {"ru": "Не удалось включить надзор: {err}",
+                                "en": "Could not enable supervision: {err}"},
+    "watchdog.turn_off_failed": {"ru": "Не удалось выключить надзор: {err}",
+                                 "en": "Could not disable supervision: {err}"},
+    "watchdog.install_notice_on": {
+        "ru": "ВНИМАНИЕ (надзор за программой).\n"
+              "  Программа создала задачу в Планировщике заданий и включила её.\n"
+              "  Она поднимает программу при входе в систему и раз в 5 минут, если та не работает.\n"
+              "  Выключить: --watchdog off (или значок в трее -> Надзор). Тогда после падения "
+              "программу придётся запускать вручную.",
+        "en": "IMPORTANT (program supervision).\n"
+              "  A Task Scheduler task was created and enabled.\n"
+              "  It brings the program up at logon and every 5 minutes if it is not running.\n"
+              "  To turn it off: --watchdog off (or the tray icon -> Supervision). After that "
+              "you will have to start the program by hand if it stops."},
+    "watchdog.install_notice_off": {
+        "ru": "ВНИМАНИЕ (надзор за программой ВЫКЛЮЧЕН).\n"
+              "  Задача в Планировщике заданий не создана.\n"
+              "  Программа НЕ поднимется сама после падения или закрытия — запускайте вручную.\n"
+              "  Включить: --watchdog on (или значок в трее -> Надзор).",
+        "en": "IMPORTANT (program supervision is OFF).\n"
+              "  No Task Scheduler task was created.\n"
+              "  The program will NOT bring itself back after a crash or close — start it "
+              "by hand.\n"
+              "  To turn it on: --watchdog on (or the tray icon -> Supervision)."},
+    "watchdog.uninstall_notice": {"ru": "Надзор снят: задача Планировщика удалена. Программа "
+                                       "больше не поднимается автоматически.",
+                                  "en": "Supervision removed: the scheduler task is deleted. The "
+                                        "program will no longer bring itself back."},
+    "watchdog.uninstall_failed": {"ru": "Не удалось удалить задачу надзора: {err} — удалите её "
+                                       "вручную в Планировщике заданий.",
+                                  "en": "Could not delete the supervision task: {err} — remove "
+                                        "it by hand in Task Scheduler."},
+    "tray.menu.watchdog_section": {"ru": "Надзор", "en": "Supervision"},
+    "tray.menu.watchdog": {"ru": "Поднимать программу автоматически",
+                           "en": "Bring the program up automatically"},
+    "tray.menu.notify": {"ru": "Уведомления", "en": "Notifications"},
+    "tray.menu.open_status": {"ru": "Открыть статус", "en": "Open status"},
+    "tray.menu.theme": {"ru": "Тема оформления", "en": "Colour theme"},
+    "theme.light": {"ru": "светлая", "en": "light"},
+    "theme.dark": {"ru": "тёмная", "en": "dark"},
+    "theme.auto": {"ru": "как в системе", "en": "follow system"},
+    "theme.msg.light": {"ru": "Тема: светлая", "en": "Theme: light"},
+    "theme.msg.dark": {"ru": "Тема: тёмная", "en": "Theme: dark"},
+    "theme.msg.auto": {"ru": "Тема: как в системе", "en": "Theme: follow system"},
+    "notify.section": {"ru": "Уведомления", "en": "Notifications"},
+    "ui.notify_test": {"ru": "Проверить уведомление", "en": "Test notification"},
+    "ui.about": {"ru": "Сведения", "en": "About"},
+    "ui.about.body": {"ru": "Помощник интерфейса (Qt). pid {pid}. Состояние: {state}",
+                      "en": "Interface helper (Qt). pid {pid}. Status: {state}"},
+    "ui.exit": {"ru": "Выход (остановить программу)", "en": "Quit (stop the program)"},
+    "ui.cmd_done": {"ru": "Готово", "en": "Done"},
+    "ui.cmd_failed": {"ru": "Не удалось", "en": "Failed"},
+    "ui.status.absent": {"ru": "помощник интерфейса не установлен (работает встроенный значок)",
+                         "en": "interface helper not installed (built-in icon is used)"},
+    "ui.status.running": {"ru": "помощник интерфейса работает (pid {pid})",
+                          "en": "interface helper is running (pid {pid})"},
+    "ui.status.stopped": {"ru": "помощник интерфейса установлен, но не запущен",
+                          "en": "interface helper installed but not running"},
+    "ui.status.off": {"ru": "помощник интерфейса выключен настройкой (ui.helper=off)",
+                      "en": "interface helper disabled by setting (ui.helper=off)"},
+    "ui.helper": {"ru": "Помощник интерфейса (Qt): значок, меню, уведомления",
+                  "en": "Interface helper (Qt): icon, menu, notifications"},
+    "ui.helper_enabled": {"ru": "Помощник интерфейса включён.", "en": "Interface helper on."},
+    "ui.helper_disabled": {"ru": "Помощник интерфейса выключен.", "en": "Interface helper off."},
+    "tray.msg.exit_sent": {"ru": "Команда на остановку отправлена.", "en": "Stop command sent."},
+    "notify.msg.on": {"ru": "Уведомления включены.", "en": "Notifications on."},
+    "notify.msg.off": {"ru": "Уведомления выключены.", "en": "Notifications off."},
+    "notify.lost.title": {"ru": "Связь пропала", "en": "Connection lost"},
+    "notify.lost.body": {"ru": "Восстанавливаю соединение…", "en": "Restoring the connection…"},
+    "notify.restored.title": {"ru": "Связь восстановлена", "en": "Connection restored"},
+    "notify.restored.body": {"ru": "Прокси снова работает.", "en": "The proxy is working again."},
+    "notify.switched.title": {"ru": "Сменил сервер", "en": "Switched server"},
+    "notify.switched.body": {"ru": "Связь не прерывалась.", "en": "The connection was not interrupted."},
+    "notify.off.title": {"ru": "Прокси выключен", "en": "Proxy disabled"},
+    "notify.off.body": {"ru": "Выключено вручную — автозапуск не мешает.",
+                        "en": "Disabled by hand — auto-start will not interfere."},
+    "notify.on.title": {"ru": "Прокси включён", "en": "Proxy enabled"},
+    "notify.on.body": {"ru": "Снова работаю автоматически.", "en": "Running automatically again."},
+    "notify.error.title": {"ru": "Ошибка", "en": "Error"},
+    "notify.error.body": {"ru": "Не удалось восстановить связь автоматически.",
+                          "en": "Could not restore the connection automatically."},
+    "tray.msg.watchdog_on": {"ru": "Надзор включён — программа поднимется сама.",
+                             "en": "Supervision on — the program will bring itself back."},
+    "tray.msg.watchdog_off": {"ru": "Надзор выключен — после падения запускайте программу вручную.",
+                              "en": "Supervision off — after a crash you must start it by hand."},
 }
 
 

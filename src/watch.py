@@ -50,8 +50,22 @@ def _acquire_singleton(cfg: dict) -> bool:
         return True
 
 
-def _tip(state: str, pool_n: int = 10) -> str:
-    return f"FOREST {state} | {pool_n} серверов | watch OK"[:63]
+def _tip(state: str, pool_n: int = 10, route: str = None) -> str:
+    """Подсказка значка. Состав — как в эталоне: состояние, серверы, маршрут.
+
+    Windows режет подсказку на 63 символах (ограничение системы), поэтому
+    строка обрезается — ровно как в прежней надстройке.
+    """
+    if route is None:
+        try:
+            import status_info as SI
+            route = SI.route_text(_TIP_CFG)
+        except Exception:
+            route = "РФ напрямую"
+    return f"FOREST {state} | {pool_n} серверов | {route} | watch OK"[:63]
+
+
+_TIP_CFG = {}
 
 
 def _tray_ok(cfg: dict, rtt=None) -> None:
@@ -112,6 +126,11 @@ def run_watch(cfg: dict, stop_event=None, full_cycle=None, once: bool = False,
 
     lg.info(f"Watch: сторож-балансировщик запущен (интервал {interval:.0f}s, "
             f"probe {probe_timeout:.0f}s, пул {bal_n} серверов)")
+    try:                          # подсказка значка строит маршрут из настроек
+        _TIP_CFG.clear()
+        _TIP_CFG.update(cfg)
+    except Exception:
+        pass
     try:
         CW.ensure_balancer(client, cfg, n=bal_n)
     except Exception as e:
@@ -126,8 +145,45 @@ def run_watch(cfg: dict, stop_event=None, full_cycle=None, once: bool = False,
     slow_hits = 0
     last_ok_mark = 0.0
     last_off_beat = 0.0
+    last_ui_check = 0.0
+
+    def _service_ui() -> None:
+        """Разбирает команды помощника интерфейса и держит его живым.
+
+        Команды (state/ui_cmd.json) выполняются ШТАТНЫМИ средствами — теми же,
+        что у встроенного меню трея, поэтому ядро по-прежнему один хозяин.
+        """
+        nonlocal last_ui_check
+        try:
+            import ui_cmd as UC
+            rec = UC.consume(cfg)
+            if rec:
+                ok, msg = UC.apply(cfg, rec)
+                lg.info(f"помощник интерфейса: команда «{rec.get('cmd')}» — "
+                        f"{'OK' if ok else 'ОШИБКА'} {msg}")
+                if rec.get("cmd") == "exit":
+                    if stop_event is not None:
+                        stop_event.set()
+                    return
+            if time.time() - last_ui_check > 30:
+                last_ui_check = time.time()
+                import ui_helper as UH
+                UH.ensure(cfg)
+        except Exception as e:
+            lg.warn(f"помощник интерфейса: {e}")
+
+    # помощник интерфейса поднимаем сразу: он должен работать, пока работает
+    # программа (отдельного «своего» автозапуска у него нет)
+    try:
+        import ui_helper as UH
+        UH.ensure(cfg)
+    except Exception as e:
+        lg.warn(f"помощник интерфейса: старт: {e}")
+    _service_ui()
+
     while not _stopped():
         try:
+            _service_ui()
             if CW.proxy_off(cfg):
                 if time.time() - last_off_beat > 15:
                     last_off_beat = time.time()

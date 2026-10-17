@@ -20,7 +20,7 @@ REPO_DIR="$(dirname "$PACKAGING_LINUX_DIR")"
 
 # ── версия и имена ──────────────────────────────────────────────────────────
 APP=forest-proxy-updater
-VERSION="${FOREST_PKG_VERSION:-1.1.0}"
+VERSION="${FOREST_PKG_VERSION:-1.2.0}"
 RELEASE="${FOREST_PKG_RELEASE:-1}"          # номер выпуска пакета (.rpm/.pkg)
 SUMMARY="Auto-updating proxy supervisor built on top of the Xray core"
 HOMEPAGE="https://github.com/FORESTmg/proxy-auto-updater"
@@ -37,6 +37,14 @@ LICDIR="$PREFIX/share/licenses/$APP"
 
 # ── входы сборки ────────────────────────────────────────────────────────────
 ELF="${FOREST_ELF:-$REPO_DIR/linux/dist/$APP}"
+# Помощник интерфейса (Qt) — отдельный артефакт; пакет собирается и без него.
+# Имя файла — ровно как его ищет основная программа (src/ui_helper.py,
+# helper_path(): рядом с самим ELF). Иначе значок в трее не подхватился бы.
+UI_NAME="forest-ui"
+UI_ELF="${FOREST_UI_ELF:-$REPO_DIR/linux/dist/$UI_NAME}"
+ICON_PNG="$PACKAGING_LINUX_DIR/icons/$APP.png"
+DESKTOP_SRC="$PACKAGING_LINUX_DIR/system/$APP.desktop"
+DESKTOP_UI_SRC="$PACKAGING_LINUX_DIR/system/$APP-ui.desktop"
 UNIT_SRC_DIR="$PACKAGING_LINUX_DIR/system"
 EXAMPLE_CONFIG="$REPO_DIR/config.example.json"
 LICENSE_FILE="$REPO_DIR/LICENSE"
@@ -58,6 +66,16 @@ require_tool() {   # require_tool <tool> [подсказка]
 }
 
 # ── проверки входов ─────────────────────────────────────────────────────────
+# Помощник интерфейса: упаковщики .rpm и Arch перечисляют файлы ПОИМЁННО, поэтому
+# там помощник обязателен (иначе rpmbuild/makepkg соберут неполный пакет).
+# В .deb раскладка копируется целиком, так что помощник попадает туда, если
+# собран; .tar.gz и AppImage — облегчённые портативные сборки, помощник к ним
+# прилагается отдельным файлом (см. packaging-linux/README.md).
+require_ui() {
+    [ -f "$UI_ELF" ] || die "нет собранного помощника: $UI_ELF
+  Соберите его: sh packaging/build-ui.sh"
+}
+
 check_inputs() {
     [ -f "$ELF" ] || die "нет собранного ELF: $ELF
   Соберите Linux-версию: sh packaging/build-linux.sh"
@@ -69,6 +87,8 @@ check_inputs() {
     [ -f "$REPO_DIR/docs/LINUX-INSTALL.ru.md" ] || die "нет docs/LINUX-INSTALL.ru.md"
     [ -f "$REPO_DIR/docs/TERMS.md" ]            || die "нет docs/TERMS.md"
     [ -f "$REPO_DIR/docs/TERMS.ru.md" ]         || die "нет docs/TERMS.ru.md"
+    [ -f "$DESKTOP_SRC" ] || die "нет $DESKTOP_SRC (ярлык помощника интерфейса)"
+    [ -f "$ICON_PNG" ]    || die "нет $ICON_PNG (значок для трея и уведомлений)"
     for u in "$APP.service" "$APP-refresh.service" "$APP.timer"; do
         [ -f "$UNIT_SRC_DIR/$u" ] || die "нет шаблона юнита: $UNIT_SRC_DIR/$u"
     done
@@ -87,13 +107,42 @@ stage_payload() {
     [ -n "$root" ] || die "stage_payload: не передан корень"
     rm -rf "$root"
     mkdir -p "$root$LIBDIR" "$root$PREFIX/bin" "$root$UNITDIR" "$root$CONFDIR" \
-             "$root$DOCDIR" "$root$LICDIR"
+             "$root$DOCDIR" "$root$LICDIR" \
+             "$root$PREFIX/share/applications" \
+             "$root$PREFIX/share/icons/hicolor/256x256/apps"
 
     # 1. сама программа (ядро xray и гео-базы уже внутри ELF)
     install -m 0755 "$ELF" "$root$LIBDIR/$APP"
 
+    # 1б. помощник интерфейса (Qt) — если собран. Он ОТДЕЛЬНЫЙ файл: значок в
+    #     трее, меню и уведомления; программа работает и без него.
+    if [ -f "$UI_ELF" ]; then
+        install -m 0755 "$UI_ELF" "$root$LIBDIR/$UI_NAME"
+        ln -sf "$LIBDIR/$UI_NAME" "$root$PREFIX/bin/$UI_NAME"
+        say "помощник интерфейса: $UI_ELF -> $LIBDIR/$UI_NAME"
+    else
+        warn "нет собранного помощника ($UI_ELF) — пакет будет без значка в трее.
+  Соберите его: sh packaging/build-ui.sh"
+    fi
+
     # 2. команда в PATH
     ln -sf "$LIBDIR/$APP" "$root$PREFIX/bin/$APP"
+
+    # 2б. значок и .desktop: значок нужен и для трея, и для уведомлений
+    if [ -f "$ICON_PNG" ]; then
+        install -m 0644 "$ICON_PNG" \
+            "$root$PREFIX/share/icons/hicolor/256x256/apps/$APP.png"
+    else
+        warn "нет $ICON_PNG — значок в меню и в уведомлениях не установится"
+    fi
+    sed -e "s|@EXEC@|$LIBDIR/$APP|g" -e "s|@APP@|$APP|g" \
+        "$DESKTOP_SRC" > "$root$PREFIX/share/applications/$APP.desktop"
+    chmod 0644 "$root$PREFIX/share/applications/$APP.desktop"
+    if [ -f "$DESKTOP_UI_SRC" ] && [ -f "$UI_ELF" ]; then
+        sed -e "s|@EXEC@|$LIBDIR/$UI_NAME|g" -e "s|@APP@|$APP|g" \
+            "$DESKTOP_UI_SRC" > "$root$PREFIX/share/applications/$APP-ui.desktop"
+        chmod 0644 "$root$PREFIX/share/applications/$APP-ui.desktop"
+    fi
 
     # 3. системные юниты (пути уже подставлены)
     render_units "$root$UNITDIR"

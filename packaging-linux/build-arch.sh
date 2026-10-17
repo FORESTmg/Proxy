@@ -20,6 +20,7 @@ ARCH_DIR="$PACKAGING_LINUX_DIR/arch"
 
 step "проверка входов"
 check_inputs
+require_ui
 require_tool makepkg "это сборка Arch: нужен пакет makepkg (base-devel)"
 require_tool fakeroot "Arch: pacman -S fakeroot"
 say "ELF:      $ELF ($(du -h "$ELF" | cut -f1))"
@@ -72,6 +73,14 @@ install -m 0644 "$STAGE$DOCDIR/TERMS.ru.md"          "$SRC/TERMS.ru.md"
 install -m 0644 "$STAGE$LICDIR/COPYING"              "$SRC/COPYING"
 install -m 0644 "$ARCH_DIR/PKGBUILD"                 "$SRC/PKGBUILD"
 install -m 0644 "$ARCH_DIR/forest-proxy-updater.install" "$SRC/forest-proxy-updater.install"
+# Помощник интерфейса, ярлыки и значок — «плоско», как и остальные входы.
+install -m 0755 "$STAGE$LIBDIR/$UI_NAME"                    "$SRC/forest-ui"
+install -m 0644 "$STAGE$PREFIX/share/applications/$APP.desktop" \
+                                                  "$SRC/forest-proxy-updater.desktop"
+install -m 0644 "$STAGE$PREFIX/share/applications/$APP-ui.desktop" \
+                                                  "$SRC/forest-proxy-updater-ui.desktop"
+install -m 0644 "$STAGE$PREFIX/share/icons/hicolor/256x256/apps/$APP.png" \
+                                                  "$SRC/forest-proxy-updater.png"
 # версия из окружения (если переопределена)
 sed -i "s|^pkgver=.*|pkgver=$VERSION|; s|^pkgrel=.*|pkgrel=$RELEASE|" "$SRC/PKGBUILD"
 say "PKGBUILD: $SRC/PKGBUILD (pkgver=$VERSION, pkgrel=$RELEASE)"

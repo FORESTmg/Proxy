@@ -59,14 +59,29 @@ if _missing:
 # (import watch внутри функции, import selftest, import tray, …).
 HIDDEN = [
     "clientwrite", "clientwrite_posix", "clientwrite_v2rayn",
-    "config", "i18n", "log", "netfilters", "parser", "selftest",
-    "sources", "tray", "tray_status", "v2ray_updater", "watch", "xraytest",
+    "config", "i18n", "log", "netfilters", "notify", "parser", "selftest",
+    "sources", "theme", "tray", "tray_check", "tray_icon", "tray_menu",
+    "tray_status", "v2ray_updater", "watch", "watchdog", "xraytest",
 ]
 
 # данные, которые должны лежать рядом с exe ВНУТРИ onefile-пакета
 DATAS = [(os.path.join(_VENDOR, f), "bin/xray")
          for f in ("xray.exe", "geoip.dat", "geosite.dat", "LICENSE")]
 DATAS.append((_EXAMPLE, "."))
+# Иконка пользователя: внутрь пакета, чтобы --install положил её рядом с
+# программой (её берут значок трея и ярлык) и чтобы работал откат, если файла
+# рядом не окажется.
+if os.path.isfile(_ICON):
+    DATAS.append((_ICON, "."))
+else:
+    raise SystemExit("Не хватает иконки: " + _ICON + " (положите свой app.ico)")
+
+# Отладочная сборка с консолью (FOREST_CONSOLE_BUILD=1): тогда ошибки
+# bootloader'а (например, неудалённый _MEI) печатаются в stderr, а НЕ показываются
+# модальным окном на рабочем столе. Нужна для безопасных проверок в песочнице;
+# штатная сборка (переменная не задана) остаётся оконной и без консоли.
+_CONSOLE_BUILD = os.environ.get("FOREST_CONSOLE_BUILD") == "1"
+_NAME = "ForestProxyUpdater" + ("-console" if _CONSOLE_BUILD else "")
 
 a = Analysis(
     [os.path.join(_SRC, "v2ray_updater.py")],
@@ -90,13 +105,13 @@ exe = EXE(
     a.binaries,
     a.datas,
     [],
-    name="ForestProxyUpdater",
+    name=_NAME,
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
     upx=False,
     runtime_tmpdir=None,
-    console=False,              # без консольного окна (pythonw-семантика)
+    console=_CONSOLE_BUILD,      # без консольного окна (pythonw-семантика)
     disable_windowed_traceback=False,
     argv_emulation=False,
     target_arch=None,

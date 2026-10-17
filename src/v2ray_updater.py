@@ -14,9 +14,11 @@
 
 Команды:
   --install     раскладка в %LOCALAPPDATA%\\ForestProxyUpdater, ярлык,
-                автозапуск, первый цикл
-  --uninstall   снять всё и вернуть системный прокси в исходное состояние
+                задача Планировщика заданий (автономный надзор), первый цикл
+  --uninstall   снять всё (задачу надзора, ярлык, файлы) и вернуть системный
+                прокси в исходное состояние
   --run         обычный запуск с треем (супервизор до остановки)
+  --ensure      поднять супервизор, если он не работает (для надзора); тихо
   --once        один полный цикл подбора серверов
   --guard       одна быстрая самопроверка/восстановление
   --status      показать текущее состояние
@@ -585,7 +587,13 @@ def run_supervisor(cfg: dict) -> int:
              см. linux/posix_platform.py::indicators_loop.
     """
     import watch
+    import watchdog as WD
     lg = log.get_logger()
+    # Защита от второго экземпляра: живой супервизор этой установки уже есть —
+    # второй не запускаем (иначе два ядра на одном порту разорвут связь).
+    if not WD.claim_supervisor(cfg):
+        lg.info("Супервизор этой установки уже запущен — второй не нужен")
+        return 0
     client = CFG.find_client(cfg)
     if not client.get("core"):
         lg.error("Ядро xray не найдено — положите xray рядом с программой "
@@ -648,8 +656,156 @@ def run_supervisor(cfg: dict) -> int:
             CW.stop_core(cfg, why="supervisor-stop")
         except Exception:
             pass
+        try:
+            WD.release_supervisor(cfg)
+        except Exception:
+            pass
         lg.info("Супервизор остановлен")
     return 0
+
+
+# ══════════════════════════════════════════ автономный надзор ═══
+def run_ensure(cfg: dict) -> int:
+    """``--ensure``: поднять супервизор, если его нет. Тихо, только в лог.
+
+    Windows — запуск ``--run`` отвязанно от вызывающего процесса.
+    Linux — поднять/включить службу systemd (у неё уже Restart=always + таймер).
+    """
+    if os.name != "nt":
+        pp = posix_platform()
+        if pp is not None and hasattr(pp, "ensure"):
+            rc = pp.ensure(cfg)
+            try:                      # на Linux помощник поднимаем так же тихо
+                import ui_helper as UH
+                UH.ensure(cfg)
+            except Exception:
+                pass
+            return rc
+        return 0
+    import watchdog
+    rc = watchdog.ensure(cfg)
+    try:
+        # Задача Планировщика зовёт именно --ensure: вместе с программой она
+        # поднимает и помощника интерфейса (если он установлен и не выключен).
+        import ui_helper as UH
+        UH.ensure(cfg)
+    except Exception:
+        pass
+    return rc
+
+
+def run_watchdog_command(cfg: dict, action: str) -> int:
+    """``--watchdog on|off|status``: включить/выключить надзор либо показать его.
+
+    on  — записать watchdog.enabled=true и создать задачу Планировщика;
+    off — записать watchdog.enabled=false и УДАЛИТЬ задачу;
+    status — честный отчёт: включена ли настройка, есть ли задача, когда она
+             последний раз запускалась, работает ли программа сейчас.
+    """
+    lg = log.get_logger()
+    if os.name != "nt":
+        # Linux: надзор — это systemd (Restart=always) + таймер; настройка в конфиге.
+        pp = posix_platform()
+        if action == "status":
+            st = {"enabled": bool((cfg.get("watchdog") or {}).get("enabled", True)),
+                  "service": (pp.service_state() if pp else "нет модуля"),
+                  "supervisor_pid": 0}
+            _print_watchdog_status_linux(cfg, st)
+            return 0
+        if not pp:
+            print("Надзор Linux доступен только на Linux (systemd).")
+            return 1
+        want = (action == "on")
+        _set_config_value(cfg, "watchdog", "enabled", want)
+        print(i18n.t("watchdog.linux_note"))
+        return 0
+
+    import watchdog
+    if action == "status":
+        rep = watchdog.watchdog_report(cfg)
+        _print_watchdog_status(cfg, rep)
+        return 0
+    want = (action == "on")
+    ok = _set_config_value(cfg, "watchdog", "enabled", want)
+    cfg.setdefault("watchdog", {})["enabled"] = want
+    if not ok:
+        lg.warn("watchdog: настройка не записана в config.json — применяю как есть")
+    res = watchdog.apply_watchdog(cfg)
+    if want:
+        print(i18n.t("watchdog.turned_on") if res["ok"] else
+              i18n.t("watchdog.turn_on_failed", err=res["detail"]))
+    else:
+        print(i18n.t("watchdog.turned_off") if res["ok"] else
+              i18n.t("watchdog.turn_off_failed", err=res["detail"]))
+    print(i18n.t("watchdog.off_warning") if not want else i18n.t("watchdog.on_note"))
+    return 0 if res["ok"] else 1
+
+
+def _set_config_value(cfg: dict, section: str, key: str, value) -> bool:
+    """Пишет cfg[section][key] в config.json атомарно. True при успехе."""
+    p = cfg.get("_config_path") or ""
+    data = {}
+    try:
+        if p and os.path.isfile(p):
+            with open(p, encoding="utf-8") as f:
+                data = json.load(f)
+    except Exception:
+        data = {}
+    if not isinstance(data, dict):
+        data = {}
+    node = data
+    if not isinstance(node.get(section), dict):
+        node[section] = {}
+    node[section][key] = value
+    try:
+        tmp = p + ".tmp"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, p)
+        return True
+    except Exception as e:
+        log.get_logger().warn(f"watchdog: запись config.json ({p}): {e}")
+        return False
+
+
+def _print_watchdog_status(cfg: dict, rep: dict) -> None:
+    st, task = rep["settings"], rep["task"]
+    print("=" * 60)
+    print(i18n.t("watchdog.status_title"))
+    print("=" * 60)
+    print(i18n.t("watchdog.setting") + ": " +
+          (i18n.t("watchdog.enabled") if st["enabled"] else i18n.t("watchdog.disabled")))
+    print(i18n.t("watchdog.interval") % st["interval_min"])
+    print(i18n.t("watchdog.task_name") + f": {st['task_name']}")
+    if task.get("exists"):
+        print(i18n.t("watchdog.task_present") + ": " + i18n.t("watchdog.yes") +
+              f"  [{task.get('state', '')}]")
+        print(i18n.t("watchdog.task_action") + f": {task.get('action', '')}")
+        print(i18n.t("watchdog.last_run") + f": {task.get('last_run', '') or '—'}")
+        print(i18n.t("watchdog.next_run") + f": {task.get('next_run', '') or '—'}")
+    else:
+        print(i18n.t("watchdog.task_present") + ": " + i18n.t("watchdog.no"))
+    running = (i18n.t("watchdog.program_running") if rep["supervisor_alive"]
+               else i18n.t("watchdog.program_stopped"))
+    extra = f" (pid {rep['supervisor_pid']})" if rep["supervisor_alive"] else ""
+    print(i18n.t("watchdog.program") + ": " + running + extra)
+    # Честный итог: включено и задача есть / включено, а задачи нет / выключено.
+    if not st["enabled"]:
+        print(i18n.t("watchdog.off_warning"))
+    elif not task.get("exists"):
+        print(i18n.t("watchdog.task_missing_warn"))
+    else:
+        print(i18n.t("watchdog.on_note"))
+
+
+def _print_watchdog_status_linux(cfg: dict, st: dict) -> None:
+    print("=" * 60)
+    print(i18n.t("watchdog.status_title"))
+    print("=" * 60)
+    print(i18n.t("watchdog.setting") + ": " +
+          (i18n.t("watchdog.enabled") if st["enabled"] else i18n.t("watchdog.disabled")))
+    print(i18n.t("watchdog.service") + f": {st.get('service', '')}")
+    print(i18n.t("watchdog.linux_note"))
 
 
 # ══════════════════════════════════════════ установка / удаление ═══
@@ -757,14 +913,17 @@ def prepare_install_launch(cfg: dict) -> tuple:
     return _pythonw(), f'"{entry}" --run', "src"
 
 
-def _create_shortcut(target: str, args: str, workdir: str, lnk_path: str) -> bool:
+def _create_shortcut(target: str, args: str, workdir: str, lnk_path: str,
+                     icon: str = "") -> bool:
     os.makedirs(os.path.dirname(lnk_path), exist_ok=True)
+    icon_ps = f"$s.IconLocation = '{icon},0'; " if icon else ""
     ps = (
         "$w = New-Object -ComObject WScript.Shell; "
         f"$s = $w.CreateShortcut('{lnk_path}'); "
         f"$s.TargetPath = '{target}'; "
         f"$s.Arguments = '{args}'; "
         f"$s.WorkingDirectory = '{workdir}'; "
+        f"{icon_ps}"
         "$s.Description = \"FOREST's Proxy Auto-updater\"; "
         "$s.Save()"
     )
@@ -922,29 +1081,104 @@ def install(cfg: dict) -> int:
             except Exception as e:
                 lg.warn(f"  конфиг не создан: {e}")
 
-    # 3. ярлык + автозапуск (ровно: "<установленный exe>" --run)
-    lnk = os.path.join(_shortcut_dir(), f"{APP_RUN_VALUE}.lnk")
-    ok_lnk = _create_shortcut(target, args, root, lnk)
-    cmd = f'"{target}" {args}'.strip()
-    ok_auto = _set_autostart(cmd)
-    lg.info(f"  цель запуска: \"{target}\" {args}   (режим: {mode})")
-    lg.info(f"  ярлык: {'создан' if ok_lnk else 'НЕ создан'} ({lnk})")
-    lg.info(f"  автозапуск (HKCU\\{_run_key_path()}\\{_run_value_name()}): "
-            f"{'включён' if ok_auto else 'НЕ включён'} = {cmd}")
+    # 3. ярлык (ручной запуск) + автономный надзор через Планировщик заданий
+    #    Иконка: источник истины — packaging/app.ico (рисунок пользователя).
+    #    Кладём её рядом с программой: её же берёт значок трея и ярлык.
+    icon_dst = os.path.join(root, "app.ico")
+    if os.path.isfile(icon_dst):
+        lg.info(f"  иконка уже на месте: {icon_dst}")
+    else:
+        cands = []
+        try:
+            mp = getattr(sys, "_MEIPASS", "") or ""
+            if mp:
+                cands.append(os.path.join(mp, "app.ico"))
+            cands.append(os.path.join(
+                os.path.dirname(os.path.abspath(sys.executable)), "app.ico"))
+            cands.append(os.path.join(CFG.PROJECT_DIR, "app.ico"))
+            cands.append(os.path.join(CFG.BASE_DIR, "app.ico"))
+        except Exception:
+            pass
+        for c in cands:
+            try:
+                if c and os.path.isfile(c) and os.path.abspath(c) != os.path.abspath(icon_dst):
+                    shutil.copy2(c, icon_dst)
+                    lg.info(f"  иконка скопирована рядом с программой: {icon_dst} "
+                            f"({os.path.getsize(icon_dst)} байт) из {c}")
+                    break
+            except Exception as e:
+                lg.warn(f"  иконка {c}: {e}")
+        if not os.path.isfile(icon_dst):
+            lg.warn("  app.ico не найден в комплекте — ярлык получит значок .exe")
 
-    # 3б. проверка по факту: что реально лежит в ярлыке и в реестре
+    lnk = os.path.join(_shortcut_dir(), f"{APP_RUN_VALUE}.lnk")
+    icon_for_lnk = icon_dst if os.path.isfile(icon_dst) else target
+    ok_lnk = _create_shortcut(target, args, root, lnk, icon=icon_for_lnk)
+    lg.info(f"  цель запуска: \"{target}\" {args}   (режим: {mode})")
+    lg.info(f"  ярлык: {'создан' if ok_lnk else 'НЕ создан'} ({lnk}); "
+            f"иконка ярлыка: {icon_for_lnk}")
+
+    # 3б. старый автозапуск из реестра снимаем: механизм ровно ОДИН — задача
+    #     Планировщика заданий (иначе два механизма поднимали бы по экземпляру).
+    if _read_autostart():
+        _remove_autostart()
+        lg.info("  старая запись автозапуска в реестре снята "
+                "(теперь механизм один — задача Планировщика)")
+
+    # 3в. надзор по настройке watchdog: enabled -> создать задачу, иначе удалить
+    import watchdog
+    wd = watchdog.apply_watchdog(cfg)
+    lg.info(f"  надзор (watchdog): {wd['action']} — {wd['detail']}")
+
+    # 3г. помощник интерфейса (Qt: значок, меню, уведомления) — если есть в
+    #     комплекте. Он ОТДЕЛЬНАЯ программа: кладём рядом с программой, чтобы
+    #     её нашли и --ensure (задача Планировщика), и сам супервизор.
+    try:
+        import ui_helper as UH
+        name = UH.helper_name()
+        if UH.helper_path(cfg):
+            lg.info(f"  помощник интерфейса уже на месте: {UH.helper_path(cfg)}")
+        else:
+            cands = []
+            mp = getattr(sys, "_MEIPASS", "") or ""
+            if mp:
+                cands.append(os.path.join(mp, name))
+            exe_dir = os.path.dirname(os.path.abspath(sys.executable))
+            cands.append(os.path.join(exe_dir, name))
+            cands.append(os.path.join(CFG.PROJECT_DIR, "packaging", "dist", name))
+            cands.append(os.path.join(CFG.PROJECT_DIR, "linux", "dist", name))
+            for c in cands:
+                try:
+                    if c and os.path.isfile(c):
+                        dst = os.path.join(root, name)
+                        if os.path.abspath(c) != os.path.abspath(dst):
+                            shutil.copy2(c, dst)
+                        lg.info(f"  помощник интерфейса установлен: {dst} "
+                                f"({os.path.getsize(dst)} байт)")
+                        break
+                except Exception as e:
+                    lg.warn(f"  помощник интерфейса {c}: {e}")
+        if UH.enabled(cfg):
+            UH.ensure(cfg)
+            lg.info(f"  помощник интерфейса: {UH.status_text(cfg)}")
+        else:
+            lg.info("  помощник интерфейса выключен настройкой ui.helper=off "
+                    "или файла нет — интерфейс даёт встроенный значок")
+    except Exception as e:
+        lg.warn(f"  помощник интерфейса: {e}")
+
+    # 3г. проверка по факту: что реально лежит в ярлыке и в реестре
     lt, la, _lw = _read_shortcut(lnk)
     if ok_lnk:
         if lt == target and la.strip() == args.strip():
             lg.info(f"  проверка ярлыка: OK (\"{lt}\" {la})")
         else:
             lg.warn(f"  проверка ярлыка: расхождение — в ярлыке \"{lt}\" {la}")
-    got = _read_autostart()
-    if ok_auto:
-        if got == cmd:
-            lg.info(f"  проверка автозапуска: OK ({got})")
-        else:
-            lg.warn(f"  проверка автозапуска: расхождение — в реестре «{got}»")
+    left = _read_autostart()
+    if not left:
+        lg.info("  проверка автозапуска: в реестре записи нет (OK — механизм один)")
+    else:
+        lg.warn(f"  проверка автозапуска: в реестре ОСТАЛОСЬ «{left}»")
 
     # 4. первый цикл (системный прокси на этом шаге НЕ трогается)
     if not os.environ.get("FOREST_SKIP_FIRST_CYCLE"):
@@ -963,6 +1197,12 @@ def install(cfg: dict) -> int:
             lg.warn(f"  первый цикл: {e}")
     print(i18n.t("install.done"))
     print(i18n.t("install.proxy_note"))
+    # Понятное предупреждение про надзор — пользователь обязан знать (без англицизмов).
+    if wd.get("ok") and wd.get("action") in ("created", "unchanged") and \
+            watchdog.settings(cfg)["enabled"]:
+        print(i18n.t("watchdog.install_notice_on"))
+    else:
+        print(i18n.t("watchdog.install_notice_off"))
     return 0
 
 
@@ -970,6 +1210,13 @@ def uninstall(cfg: dict) -> int:
     lg = log.get_logger()
     root = cfg["paths"]["root"]
     lg.info(f"Удаление из {root}")
+    # 0. остановить помощник интерфейса (он отдельный процесс и держал бы файлы)
+    try:
+        import ui_helper as UH
+        stopped = UH.stop(cfg)
+        lg.info(f"  помощник интерфейса: {'остановлен' if stopped else 'НЕ остановлен'}")
+    except Exception as e:
+        lg.warn(f"  помощник интерфейса: {e}")
     # 1. остановить наше ядро (только наше)
     try:
         CW.stop_core(cfg, why="uninstall")
@@ -980,7 +1227,13 @@ def uninstall(cfg: dict) -> int:
         CW.restore_system_proxy(cfg)
     except Exception as e:
         lg.warn(f"  восстановление прокси: {e}")
-    # 3. снять автозапуск и ярлык
+    # 3. снять надзор (задачу Планировщика), автозапуск и ярлык
+    import watchdog
+    ok_t, detail_t = watchdog.delete_task(cfg=cfg)
+    lg.info(f"  надзор (задача Планировщика): "
+            f"{'снят' if ok_t else 'ОШИБКА'} — {detail_t}")
+    print(i18n.t("watchdog.uninstall_notice") if ok_t
+          else i18n.t("watchdog.uninstall_failed", err=detail_t))
     _remove_autostart()
     left = _read_autostart()
     lg.info(f"  автозапуск (HKCU\\{_run_key_path()}\\{_run_value_name()}): "
@@ -1037,6 +1290,50 @@ def uninstall(cfg: dict) -> int:
 
 # ══════════════════════════════════════════ статус ═══
 def show_status(cfg: dict) -> int:
+    """``--status``: печатает отчёт И кладёт его файлом в каталог состояния.
+
+    Файл нужен по двум причинам: у оконной сборки нет консоли (``sys.stdout``
+    равен None и print() уходит в никуда), а в прежней надстройке пункт меню
+    «Открыть статус» открывал именно файл отчёта — состав данных тот же.
+    """
+    import contextlib
+    import io
+
+    buf = io.StringIO()
+    real = sys.stdout            # ДО подмены: иначе Tee пишет сам в себя
+
+    class _Tee:
+        def write(self, s):
+            buf.write(s)
+            try:
+                if real is not None and real is not self:
+                    real.write(s)
+            except Exception:
+                pass
+            return len(s)
+
+        def flush(self):
+            try:
+                if real is not None:
+                    real.flush()
+            except Exception:
+                pass
+
+    with contextlib.redirect_stdout(_Tee()):
+        rc = _show_status(cfg)
+    try:
+        d = (cfg.get("paths") or {}).get("state_dir") or ""
+        if d:
+            os.makedirs(d, exist_ok=True)
+            with open(os.path.join(d, "status.txt"), "w",
+                      encoding="utf-8") as f:
+                f.write(buf.getvalue())
+    except Exception:
+        pass
+    return rc
+
+
+def _show_status(cfg: dict) -> int:
     client = CFG.find_client(cfg)
     st = CW.StateStore(cfg)
     pool_n = int(st.data.get("balancer_n", 0) or 0)
@@ -1065,6 +1362,26 @@ def show_status(cfg: dict) -> int:
         print(f"{i18n.t('status.link')}: {link}")
     print(f"config: {cfg.get('_config_path')}")
     print(f"root:   {cfg['paths']['root']}")
+    try:                      # помощник интерфейса: есть ли, работает ли
+        import ui_helper as UH
+        print(f"{i18n.t('ui.helper')}: {UH.status_text(cfg)}")
+    except Exception as e:
+        print(f"{i18n.t('ui.helper')}: {i18n.t('error.generic', err=e)}")
+    if os.name == "nt":
+        # Честная строка про надзор: включён ли, есть ли задача, работает ли программа.
+        try:
+            import watchdog
+            rep = watchdog.watchdog_report(cfg)
+            st, task = rep["settings"], rep["task"]
+            print(i18n.t("watchdog.status_line") + ": " +
+                  ((i18n.t("watchdog.enabled") + f", {i18n.t('watchdog.task_word')}: " +
+                    (i18n.t("watchdog.yes") if task.get("exists") else i18n.t("watchdog.no")))
+                   if st["enabled"] else i18n.t("watchdog.disabled")))
+            print("  " + i18n.t("watchdog.program") + ": " +
+                  (i18n.t("watchdog.program_running") if rep["supervisor_alive"]
+                   else i18n.t("watchdog.program_stopped")))
+        except Exception as e:
+            print(f"{i18n.t('watchdog.status_line')}: {i18n.t('error.generic', err=e)}")
     if os.name != "nt":
         # Linux: вместо трея — состояние systemd-юнита и файл индикации
         pp = posix_platform()
@@ -1143,6 +1460,10 @@ def main(argv=None) -> int:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 
+    # Уходим из каталога распаковки onefile ДО запуска любых дочерних процессов
+    # (иначе уборщик PyInstaller не снесёт _MEI и покажет окно ошибки).
+    moved_cwd = CFG.ensure_safe_cwd()
+
     ap = argparse.ArgumentParser(
         description="FOREST's Proxy Auto-updater",
         epilog="Условия использования (terms of use): docs/TERMS.ru.md / "
@@ -1151,6 +1472,10 @@ def main(argv=None) -> int:
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--run", action="store_true", help="супервизор с треем")
+    ap.add_argument("--ensure", action="store_true",
+                    help="поднять супервизор, если он не работает (для надзора)")
+    ap.add_argument("--watchdog", choices=["on", "off", "status"], default=None,
+                    help="автономный надзор: on | off | status")
     ap.add_argument("--once", action="store_true", help="один полный цикл")
     ap.add_argument("--guard", action="store_true", help="одна самопроверка")
     ap.add_argument("--status", action="store_true")
@@ -1172,6 +1497,9 @@ def main(argv=None) -> int:
     lg = log.get_logger()
     lg.info("Запуск FOREST's Proxy Auto-updater (аргументы: %s)"
             % " ".join(a for a in (argv if argv is not None else sys.argv[1:])))
+    lg.info("cwd=%s | _MEIPASS=%s | уход из распаковки: %s"
+            % (os.getcwd(), getattr(sys, "_MEIPASS", "") or "—",
+               moved_cwd or "не требовался"))
     # Ядро и гео-базы работают из ПОСТОЯННОГО каталога (копия из бандла при
     # первом запуске: config.ensure_core_installed — зовётся из find_core).
     # Свои прошлые каталоги распаковки _MEI* убираем в фоне: иначе они копятся
@@ -1191,6 +1519,10 @@ def main(argv=None) -> int:
         if pp is not None:
             return pp.uninstall(cfg)
         return uninstall(cfg)
+    if args.watchdog:
+        return run_watchdog_command(cfg, args.watchdog)
+    if args.ensure:
+        return run_ensure(cfg)
     if args.status:
         return show_status(cfg)
     if args.guard:

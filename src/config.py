@@ -115,6 +115,46 @@ def example_config_path():
     return None
 
 
+def ensure_safe_cwd() -> str:
+    """Уводит рабочий каталог (CWD) из каталога распаковки onefile ``_MEI*``.
+
+    Зачем: PyInstaller-onefile распаковывает содержимое во временный каталог
+    ``_MEIxxxx``. Если CWD процесса (или унаследованный CWD дочернего процесса)
+    окажется внутри него, уборщик bootloader'а не сможет снести каталог — и
+    пользователю покажется модальное окно «Failed to remove temporary
+    directory». Уходить надо ДО запуска любых дочерних процессов.
+
+    Переходим в НАДЁЖНОЕ уже существующее место — каталог самого .exe (или
+    системный temp). Ничего не создаём: у автотеста не должно быть побочных
+    эффектов. Возвращает новый CWD ('' — не потребовалось/не удалось).
+    """
+    try:
+        meipass = str(getattr(sys, "_MEIPASS", "") or "")
+        if not meipass:
+            return ""
+        cur = os.path.normcase(os.path.abspath(os.getcwd()))
+        mp = os.path.normcase(os.path.abspath(meipass))
+        if cur != mp and not cur.startswith(mp + os.sep):
+            return ""
+        cands = []
+        try:
+            if getattr(sys, "frozen", False) and sys.executable:
+                cands.append(os.path.dirname(os.path.abspath(sys.executable)))
+        except Exception:
+            pass
+        cands.append(tempfile.gettempdir())
+        for t in cands:
+            try:
+                if t and os.path.isdir(t):
+                    os.chdir(t)
+                    return t
+            except Exception:
+                continue
+    except Exception:
+        pass
+    return ""
+
+
 def config_path() -> str:
     """Путь к рабочему config.json (существующий — иначе цель для создания)."""
     p = os.environ.get("FOREST_CONFIG")
@@ -134,7 +174,17 @@ def config_path() -> str:
 # без шлюза Cloudflare, кап подсети 1, минимум скорости 1000 КБ/с,
 # «РФ напрямую» ВЫКЛЮЧЕНО (чтобы не ломать чужую маршрутизацию).
 DEFAULTS = {
-    "ui": {"lang": ""},
+    "ui": {"lang": "", "tray_state_mark": True, "theme": "auto",
+           "helper": "auto", "helper_exe": ""},
+    "notify": {
+        "enabled": True,
+        "duration_ms": 5000,
+        "fps": 60,
+        "corner": "bottom-right",
+        "on_server_switch": True,
+        "show_on_manual_off": True,
+        "width": 360,
+    },
     "client": {
         "mode": "standalone",
         "socks_port": DEFAULT_SOCKS_PORT,
@@ -170,6 +220,12 @@ DEFAULTS = {
     },
     "diversity": {"per_subnet_cap": 1, "min_pool_after_cap": 12, "max_cap_relax": 4},
     "blacklist": {"cloudflare_nodes": True},
+    # ── автономный надзор (задача Планировщика заданий) ──
+    # enabled: поднимать программу автоматически (задача --ensure при входе и
+    #          каждые interval_min минут). ВЫКЛЮЧЕНО = программа сама не
+    #          перезапустится после падения/закрытия.
+    "watchdog": {"enabled": True, "interval_min": 5,
+                 "task_name": "ForestProxyUpdater-Watchdog"},
 }
 
 

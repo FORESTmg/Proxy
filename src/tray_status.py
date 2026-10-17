@@ -157,7 +157,12 @@ def step_proc(cfg: dict, proc: dict, index: int = None, phase: str = None,
 
 
 def finish_proc(cfg: dict, proc: dict, state: str, tip: str = None) -> None:
-    """Завершает процесс: помечает финал и убирает окно (трей покажет итог)."""
+    """Завершает процесс: помечает финал и убирает окно (трей покажет итог).
+
+    Дополнительно записываем ВРЕМЯ ВОССТАНОВЛЕНИЯ СВЯЗИ (``last_restore_s`` /
+    ``last_restore_ts``): эталон показывал его в окне индикации, и оно должно
+    остаться доступным в подсказке/меню и после того, как окно закрылось.
+    """
     if proc:
         proc = dict(proc)
         proc["final"] = True
@@ -167,7 +172,12 @@ def finish_proc(cfg: dict, proc: dict, state: str, tip: str = None) -> None:
             s["done"] = True
         proc["phase"] = "Готово"
         proc["fin"] = time.time()
-    write_status(cfg, state=state, proc=proc, tip=tip)
+    extra = {}
+    if proc and str(state) == "ok":
+        extra = {"last_restore_s": round(float(proc.get("elapsed") or 0.0), 2),
+                 "last_restore_ts": time.time(),
+                 "last_restore_kind": proc.get("kind")}
+    write_status(cfg, state=state, proc=proc, tip=tip, **extra)
 
 def fail_proc(cfg: dict, proc: dict, state: str, tip: str = None,
               reason: str = "") -> None:

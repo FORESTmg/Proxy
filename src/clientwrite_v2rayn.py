@@ -567,7 +567,12 @@ def gui_restart_ui(client: dict, cfg: dict, server=None, active_id=None,
 # CATEGORY-BANK-RU, PRIVATE и т.д.
 RU_DIRECT_DOMAINS = ["geosite:category-ru", "geosite:tld-ru",
                      "geosite:category-gov-ru", "geosite:category-bank-ru",
-                     "geosite:category-medicine-ru", "geosite:private"]
+                     # ВНИМАНИЕ: только категории, реально присутствующие во вшитом
+                     # geosite.dat. category-medicine-ru в нём ОТСУТСТВУЕТ, и одна
+                     # такая категория валит ВЕСЬ конфиг ядра («failed to parse
+                     # domain») — пул не применяется вообще. Проверять новые
+                     # категории через `xray run -test`.
+                     "geosite:private"]
 RU_DIRECT_IPS = ["geoip:ru", "geoip:private"]
 
 # Локальные имена: ретрекер провайдера и mDNS-имена. Доступны ТОЛЬКО напрямую
@@ -617,6 +622,27 @@ def _asset_dir(core: str, cfg: dict = None) -> str:
                     pass
             return d
     return os.path.dirname(core) if core else ""
+
+
+def ru_direct_enabled(cfg: dict, core: str = "") -> bool:
+    """Нужна ли маршрутизация «РФ → напрямую» (только при наличии гео-баз).
+
+    Один источник истины — ``watch.ru_direct`` в конфиге. Раньше сборка конфига
+    вызывалась без этого признака, и он по умолчанию был True: в режиме v2rayN
+    «РФ → напрямую» работал ВСЕГДА, независимо от настройки.
+    """
+    want = bool((cfg or {}).get("watch", {}).get("ru_direct", False))
+    if not want:
+        return False
+    try:
+        core = core or (cfg.get("client", {}) or {}).get("core") or ""
+    except Exception:
+        core = ""
+    if core and _asset_dir(core, cfg):
+        return True
+    log.get_logger().warn("ru_direct включён, но geosite.dat/geoip.dat не найдены — "
+                          "правила РФ→direct отключены (весь трафик через прокси)")
+    return False
 
 
 
@@ -1218,7 +1244,8 @@ def start_balancer(client: dict, servers: list, cfg: dict, port: int = None,
     if not core or not os.path.isfile(core):
         lg.error("start_balancer: ядро не найдено")
         return False
-    conf = build_balancer_config(servers, port, listen=listen)
+    conf = build_balancer_config(servers, port, listen=listen,
+                                 ru_direct=ru_direct_enabled(cfg, core))
     if conf is None:
         lg.error("start_balancer: нет валидных outbound")
         return False
@@ -1246,7 +1273,8 @@ def start_balancer(client: dict, servers: list, cfg: dict, port: int = None,
             lg.warn(f"start_balancer: из пула исключены {len(servers) - len(keep)} сервер(ов) "
                     f"с удалёнными полями {sorted(fields)}")
             servers = keep
-            conf = build_balancer_config(servers, port, listen=listen)
+            conf = build_balancer_config(servers, port, listen=listen,
+                                         ru_direct=ru_direct_enabled(cfg, core))
             if conf is None:
                 break
             ok_v, err_v = _validate_config(core, conf, cfg)
@@ -1625,6 +1653,12 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10, force: bool = False,
     pid_file = os.path.join(cfg["paths"]["state_dir"], "balancer.pid")
     st = StateStore(cfg)
     sig = _pool_sig(pool)
+    # Признак «РФ → напрямую» влияет на конфиг ядра, поэтому смена настройки
+    # обязана применяться НЕМЕДЛЕННО, а не после смены состава пула.
+    want_ru = ru_direct_enabled(cfg, (client or {}).get("core"))
+    # Ключа ещё нет (обновление со старой версии) -> считаем настройку
+    # изменившейся один раз, чтобы применить её сразу.
+    ru_changed = bool(st.data.get("balancer_ru", not want_ru)) != bool(want_ru)
     cur = _port_pid(port)
     ours = None
     try:
@@ -1646,10 +1680,14 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10, force: bool = False,
     if same_owner and not force:
         age = time.time() - float(st.data.get("balancer_ts", 0) or 0)
         max_age = float(cfg.get("watch", {}).get("balancer_max_age_s", 3600))
-        if age < max_age and _link_ok(cfg, port):
+        if age < max_age and _link_ok(cfg, port) and not ru_changed:
             # состав мог измениться, но ядро работает и молодо: НЕ трогаем —
-            # каждый перезапуск = короткий разрыв связи
+            # каждый перезапуск = короткий разрыв связи. Смена НАСТРОЙКИ
+            # маршрутизации сюда не попадает: она применяется сразу.
             return True
+        if ru_changed:
+            lg.info("ensure_balancer: изменилась настройка РФ→напрямую — "
+                    "перегенерирую конфиг ядра")
         if st.data.get("balancer_sig") != sig:
             lg.info("ensure_balancer: состав пула изменился — обновляю балансировщик")
     # ЗАМОРОЗКА ПУЛА: пока ядро живо и связь есть — состав не перетасовываем.
@@ -1658,13 +1696,14 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10, force: bool = False,
     freeze_s = float(cfg.get("watch", {}).get("pool_freeze_s", 10800))
     age_now = time.time() - float(st.data.get("balancer_ts", 0) or 0)
     if same_owner and st.data.get("balancer_sig") and age_now < freeze_s \
-            and _link_ok(cfg, port):
+            and _link_ok(cfg, port) and not ru_changed:
         if st.data.get("balancer_sig") != sig:
             lg.info("ensure_balancer: состав пула изменился, но ядро работает — "
                     f"пул заморожен ещё на {int((freeze_s - age_now) / 60)} мин")
         return True
     if same_owner and force:
-        if st.data.get("balancer_sig") == sig and _link_ok(cfg, port):
+        if st.data.get("balancer_sig") == sig and _link_ok(cfg, port) \
+                and not ru_changed:
             return True
     elif cur and not same_owner:
         lg.warn(f"ensure_balancer: порт {port} занят чужим ядром ({cur}) — снимаю")
@@ -1682,6 +1721,7 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10, force: bool = False,
         try:
             st.data["balancer_sig"] = sig
             st.data["balancer_n"] = len(pool)
+            st.data["balancer_ru"] = bool(want_ru)
             st.data["balancer_ts"] = time.time()
             st.data["emergency_ts"] = 0        # нормальный пул — аварийный режим снят
             st.save()

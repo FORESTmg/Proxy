@@ -204,6 +204,24 @@ def main() -> int:
               any(r.get("outboundTag") == "direct" and r.get("domain") for r in rrules))
         check("при ru_direct есть правило direct по IP",
               any(r.get("outboundTag") == "direct" and r.get("ip") for r in rrules))
+        # Метки, которые обязаны присутствовать в РФ-правиле (и не должно быть
+        # категорий, отсутствующих во вшитом geosite.dat — иначе конфиг ядра
+        # отвергается целиком).
+        doms = [d for r in rrules if r.get("outboundTag") == "direct"
+                for d in (r.get("domain") or [])]
+        ips = [i for r in rrules if r.get("outboundTag") == "direct"
+               for i in (r.get("ip") or [])]
+        check("РФ-правило содержит geosite:category-ru и geosite:tld-ru",
+              "geosite:category-ru" in doms and "geosite:tld-ru" in doms, str(doms))
+        check("нет отсутствующих категорий (category-medicine-ru)",
+              not any("category-medicine-ru" in d for d in doms), str(doms))
+        check("РФ-правило содержит geoip:ru", "geoip:ru" in ips, str(ips))
+        check("смена ru_direct меняет ОТПЕЧАТОК конфига (корень дефекта)",
+              CW._conf_sha(ruconf) != CW._conf_sha(
+                  CW.build_balancer_config(client, pool,
+                                           ru_direct=False)))
+        check("отпечаток одного пула при этом НЕ меняется (поэтому его мало)",
+              CW._pool_sig(pool) == CW._pool_sig(list(pool)))
         check("порядок правил: local -> torrent -> RU",
               rrules[0].get("outboundTag") == "direct"
               and rrules[1].get("inboundTag") == ["torrent-in"])
@@ -457,6 +475,160 @@ def main() -> int:
     check("наша старая распаковка _MEI удалена", not os.path.isdir(ours), str(r))
     check("чужая распаковка _MEI не тронута", os.path.isdir(foreign), str(r))
     shutil.rmtree(mei_root, ignore_errors=True)
+    # CWD внутри _MEI недопустим: уборщик PyInstaller не снесёт каталог и
+    # покажет окно «Failed to remove temporary directory». ensure_safe_cwd()
+    # обязан увести процесс из распаковки ДО запуска дочерних процессов.
+    fake_mei = os.path.join(_TMP, "fake_mei_ctx")
+    os.makedirs(os.path.join(fake_mei, "sub"), exist_ok=True)
+    had_mp = hasattr(sys, "_MEIPASS")
+    old_mp = getattr(sys, "_MEIPASS", None)
+    old_cwd = os.getcwd()
+    sys._MEIPASS = fake_mei
+    try:
+        os.chdir(fake_mei)
+        moved = CFG.ensure_safe_cwd()
+        cur = os.path.normcase(os.path.abspath(os.getcwd()))
+        mpn = os.path.normcase(os.path.abspath(fake_mei))
+        still_inside = (cur == mpn or cur.startswith(mpn + os.sep))
+        check("ensure_safe_cwd уводит CWD из каталога распаковки",
+              bool(moved) and not still_inside, f"moved={moved!r} cwd={cur}")
+        check("ensure_safe_cwd не создаёт пользовательский каталог заново",
+              os.path.normcase(os.path.abspath(moved)) != os.path.normcase(
+                  os.path.abspath(CFG.data_root())) or os.path.isdir(CFG.data_root()))
+        check("ensure_safe_cwd при безопасном CWD ничего не делает",
+              CFG.ensure_safe_cwd() == "")
+    finally:
+        os.chdir(old_cwd)
+        if had_mp:
+            sys._MEIPASS = old_mp
+        else:
+            try:
+                delattr(sys, "_MEIPASS")
+            except AttributeError:
+                pass
+        shutil.rmtree(fake_mei, ignore_errors=True)
+    print()
+    print("=" * 64)
+    print("14. Автономный надзор: --ensure, защита от второго экземпляра, задача")
+    print("=" * 64)
+    import watchdog as WD
+    # 14.1 настройки (дефолты и переопределение); тест НЕ трогает систему
+    check("watchdog в дефолтах: enabled=True", cfg2["watchdog"]["enabled"] is True)
+    check("watchdog в дефолтах: interval_min=5",
+          int(cfg2["watchdog"]["interval_min"]) == 5)
+    check("watchdog в дефолтах: task_name",
+          cfg2["watchdog"]["task_name"] == "ForestProxyUpdater-Watchdog")
+    st0 = WD.settings({})
+    check("WD.settings(пусто): включено по умолчанию",
+          st0["enabled"] is True and st0["interval_min"] == 5)
+    st1 = WD.settings({"watchdog": {"enabled": False, "interval_min": 2,
+                                    "task_name": "X-Y"}})
+    check("WD.settings читает настройки из конфига",
+          st1["enabled"] is False and st1["interval_min"] == 2 and st1["task_name"] == "X-Y")
+    os.environ["FOREST_TASK_NAME"] = "ForestTest-Task"
+    check("имя задачи: env перекрывает конфиг",
+          WD.task_name({"watchdog": {"task_name": "X"}}) == "ForestTest-Task")
+    os.environ.pop("FOREST_TASK_NAME", None)
+    check("имя задачи берётся из конфига",
+          WD.task_name({"watchdog": {"task_name": "FromCfg"}}) == "FromCfg")
+    check("имя задачи по умолчанию", WD.task_name({}) == WD.TASK_NAME_DEFAULT)
+
+    # 14.2 XML задачи — чистая функция (систему не трогаем)
+    xml = WD.task_xml(r"C:\Apps\ForestProxyUpdater.exe",
+                      '--ensure --config "C:\\Apps\\config.json"',
+                      r"C:\Apps", "PC\\user", interval_min=5)
+    check("XML: действие --ensure", "--ensure" in xml)
+    check("XML: триггер «при входе в систему»", "<LogonTrigger>" in xml)
+    check("XML: триггер повтора (TimeTrigger с StartBoundary)",
+          "<TimeTrigger>" in xml and "<StartBoundary>" in xml)
+    check("XML: повтор каждые 5 минут", "<Interval>PT5M</Interval>" in xml)
+    check("XML: повтор бесконечный (Duration не задан)", "<Duration>" not in xml)
+    check("XML: задача скрытая", "<Hidden>true</Hidden>" in xml)
+    check("XML: не запускать новый экземпляр (IgnoreNew)",
+          "<MultipleInstancesPolicy>IgnoreNew</MultipleInstancesPolicy>" in xml)
+    check("XML: от имени текущего пользователя",
+          "PC\\user" in xml and "<LogonType>InteractiveToken</LogonType>" in xml)
+    check("XML: интервал переопределяется из конфига",
+          "<Interval>PT2M</Interval>" in WD.task_xml("e", "a", "w", "u", interval_min=2))
+    check("XML: спецсимволы в путях экранируются",
+          "&amp;" in WD.task_xml("a&b", "c", "w", "u"))
+    check("аргументы задачи: --ensure и --config",
+          "--ensure" in WD.install_args({"watchdog": {}}) and
+          "--config" in WD.install_args({"_config_path": r"C:\x\config.json"}))
+
+    # 14.3 маркер супервизора: живой и мёртвый pid
+    me = os.getpid()
+    if getattr(sys, "frozen", False):
+        root_wd = os.path.dirname(os.path.abspath(sys.executable))
+    else:
+        root_wd = os.path.join(_TMP, "fresh_root")
+    cfg_wd = {"paths": {"root": root_wd,
+                        "state_dir": os.path.join(_TMP, "wd_state")},
+              "watchdog": cfg2["watchdog"]}
+    os.makedirs(cfg_wd["paths"]["state_dir"], exist_ok=True)
+    # 14.3a «своя семья»: onefile — это ДВА процесса (bootloader-родитель и
+    # Python-потомок) с одинаковой командной строкой. Родителя нельзя принять за
+    # чужой живой супервизор, иначе --run откажется стартовать.
+    m_exe = WD.our_exe(cfg_wd)
+    rows = [(me, 4242, m_exe, f'"{m_exe}" --run'),
+            (4242, 1, m_exe, f'"{m_exe}" --run'),
+            (9999, 1, r"C:\Other\Other.exe", r'"C:\Other\Other.exe" --run --x')]
+    skip = WD._self_family_pids(rows, cfg_wd)
+    check("своя семья: родитель-bootloader не считается чужим супервизором",
+          me in skip and 4242 in skip)
+    check("своя семья: посторонний процесс не исключается", 9999 not in skip)
+    WD.write_marker(cfg_wd, argv=["--run"])
+    d = WD.read_marker(cfg_wd)
+    check("маркер записан (pid/root/exe)",
+          d.get("pid") == me and d.get("root") == cfg_wd["paths"]["root"])
+    check("живой маркер распознан", WD._marker_live_pid(cfg_wd) == me)
+    check("find_live_supervisor видит супервизора по маркеру",
+          WD.find_live_supervisor(cfg_wd) == me)
+    check("find_live_supervisor исключает свой pid",
+          WD.find_live_supervisor(cfg_wd, exclude=(me,)) == 0)
+    with open(WD.marker_path(cfg_wd), "w", encoding="utf-8") as f:
+        json.dump({"pid": 999999, "ts": time.time(), "exe": WD.our_exe(cfg_wd),
+                   "root": cfg_wd["paths"]["root"]}, f)
+    check("мёртвый pid -> супервизора нет", WD._marker_live_pid(cfg_wd) == 0)
+    check("ensure без супервизора (пробно, без запуска) -> 0",
+          WD.ensure(cfg_wd, spawn=False) == 0)
+
+    # 14.4 захват: двух --run быть не должно
+    WD.clear_marker(cfg_wd)
+    got1 = WD.claim_supervisor(cfg_wd)
+    got2 = WD.claim_supervisor(cfg_wd)
+    check("claim: первый экземпляр становится супервизором", got1 is True)
+    check("claim: второй отказывается (нет второго --run)", got2 is False)
+    WD.release_supervisor(cfg_wd)
+    check("release убрал маркер", WD._marker_live_pid(cfg_wd) == 0)
+
+    # 14.5 отчёт/статус задачи (только чтение)
+    os.environ["FOREST_TASK_NAME"] = "ForestSelftest-NoSuchTask-QZ"
+    rep = WD.watchdog_report(cfg_wd)
+    os.environ.pop("FOREST_TASK_NAME", None)
+    check("watchdog_report: есть settings/task/supervisor_alive",
+          all(k in rep for k in ("settings", "task", "supervisor_alive")))
+    check("несуществующая задача: exists=False", rep["task"]["exists"] is False)
+
+    # 14.6 выключенный надзор: задачу НЕ создаём, сообщаем честно
+    os.environ["FOREST_TASK_NAME"] = "ForestSelftest-Off-QZ"
+    cfg_off = dict(cfg_wd)
+    cfg_off["watchdog"] = {"enabled": False, "interval_min": 5,
+                           "task_name": "ForestSelftest-Off-QZ"}
+    res_off = WD.apply_watchdog(cfg_off, log_msg=False)
+    os.environ.pop("FOREST_TASK_NAME", None)
+    check("enabled=False: задача не создаётся (unchanged)",
+          res_off["ok"] and res_off["action"] == "unchanged")
+    check("enabled=False: задачи в Планировщике нет",
+          not WD.task_exists("ForestSelftest-Off-QZ"))
+
+    # 14.7 строки надзора в каталоге i18n заполнены на обоих языках
+    comp = i18n.check_complete()
+    wd_keys = [k for k in i18n.all_keys() if "watchdog" in k]
+    check("i18n: ключи надзора есть", bool(wd_keys))
+    check("i18n: ключи надзора заполнены (ru/en)",
+          all(k not in comp["missing"] for k in wd_keys))
+
     print()
     print("=" * 64)
     if FAILED:

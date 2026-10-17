@@ -5,12 +5,17 @@
 #
 # build-all.sh — собирает все форматы, которые возможны на этой машине.
 #
-#   sh packaging-linux/build-all.sh
-#   FOREST_PKG_VERSION=1.0.2 sh build-all.sh
+#   bash packaging-linux/build-all.sh
+#   FOREST_PKG_VERSION=1.0.2 bash build-all.sh
 #
 # Форматы без своих инструментов пропускаются с внятным сообщением (это не
 # ошибка: например, на Arch нет dpkg-deb, а на Debian — makepkg). Готовые файлы
 # попадают в packaging-linux/out/, сводка печатается в конце.
+#
+# Сборщики используют ${BASH_SOURCE}, поэтому им нужен именно bash. Если файл
+# запустили через sh (dash), перезапускаем себя под bash — иначе будет
+# «Bad substitution» и пустые пути.
+if [ -z "${BASH_VERSION:-}" ]; then exec bash "$0" "$@"; fi
 set -u
 
 . "$(cd "$(dirname "$0")" && pwd)/lib/common.sh"
@@ -35,7 +40,7 @@ run_builder() {   # run_builder <скрипт> <что>
     local script="$1" what="$2"
     echo
     echo "############ $what ############"
-    if sh "$PACKAGING_LINUX_DIR/$script"; then
+    if bash "$PACKAGING_LINUX_DIR/$script"; then
         :
     else
         FAILED=1

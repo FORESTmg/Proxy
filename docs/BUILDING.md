@@ -71,6 +71,38 @@ The reference build in this repository:
 | Xray-core | v26.3.27 |
 | Layout | onefile, `console=False` |
 
+## Building the interface helper (`forest-ui`, Qt)
+
+The interface helper is a **separate artefact** (see
+[ARCHITECTURE.md](ARCHITECTURE.md) — two processes, one owner of the core):
+
+```powershell
+powershell -ExecutionPolicy Bypass -File packaging\build-ui.ps1     # -> packaging\dist\forest-ui.exe
+```
+
+```sh
+sh packaging/build-ui.sh                                            # -> linux/dist/forest-ui
+```
+
+It installs PySide6-Essentials (pin in `packaging/requirements-ui.txt`) into the
+same `.build-venv`, then builds `packaging/forest-ui.spec`. The main program is
+**not** rebuilt and stays dependency-free — if you never build the helper, the
+program uses the built-in icon and the built-in notifications.
+
+The spec drops the Qt parts the helper does not use (QML/Quick, network, SQL,
+multimedia, WebEngine …), which is why the result is ~35 MiB instead of ~100 MiB.
+The point is checked, not assumed: after building, run
+
+```powershell
+packaging\dist\forest-ui.exe --menu-dump     # the whole menu structure
+packaging\dist\forest-ui.exe --selftest      # icons, themes, command bridge, frame rate, focus
+packaging\dist\forest-ui.exe --show error "Title" "Body"   # one real notification + frame numbers
+```
+
+`--selftest` exits non-zero if anything is wrong; it measures the average and
+worst frame interval of the animation and checks that the foreground window did
+not change.
+
 ## What is inside the one `.exe`
 
 The spec `ForestProxyUpdater.spec` builds onefile + `console=False` (no console

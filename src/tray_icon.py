@@ -35,7 +35,9 @@
 from __future__ import annotations
 
 import math
+import os
 import struct
+import sys
 
 # ────────────────────────────────────────────── упаковка .ico ───
 _HEADER = struct.Struct("<HHH")            # reserved, type, count
@@ -125,7 +127,54 @@ STATES = {
     "ok":    ((34, 160, 80), (57, 194, 109)),    # зелёный — работает
     "off":   ((110, 112, 120), (150, 152, 160)),  # серый   — выключено вручную
     "error": ((198, 64, 64), (229, 72, 77)),      # красный — обрыв связи
+    "busy":  ((198, 150, 22), (240, 196, 44)),    # жёлтый  — идёт переключение/проверка
+    # состояния ЭТАЛОНА (v2ray-auto-updater, tray.ps1) — цвета оттуда же
+    "switch": ((198, 150, 34), (240, 180, 41)),    # переключение сервера
+    "noanswer": ((198, 150, 34), (240, 180, 41)),  # сторож молчит (нет данных)
+    "restoring": ((58, 108, 214), (79, 140, 255)),  # восстановление связи
+    "down": ((198, 64, 64), (229, 72, 77)),        # НЕТ СВЯЗИ (синоним error)
 }
+# Имена, для которых рисуется значок: четыре «рабочих» состояния программы
+# плюс три состояния эталона, которые показывает помощник интерфейса.
+STATE_NAMES = ("ok", "busy", "off", "error", "switch", "noanswer", "restoring",
+               "down")
+
+
+def _darken(rgb, k: float = 0.72):
+    return tuple(max(0, min(255, int(round(c * k)))) for c in rgb)
+
+
+def states(cfg: dict = None) -> dict:
+    """Цвета состояний из палитры темы (светлая/тёмная).
+
+    Для состояний эталона (switch/noanswer/restoring/down) берём цвета из
+    :mod:`status_info` — они перенесены из прежней надстройки дословно.
+    """
+    try:
+        import theme
+        out = {}
+        for name in STATE_NAMES:
+            c = theme.state_color(cfg, name)
+            out[name] = (_darken(c), c)
+        try:
+            import status_info as SI
+            for name in ("switch", "noanswer", "restoring", "down"):
+                if name in SI.STATES:
+                    c = SI.STATES[name]["rgb"]
+                    out[name] = (_darken(c), c)
+        except Exception:
+            pass
+        return out
+    except Exception:
+        return {k: v for k, v in STATES.items()}
+
+
+def state_color(state: str, cfg: dict = None):
+    try:
+        import theme
+        return theme.state_color(cfg, state)
+    except Exception:
+        return STATES.get(state, STATES["off"])[1]
 _RING_A = 205          # непрозрачность кольца (0..255)
 _DOT_A = 255           # точка полностью непрозрачна
 _SS = 4                # суперсэмплинг 4x4 — сглаживает края без GDI
@@ -173,15 +222,295 @@ def render_state(size: int, ring_rgb, dot_rgb,
     return bytes(px)
 
 
-def state_ico(state: str, sizes=(16, 32)) -> bytes:
-    """``.ico`` для состояния: ``ok`` | ``off`` | ``error`` (16 и 32 по умолчанию)."""
-    ring, dot = STATES.get(state, STATES["off"])
+# ═══════════════════════════ иконка ПОЛЬЗОВАТЕЛЯ + цвет состояния внутри ═══
+# Значок трея — рисунок пользователя (app.ico), а состояние связи показывается
+# ЦВЕТОМ ВНУТРИ рисунка (заливка внутренней области), не отдельной точкой сбоку.
+# Если файла нет/он битый — молча откатываемся на нарисованный значок.
+_APP_ICO_CACHE = {"key": None, "data": b""}
+
+
+def find_app_ico(cfg: dict = None) -> str:
+    """Где лежит app.ico: рядом с .exe -> в бандле -> в каталоге данных -> в репо."""
+    cands = []
+    try:
+        if sys.executable:
+            cands.append(os.path.join(os.path.dirname(os.path.abspath(sys.executable)),
+                                      "app.ico"))
+    except Exception:
+        pass
+    try:
+        mp = getattr(sys, "_MEIPASS", "") or ""
+        if mp:
+            cands.append(os.path.join(mp, "app.ico"))
+    except Exception:
+        pass
+    try:
+        root = ((cfg or {}).get("paths") or {}).get("root") or ""
+        if root:
+            cands.append(os.path.join(root, "app.ico"))
+        import config as CFG
+        cands.append(os.path.join(CFG.PROJECT_DIR, "app.ico"))
+        cands.append(os.path.join(CFG.PROJECT_DIR, "packaging", "app.ico"))
+        cands.append(os.path.join(CFG.BASE_DIR, "app.ico"))
+        cands.append(os.path.join(os.path.dirname(CFG.BASE_DIR), "packaging", "app.ico"))
+    except Exception:
+        pass
+    for c in cands:
+        try:
+            if c and os.path.isfile(c):
+                return c
+        except Exception:
+            continue
+    return ""
+
+
+def load_app_ico(cfg: dict = None) -> bytes:
+    """Байты app.ico пользователя (кэш по пути+mtime). b'' — нет/битый."""
+    p = find_app_ico(cfg)
+    if not p:
+        return b""
+    try:
+        key = (p, os.path.getmtime(p))
+    except Exception:
+        key = (p, 0)
+    if _APP_ICO_CACHE.get("key") == key:
+        return _APP_ICO_CACHE.get("data") or b""
+    data = b""
+    try:
+        with open(p, "rb") as f:
+            data = f.read()
+        if not ico_images(data):        # битый/не .ico
+            data = b""
+    except Exception:
+        data = b""
+    _APP_ICO_CACHE["key"], _APP_ICO_CACHE["data"] = key, data
+    return data
+
+
+def _png_to_rgba(data: bytes):
+    """Минимальный PNG-декодер (8 бит, color type 2/6, без интерлейса).
+
+    Нужен потому, что современные .ico (в т. ч. иконка пользователя) хранят
+    изображения как PNG-потоки, а не как DIB. -> (w, h, RGBA top-down) | None
+    """
+    try:
+        import zlib
+        if not data or data[:8] != b"\x89PNG\r\n\x1a\n":
+            return None
+        i, w, h, ct, bd = 8, 0, 0, 0, 0
+        idat = bytearray()
+        while i + 8 <= len(data):
+            ln = struct.unpack_from(">I", data, i)[0]
+            tag = data[i + 4:i + 8]
+            body = data[i + 8:i + 8 + ln]
+            if tag == b"IHDR":
+                w, h, bd, ct = struct.unpack_from(">IIBB", body, 0)
+                if body[12] != 0:          # interlace
+                    return None
+            elif tag == b"IDAT":
+                idat += body
+            elif tag == b"IEND":
+                break
+            i += 12 + ln
+        if not w or not h or bd != 8 or ct not in (2, 6):
+            return None
+        ch = 4 if ct == 6 else 3
+        raw = zlib.decompress(bytes(idat))
+        stride = w * ch
+        out = bytearray(w * h * 4)
+        prev = bytearray(stride)
+        pos = 0
+        for y in range(h):
+            ft = raw[pos]; pos += 1
+            line = bytearray(raw[pos:pos + stride]); pos += stride
+            if len(line) < stride:
+                return None
+            if ft == 1:                    # Sub
+                for x in range(ch, stride):
+                    line[x] = (line[x] + line[x - ch]) & 0xFF
+            elif ft == 2:                  # Up
+                for x in range(stride):
+                    line[x] = (line[x] + prev[x]) & 0xFF
+            elif ft == 3:                  # Average
+                for x in range(stride):
+                    a = line[x - ch] if x >= ch else 0
+                    line[x] = (line[x] + ((a + prev[x]) >> 1)) & 0xFF
+            elif ft == 4:                  # Paeth
+                for x in range(stride):
+                    a = line[x - ch] if x >= ch else 0
+                    b = prev[x]
+                    c = prev[x - ch] if x >= ch else 0
+                    p = a + b - c
+                    pa, pb, pc = abs(p - a), abs(p - b), abs(p - c)
+                    pr = a if (pa <= pb and pa <= pc) else (b if pb <= pc else c)
+                    line[x] = (line[x] + pr) & 0xFF
+            elif ft != 0:
+                return None
+            prev = line
+            for x in range(w):
+                si = x * ch
+                di = (y * w + x) * 4
+                out[di] = line[si]
+                out[di + 1] = line[si + 1]
+                out[di + 2] = line[si + 2]
+                out[di + 3] = line[si + 3] if ch == 4 else 255
+        return w, h, bytes(out)
+    except Exception:
+        return None
+
+
+def _dib_to_pixels(payload: bytes):
+    """RT_ICON (DIB или PNG-поток) -> (w, h, pixels BGRA top-down) или None."""
+    if not payload:
+        return None
+    # современные .ico хранят изображения как PNG — декодируем и переводим в BGRA
+    if payload[:8] == b"\x89PNG\r\n\x1a\n":
+        r = _png_to_rgba(payload)
+        if not r:
+            return None
+        w, h, rgba = r
+        out = bytearray(w * h * 4)
+        for i in range(0, len(rgba), 4):
+            out[i] = rgba[i + 2]        # B
+            out[i + 1] = rgba[i + 1]    # G
+            out[i + 2] = rgba[i]        # R
+            out[i + 3] = rgba[i + 3]
+        return w, h, bytes(out)
+    if len(payload) < 40:
+        return None
+    try:
+        _sz, w, h2, _pl, bpp, _cmp, _isz, _x, _y, _cu, _ci = _BMIH.unpack_from(payload, 0)
+        h = h2 // 2
+        if w <= 0 or h <= 0 or bpp != 32 or w > 512 or h > 512:
+            return None
+        need = w * h * 4
+        raw = payload[40:40 + need]
+        if len(raw) < need:
+            return None
+        out = bytearray(need)
+        stride = w * 4
+        for y in range(h):              # в файле снизу вверх -> разворачиваем
+            src = (h - 1 - y) * stride
+            out[y * stride:(y + 1) * stride] = raw[src:src + stride]
+        return w, h, bytes(out)
+    except Exception:
+        return None
+
+
+def tint_inside(px: bytes, w: int, h: int, rgb, radius_frac: float = 0.42,
+                blend: float = 0.90, rim=None):
+    """Заливает ВНУТРЕННЮЮ область рисунка цветом состояния.
+
+    Сначала красим только непрозрачные пиксели (внутри силуэта рисунка). Если
+    рисунок полый и внутри центра почти нет непрозрачных пикселей — заливаем
+    весь диск, иначе цвет состояния не читался бы на 16x16. Затем по краю диска
+    рисуется тонкая обводка ``rim`` — чтобы цвет читался и на светлой, и на
+    тёмной панели задач.
+
+    -> (pixels, доля окрашенных пикселей внутри диска 0..1)
+    """
+    cx = cy = (w - 1) / 2.0
+    r = max(1.0, radius_frac * w)
+    r2 = r * r
+    disc = 0
+    idx = []
+    for y in range(h):
+        for x in range(w):
+            dx, dy = x - cx, y - cy
+            if dx * dx + dy * dy <= r2:
+                disc += 1
+                idx.append((y * w + x) * 4)
+    out = bytearray(px)
+    tinted = 0
+
+    def paint(clip_alpha: bool) -> int:
+        n = 0
+        for i in idx:
+            if clip_alpha and out[i + 3] == 0:
+                continue
+            # пиксели в BGRA: r->+2, g->+1, b->+0
+            for ci, cc in ((2, rgb[0]), (1, rgb[1]), (0, rgb[2])):
+                out[i + ci] = max(0, min(255, int(round(
+                    out[i + ci] * (1.0 - blend) + cc * blend))))
+            out[i + 3] = max(out[i + 3], 240)
+            n += 1
+        return n
+
+    if disc:
+        tinted = paint(True)
+        if tinted < disc * 0.25:        # полый рисунок — заливаем весь диск
+            out = bytearray(px)
+            tinted = paint(False)
+    # тонкая обводка по краю диска — читаемость на любой панели задач
+    if rim:
+        r_in = r * 0.90
+        r_out = r * 1.06
+        for y in range(h):
+            for x in range(w):
+                dx, dy = x - cx, y - cy
+                d = math.sqrt(dx * dx + dy * dy)
+                if r_in <= d <= r_out:
+                    i = (y * w + x) * 4
+                    if out[i + 3] == 0 and not (tinted >= disc * 0.25):
+                        continue
+                    out[i], out[i + 1], out[i + 2] = rim[2], rim[1], rim[0]
+                    out[i + 3] = 255
+    return bytes(out), (tinted / disc if disc else 0.0)
+
+
+def user_state_ico(ico: bytes, state: str, sizes=(16, 32), mark: bool = True,
+                   cfg: dict = None):
+    """``.ico`` состояния из иконки пользователя (b'' — если собрать нельзя)."""
+    st = states(cfg)
+    ring, dot = st.get(state, st["off"])
+    try:
+        import theme
+        rim = theme.palette(cfg).get("tray_rim")
+    except Exception:
+        rim = (18, 18, 18)
+    imgs = []
+    for s in sizes:
+        pay = ico_image_payload(ico, s)
+        d = _dib_to_pixels(pay) if pay else None
+        if not d:
+            continue
+        w, h, px = d
+        if mark:
+            px, _frac = tint_inside(px, w, h, dot, rim=rim)
+        imgs.append((w, h, px))
+    if not imgs:
+        return b""
+    return make_ico(imgs)
+
+
+def state_mark_enabled(cfg: dict = None) -> bool:
+    """Показывать ли цвет состояния (``ui.tray_state_mark``, по умолчанию ДА)."""
+    try:
+        v = ((cfg or {}).get("ui") or {}).get("tray_state_mark", True)
+        return bool(v)
+    except Exception:
+        return True
+
+
+def state_ico(state: str, sizes=(16, 32), cfg: dict = None) -> bytes:
+    """``.ico`` для состояния: ``ok`` | ``busy`` | ``off`` | ``error``.
+
+    Приоритет — иконка пользователя (app.ico) с цветом состояния ВНУТРИ; если
+    её нет или она битая — прежний нарисованный значок (кольцо + точка).
+    """
+    ico = load_app_ico(cfg)
+    if ico:
+        data = user_state_ico(ico, state, sizes, mark=state_mark_enabled(cfg), cfg=cfg)
+        if data:
+            return data
+    st = states(cfg)
+    ring, dot = st.get(state, st["off"])
     imgs = [(s, s, render_state(s, ring, dot)) for s in sizes]
     return make_ico(imgs)
 
 
-def all_state_icos(sizes=(16, 32)) -> dict:
-    return {name: state_ico(name, sizes) for name in STATES}
+def all_state_icos(sizes=(16, 32), cfg: dict = None) -> dict:
+    return {name: state_ico(name, sizes, cfg) for name in STATES}
 
 
 # ─────────────────────────────────────────── HICON в памяти (Win32) ───

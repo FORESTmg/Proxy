@@ -4,6 +4,144 @@ All notable changes to **FOREST's Proxy Auto-updater** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] — 2026-10-17
+
+### Added
+
+- **Indication is now exactly the composition of the previous add-on.** The old
+  setup (`D:\v2ray-auto-updater`, switched off but kept for rollback) is the
+  reference: its contents, texts and colour codes were ported verbatim into one
+  place (`src/status_info.py`) and are used by **both** interfaces (the built-in
+  icon and the Qt helper), so nothing is lost and the two can never drift apart:
+  * the icon tooltip keeps the four reference fields in order —
+    `FOREST <link state> | <N> servers | <RU route> | watch OK` (the previous
+    version always printed “10 servers”, a hard-coded default — the field is
+    kept, the number is now the real pool size);
+  * the indication card keeps the reference title, subtitle, percentage, the
+    step list **with per-step times**, and the footer, including
+    **the link recovery time** (`восстановено за N.NN с · окно закроется через
+    4 с`, `связь подтверждена · N.NN с`) — recovery time is now also persisted
+    (`last_restore_s`/`last_restore_ts`) so it stays readable in the menu after
+    the card is gone;
+  * six icon states with the reference colours: `ok` (57,194,109), `off`
+    (132,132,140), `switch` (240,180,41), `noanswer` (240,180,41), `down`
+    (229,72,77), `restoring` (79,140,255);
+  * the menu keeps the reference items (open log, open status, enable/disable the
+    proxy by hand, exit) and adds what cannot be left out (supervision,
+    notifications, theme, refresh, about).
+  What changed is only the smoothness (60 fps) and the look (our light/dark
+  palette, the user's own icon with the state colour inside).
+  Verified side by side by running the reference read-only (its modules imported
+  in a throwaway state directory — the live proxy, ports 10808/10820 and the
+  registry are untouched): every title, subtitle and colour matches, the field
+  lists are identical.
+- **Interface helper `forest-ui` (Qt/PySide6, LGPL-3.0).** The interface is now a
+  **separate program** shipped as its own artefact, so the main program stays
+  small and dependency-free. It draws the tray icon (your `app.ico` with the
+  connection colour painted **inside** the picture — four distinct states,
+  readable on light and dark taskbars), a **menu with submenus** (status,
+  supervision on/off, notifications on/off, **theme: follow system / light /
+  dark**, refresh now, test notification, open log, about, quit) and
+  **notifications** as a frameless translucent card (rounded corners, shadow,
+  your icon) sliding in and fading out at **60 fps** that **never takes focus**.
+  The helper **does not touch the core**: a menu item is written to
+  `state/ui_cmd.json` and performed by the supervisor through exactly the same
+  code as the built-in menu; state comes back through `state/tray_status.json`
+  and a heartbeat in `state/ui_helper.json`. Settings: `ui.helper` =
+  `auto`|`on`|`off`, `ui.helper_exe`. Build: `packaging/build-ui.ps1`,
+  `packaging/build-ui.sh`, spec `packaging/forest-ui.spec`.
+- **Interface fallback, honestly.** No helper, a crashed helper, no system tray —
+  the built-in ctypes icon and the built-in notifications (`src/notify.py`) work
+  as before; the built-in tray waits in reserve while the helper is alive and
+  takes over within seconds after it stops, and notifications are only shown by
+  whichever side owns the interface (never twice).
+- **Themes (light/dark) as one source of truth** — `src/theme.py`: palettes for
+  the notification card, the tray icon and the menu styling (QSS comes from the
+  same palette), automatic detection (Windows registry / `gsettings`, with
+  `FOREST_THEME`, `GTK_THEME`, `COLORFGBG` as fallbacks) and a `ui.theme`
+  override. State colours are checked against WCAG (minimum contrast 3.36:1).
+- **Notifications (`src/notify.py`, Windows)** — layered window drawn with a
+  single `UpdateLayeredWindow` per frame (no flicker at all, no `WM_PAINT`, no
+  child controls), shown with `SW_SHOWNOACTIVATE`/`WS_EX_NOACTIVATE` so the
+  active window keeps focus, frames scheduled on a **high-resolution waitable
+  timer** on an absolute timeline (no drift) — measured: **60.0 fps average,
+  worst frame 17.4 ms, 0.0 ms CPU in idle, focus unchanged**.
+- **Helper keep-alive.** `--install`, the scheduled task (`--ensure`, every
+  minute) and the supervisor (every 30 s) all call the same `ui_helper.ensure()`,
+  so a crashed helper comes back by itself and a second copy is never started
+  (`state/ui_helper.json` plus a live-process check).
+- **Linux**: the same helper provides a real tray icon and menu (StatusNotifier/
+  D-Bus); notifications in the helper go through `org.freedesktop.Notifications`
+  (the fallback path in `posix_platform.py` now uses the same `gdbus` →
+  `notify-send` chain with the app icon and urgency); packages install the icon
+  and `.desktop` files (`forest-proxy-updater.desktop`, `...-ui.desktop`).
+- **Autonomous supervision — the program brings itself back.** `--install` now
+  registers a **Task Scheduler task** `ForestProxyUpdater-Watchdog` (hidden, runs
+  as the current user, `MultipleInstancesPolicy=IgnoreNew`) with a logon trigger
+  and a repeat-every-5-minutes trigger, whose action is
+  `ForestProxyUpdater.exe --ensure`. It **replaces** the old `HKCU\...\Run`
+  autostart entry (removed by `--install`), so exactly one mechanism brings the
+  program up.
+- **`--ensure`** — a quick check (own marker file + live-process scan) that
+  launches `--run` **detached from the calling process** (`DETACHED_PROCESS` +
+  `CREATE_BREAKAWAY_FROM_JOB`, own process group) when no supervisor of *this*
+  installation is alive. It refuses to create a second supervisor, writes only to
+  the log and never shows a window.
+- **`--watchdog on|off|status`** and a `watchdog` config section
+  (`{"enabled": true, "interval_min": 5, "task_name": "..."}`, on by default).
+  `--watchdog off` deletes the task and the program honestly stops restarting
+  itself; `--status` and `--watchdog status` print the supervision state (setting,
+  task present?, last run, is the program running now). The tray menu gained
+  **Supervision → “Bring the program up automatically”**.
+- **Honest first-run notice.** `--install` tells the user in plain words that a
+  task was created and enabled, that it raises the program at logon and every
+  5 minutes, and that switching supervision off means the program will **not**
+  restart itself and must be started by hand. The same warning is printed by
+  `--watchdog status` / `--status`.
+- **Self-test section 14** (watchdog): config defaults, task XML (logon trigger,
+  5-minute repetition, hidden, IgnoreNew, current user), marker/claim logic
+  (a second `--ensure`/`--run` must not create a second supervisor) and a check
+  that `watchdog.enabled=false` does not create a task.
+- **Linux**: `--ensure` implemented for systemd — it starts the user service if it
+  is not active. Supervision on Linux remains systemd's job
+  (`Restart=always` plus the update timer).
+- **Console debug build** for safe testing: `FOREST_CONSOLE_BUILD=1` builds
+  `ForestProxyUpdater-console.exe`, whose bootloader errors go to stderr instead
+  of a desktop dialog.
+
+### Fixed
+
+- **Notification animation did not run (0 frames) after the switch to the
+  high-resolution waitable timer.** The timer was armed once in `start()` and
+  never re-armed, so exactly one frame was drawn and then the window sat still
+  until it timed out. Frames are now scheduled on an **absolute timeline**
+  (`next_due += period`), the timer is re-armed after every frame, `_disarm()`
+  uses `CancelWaitableTimer()`, and frames that are more than one period late are
+  counted as dropped instead of accumulating debt (which would make the animation
+  stutter). Verified: 117 frames for a 1.96 s animation, average **60.0 fps**,
+  worst frame **17.4 ms**.
+- **Modal window “Failed to remove temporary directory”** (Windows, PyInstaller
+  onefile). A copy of the program started **by the program itself** (the new
+  `--ensure` → `--run` launch) inherited PyInstaller's `_PYI_APPLICATION_HOME_DIR`
+  and `_PYI_PARENT_PROCESS_LEVEL`, so the child **reused the parent's `_MEI`
+  unpack directory** instead of extracting its own; the parent then could not
+  delete `_MEI` (its files were still in use by the surviving child) and showed
+  the modal error. The child environment is now cleared of the PyInstaller
+  variables (plus `PYINSTALLER_RESET_ENVIRONMENT=1`), so every process owns and
+  removes its own `_MEI`. In addition the program leaves the unpack directory on
+  start (`config.ensure_safe_cwd`, before any child process is launched) and
+  starts its background processes with a working directory outside the unpack
+  directory.
+
+### Changed
+
+- `--install` no longer writes an autostart entry to the registry; the single
+  autostart mechanism is the scheduler task. `--uninstall` removes the task, any
+  legacy autostart entry, the shortcut and the files.
+- The identity used for “is a supervisor of *this* installation alive” is derived
+  from the running executable (`sys.executable`) and the state directory, so two
+  different installations (a working one and a test sandbox) never see each other.
+
 ## [1.1.0] — 2026-10-17
 
 ### Added

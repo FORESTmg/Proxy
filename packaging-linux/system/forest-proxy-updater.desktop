@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=FOREST's Proxy Auto-updater
+GenericName=Auto-updating proxy
+Comment=Auto-updating local proxy on top of the Xray core
+Exec=@EXEC@
+Icon=forest-proxy-updater
+Terminal=true
+Categories=Network;
+Keywords=proxy;xray;v2ray;vless;vmess;tunnel;
+# Программа не имеет графического интерфейса: весь вывод идёт в терминал,
+# поэтому Terminal=true. Установка и удаление — флагами --install/--uninstall.

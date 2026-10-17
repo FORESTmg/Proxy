@@ -219,10 +219,88 @@ class _TrayHost:
         self._test_steps = None
         self._test_start = None
         self._test_i = 0
+        self._theme_cur = None
+
+    # ────────────────────────────────────────── уведомления и тема ───
+    def _setup_services(self) -> None:
+        """Настройка уведомлений и запоминание текущей темы."""
+        cfg = getattr(self.actions, "cfg", None) or {}
+        try:
+            import notify as N
+            N.configure(cfg)
+            self.lg.info(f"{self.tag}: уведомления "
+                         f"{'включены' if N.enabled() else 'выключены'}")
+        except Exception as e:
+            self.lg.warn(f"{self.tag}: уведомления не настроены: {e}")
+        try:
+            import theme
+            self._theme_cur = theme.choice(cfg)
+            self.lg.info(f"{self.tag}: тема оформления: {self._theme_cur}; "
+                         f"минимальный контраст цветов состояния к панели: "
+                         f"{theme.min_contrast():.2f}")
+        except Exception as e:
+            self.lg.warn(f"{self.tag}: тема не определена: {e}")
+
+    def _reload_theme_if_needed(self) -> None:
+        """Тема сменилась (в меню трея или в системе) — пересобрать значки."""
+        try:
+            import theme
+            now = theme.choice(getattr(self.actions, "cfg", None) or {})
+        except Exception:
+            return
+        if not self._theme_cur or now == self._theme_cur:
+            return
+        self._theme_cur = now
+        try:
+            for h in list(self.hicons.values()):
+                TI.destroy_hicon(h)
+            self.hicons = {}
+            self._make_hicons()
+            self._modify_icon()
+            self.lg.info(f"{self.tag}: тема -> {now}, значки пересобраны")
+        except Exception as e:
+            self.lg.warn(f"{self.tag}: пересборка значков после смены темы: {e}")
+
+    def _notify_transition(self, prev, cur) -> None:
+        """Уведомляем ТОЛЬКО о значимом: обрыв, восстановление, ручное
+        выключение, критическая ошибка. Рутина обновления пула молчит."""
+        if prev is None or prev == cur:
+            return
+        ev = None
+        if cur == "error" and prev != "error":
+            ev = "lost"
+        elif cur == "ok" and prev == "error":
+            ev = "restored"
+        elif cur == "off" and prev != "off":
+            ev = "off"
+        elif cur == "ok" and prev == "off":
+            ev = "on"
+        elif cur == "busy" and prev == "ok":
+            ev = "switched"
+        if not ev:
+            return
+        # Уведомления о переходах показывает тот, у кого интерфейс: если работает
+        # помощник (forest-ui), он и показывает — иначе пользователь получил бы
+        # два уведомления об одном и том же событии.
+        try:
+            import ui_helper as UH
+            if UH.running(getattr(self.actions, "cfg", None) or {}):
+                self.lg.info(f"{self.tag}: уведомление о «{ev}» показывает "
+                             f"помощник интерфейса")
+                return
+        except Exception:
+            pass
+        try:
+            import notify as N
+            N.notify_event(ev, getattr(self.actions, "cfg", None))
+            self.lg.info(f"{self.tag}: уведомление о событии «{ev}» "
+                         f"({prev} -> {cur})")
+        except Exception as e:
+            self.lg.warn(f"{self.tag}: уведомление ({ev}): {e}")
 
     # ────────────────────────────────────────────── HICON-ы ───
     def _make_hicons(self):
-        icos = TI.all_state_icos()
+        icos = TI.all_state_icos(cfg=getattr(self.actions, "cfg", None))
         for name, data in icos.items():
             h, err = TI.make_hicon(data, 16)
             if not h:
@@ -314,6 +392,19 @@ class _TrayHost:
         u.AppendMenuW(sub, cf_flags, TM.CMD_FILTER_CF, labels["filter_cf"])
         u.AppendMenuW(menu, MF_POPUP | MF_STRING, int(sub), labels["filters"])
         u.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        # подменю «Надзор» — переключатель автоподъёма программы (гачка)
+        wsub = u.CreatePopupMenu()
+        wd_flags = MF_STRING | (MF_CHECKED if self.actions.watchdog_enabled() else MF_UNCHECKED)
+        u.AppendMenuW(wsub, wd_flags, TM.CMD_WATCHDOG, labels["watchdog"])
+        u.AppendMenuW(menu, MF_POPUP | MF_STRING, int(wsub), labels["watchdog_section"])
+        u.AppendMenuW(menu, MF_SEPARATOR, 0, None)
+        # подменю «Уведомления» — сами уведомления и тема оформления
+        nsub = u.CreatePopupMenu()
+        n_flags = MF_STRING | (MF_CHECKED if self.actions.notify_enabled() else MF_UNCHECKED)
+        u.AppendMenuW(nsub, n_flags, TM.CMD_NOTIFY, labels["notify"])
+        u.AppendMenuW(nsub, MF_STRING, TM.CMD_THEME, labels["theme"])
+        u.AppendMenuW(menu, MF_POPUP | MF_STRING, int(nsub), labels["notify_section"])
+        u.AppendMenuW(menu, MF_SEPARATOR, 0, None)
         u.AppendMenuW(menu, MF_STRING, TM.CMD_EXIT, labels["exit"])
         return menu
 
@@ -347,6 +438,12 @@ class _TrayHost:
                     msg = a.toggle_ru_direct()
                 elif cmd == TM.CMD_FILTER_CF:
                     msg = a.toggle_cloudflare()
+                elif cmd == TM.CMD_WATCHDOG:
+                    msg = a.toggle_watchdog()
+                elif cmd == TM.CMD_NOTIFY:
+                    msg = a.toggle_notify()
+                elif cmd == TM.CMD_THEME:
+                    msg = a.cycle_theme()
                 else:
                     msg = ""
                 if msg:
@@ -363,7 +460,8 @@ class _TrayHost:
             if msg:
                 self.lg.info(f"{self.tag}: {msg}")
         elif cmd in (TM.CMD_TOGGLE_PROXY, TM.CMD_REFRESH,
-                     TM.CMD_FILTER_RU, TM.CMD_FILTER_CF):
+                     TM.CMD_FILTER_RU, TM.CMD_FILTER_CF, TM.CMD_WATCHDOG,
+                     TM.CMD_NOTIFY, TM.CMD_THEME):
             # тяжёлые операции (снятие/перезапуск ядра, запись конфига) — в
             # отдельном потоке, чтобы не подвешивать цикл сообщений трея
             threading.Thread(target=work, daemon=True).start()
@@ -400,16 +498,20 @@ class _TrayHost:
             self._run_test_step()
             return
         try:
+            self._reload_theme_if_needed()
+            prev = self._state
             ok, err, changed = self._modify_icon()
             if changed:
                 self.lg.info(f"{self.tag}: NIM_MODIFY -> state={self._state} "
                              f"{'OK' if ok else 'FAIL err=' + str(err)}")
+                self._notify_transition(prev, self._state)
         except Exception as e:
             self.lg.warn(f"{self.tag}: обновление значка: {e}")
 
     # ────────────────────────────────────────────── жизненный цикл ───
     def run(self) -> int:
         self._wp = WNDPROC(self._wndproc)
+        self._setup_services()
         self._make_hicons()
         self._create_window()
         self._add_icon()
@@ -522,6 +624,23 @@ def run_tray(cfg: dict, stop_event=None, poll_s: float = 2.0,
     lg = log.get_logger()
     if not IS_WIN:
         return _run_tray_fallback(cfg, stop_event, poll_s)
+    # Если работает помощник интерфейса (forest-ui, Qt) — интерфейс у него:
+    # своего значка не создаём. Иначе в трее было бы ДВА значка, а уведомления
+    # дублировались бы. Помощник ушёл — поднимаем встроенный значок: это и есть
+    # резервный путь (программа работает без помощника).
+    try:
+        import ui_helper as UH
+        if UH.running(cfg):
+            lg.info("трей: интерфейс ведёт помощник (forest-ui) — встроенный "
+                    "значок ждёт в резерве")
+            while UH.running(cfg):
+                if stop_event is not None and stop_event.is_set():
+                    return 0
+                time.sleep(max(1.0, poll_s))
+            lg.warn("трей: помощник интерфейса остановился — "
+                    "включаю встроенный значок")
+    except Exception as e:
+        lg.warn(f"трей: проверка помощника интерфейса: {e}")
     actions = TM.TrayActions(cfg, on_refresh=on_refresh)
     host = _TrayHost(actions, poll_s=poll_s, stop_event=stop_event)
     actions.on_exit = host.stop
@@ -545,7 +664,7 @@ def run_test(duration: float = 5.0) -> int:
     # 1. генерация иконок и HICON
     print("1) иконки (чистый Python, ICO из пикселей):")
     ok_icons = True
-    for name in ("ok", "off", "error"):
+    for name in ("ok", "busy", "off", "error"):
         data = TI.state_ico(name)
         sizes = [w for w, _h, _o, _s in TI.ico_images(data)]
         h, err = TI.make_hicon(data, 16)
@@ -564,7 +683,7 @@ def run_test(duration: float = 5.0) -> int:
     actions = TM.TrayActions(cfg)
     labels = actions.menu_labels()
     for k in ("toggle", "status", "refresh", "open_log", "filters", "filter_ru",
-              "filter_cf", "exit"):
+              "filter_cf", "watchdog_section", "watchdog", "exit"):
         print(f"   {k:10s}: {labels[k]}")
     print(f"   подсказка значка: {actions.tip()}")
 

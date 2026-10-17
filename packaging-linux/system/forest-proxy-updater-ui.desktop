@@ -1,0 +1,16 @@
+[Desktop Entry]
+Type=Application
+Name=FOREST's Proxy Auto-updater (interface helper)
+Name[ru]=FOREST's Proxy Auto-updater (помощник интерфейса)
+GenericName=Auto-updating proxy — tray icon, menu and notifications
+GenericName[ru]=Автоматический прокси — значок в трее, меню и уведомления
+Comment=Tray icon, menu and notifications for FOREST's Proxy Auto-updater
+Comment[ru]=Значок в трее, меню и уведомления для FOREST's Proxy Auto-updater
+Exec=@EXEC@
+Icon=forest-proxy-updater
+Terminal=false
+Categories=Network;
+Keywords=proxy;xray;v2ray;vless;vmess;tunnel;tray;
+# Помощник интерфейса (Qt): значок в трее, меню с подменю и уведомления.
+# Ядром он НЕ управляет — команды уходят в state/ui_cmd.json, а выполняет их
+# основная программа. Без него программа работает со встроенным значком.

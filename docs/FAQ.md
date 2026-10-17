@@ -160,20 +160,37 @@ subscription of the current pool — import it into any compatible client
 ## How do I remove everything?
 
 Run the `.exe` with `--uninstall`. This stops the core, restores the system proxy
-to the state before the first run, removes the autostart entry and the shortcut,
-and deletes `%LOCALAPPDATA%\ForestProxyUpdater`.
+to the state before the first run, removes the supervision task (and any legacy
+autostart entry) and the shortcut, and deletes
+`%LOCALAPPDATA%\ForestProxyUpdater`.
 
 If something was left behind (for example the core was busy and the directory
 could not be deleted), close the program, stop any leftover `xray.exe` that has
 `forest_xray.json` in its command line, and delete
 `%LOCALAPPDATA%\ForestProxyUpdater` manually. Then check in Windows *Settings →
 Network & Internet → Proxy* that nothing is left pointing at `127.0.0.1:10808`.
+Also check *Task Scheduler* for a leftover `ForestProxyUpdater-Watchdog` task
+(`schtasks /Delete /TN ForestProxyUpdater-Watchdog /F`).
+
+## Will it come back if it crashes or I close it by mistake?
+
+Yes — by default. `--install` creates a hidden Windows **Task Scheduler task**
+`ForestProxyUpdater-Watchdog` that starts the program at logon and checks every
+5 minutes whether it is running (calling `--ensure`), so a crash, an accidental
+close or the death of the process that started it does not leave you without a
+connection.
+
+If you do **not** want that, run `--watchdog off` (or untick **Supervision →
+"Bring the program up automatically"** in the tray menu, or set
+`"watchdog": {"enabled": false}`). After that the program will **not** restart
+itself and you will have to start it by hand. `--watchdog on` creates the task
+again, `--watchdog status` shows whether it is on and when it last ran.
 
 ## Can I run it once and exit, without autostart?
 
 Yes: run `--once` for a single selection cycle, or `--guard` for a single
-recovery pass. `--install` is what adds the autostart entry; if you only run
-`--once`, nothing is installed and no autostart is created. `--dry-run` performs
+recovery pass. `--install` is what creates the supervision task; if you only run
+`--once`, nothing is installed and nothing is scheduled. `--dry-run` performs
 a full cycle without writing anything or starting the core.
 
 ## Can I use it with my own servers / v2rayN?
@@ -191,6 +208,40 @@ a full cycle without writing anything or starting the core.
 No. `test.gate_urls` is empty in the shipped config. It exists for particular
 network conditions and is your responsibility to enable — see the security
 section in [`../README.md`](../README.md).
+
+## Where is the tray icon / where are the notifications?
+
+There are **two** possible interfaces, and exactly one of them is active:
+
+* **`forest-ui`** — the Qt helper (a separate file in the kit). If it is present
+  and running, it owns the tray icon, the menu and the notifications.
+* **the built-in icon** (ctypes, inside the program) — always present. It waits
+  in reserve while the helper is alive and takes over within seconds after the
+  helper stops or crashes.
+
+If you see no tray icon at all: the helper was probably not shipped, or Qt cannot
+find a tray on your desktop (some minimal window managers). Check with
+`--status` — it prints which of the two you have. Notifications work either way.
+
+## Do I need to install Qt, Python or anything else?
+
+No. `forest-ui.exe` (Windows) and `forest-ui` (Linux) are self-contained: Qt and
+Python are inside the file. Nothing has to be installed, and no Qt ever appears
+in the system.
+
+## I do not want the Qt helper — can I turn it off?
+
+Yes. Set `"ui": {"helper": "off"}` and restart, or simply delete
+`forest-ui.exe` from the program folder. Then the built-in icon and the built-in
+notifications are used, and the program behaves exactly as before. The helper is
+also never started twice: `state/ui_helper.json` plus a live-process check make
+sure of that.
+
+## Why is the helper shipped separately?
+
+Because Qt weighs tens of megabytes. Keeping it in a separate file keeps the main
+program small, dependency-free and fast to start; the helper is the optional
+"pretty" interface on top.
 
 ## Still stuck
 

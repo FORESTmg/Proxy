@@ -29,6 +29,8 @@ venv/
 # сборка
 build/
 dist/
+build-console/
+dist-console/
 *.spec
 packaging/build/
 packaging/dist/

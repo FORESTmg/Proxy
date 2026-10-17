@@ -1488,6 +1488,7 @@ def _emergency_restore(client: dict, cfg: dict, port: int) -> bool:
             return False
         st.data["balancer_cfg_sha"] = _conf_sha(conf)
         st.data["balancer_sig"] = _pool_sig(servers)
+        st.data["balancer_ru"] = bool(ru_direct_enabled(cfg))
         st.data["balancer_gap_ms"] = gap_ms
         st.save()
     finally:
@@ -1696,38 +1697,54 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10,
     # Работающее ядро наше и конфиг на диске — тот, что мы записали:
     # только тогда его можно считать «своим» и не трогать.
     same_running = bool(live and owned_sha and owned_sha == live_sha)
-    if live and link:
-        if st.data.get("balancer_sig") == sig and same_running:
-            lg.info("ensure_balancer: состав пула не изменился — перезапуска нет")
+
+    # КОРЕНЬ. ЖЕЛАЕМЫЙ конфиг собираем ДО решения «перезапускать или нет».
+    # Раньше решение опиралось на отпечаток ОДНОГО ПУЛА (_pool_sig), который не
+    # учитывает НАСТРОЙКИ: включение watch.ru_direct не меняло отпечаток, и
+    # функция выходила по «состав пула не изменился» — настройка молча не
+    # применялась до следующей смены состава пула. Теперь сравниваем сам
+    # конфиг (он включает маршрутизацию, DNS, порты, outbound'ы).
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    listen = cfg.get("client", {}).get("listen", "127.0.0.1")
+    tport = int(client.get("torrent_port",
+                           cfg.get("client", {}).get("torrent_port",
+                                                     DEFAULT_TORRENT_PORT)))
+    want_ru = ru_direct_enabled(cfg)
+    conf = build_balancer_config(pool, port, listen=listen, ru_direct=want_ru,
+                                 torrent_port=tport)
+    if conf is None:
+        lg.warn("ensure_balancer: пул пуст после сборки outbound'ов")
+        return bool(link)
+    cand_sha = _conf_sha(conf)
+    if live and link and same_running:
+        if cand_sha == live_sha:
+            lg.info("ensure_balancer: конфиг совпадает с работающим — перезапуска нет")
+            st.data["balancer_sig"] = sig
+            st.data["balancer_cfg_sha"] = cand_sha
+            st.data["balancer_ru"] = bool(want_ru)
+            st.data["balancer_n"] = len(pool)
+            st.save()
             return True
         age = time.time() - float(st.data.get("balancer_ts", 0) or 0)
         freeze_s = float(cfg.get("watch", {}).get("pool_freeze_s", 10800))
-        # force=True (кнопка «Пересобрать» в трее) — явный запрос: заморозку
-        # не удерживаем. Плановые вызовы force не передают.
-        if same_running and st.data.get("balancer_sig") and age < freeze_s and not force:
-            if st.data.get("balancer_sig") != sig:
-                lg.info("ensure_balancer: состав пула изменился, но ядро работает — "
-                        f"пул заморожен ещё на {int((freeze_s - age) / 60)} мин "
-                        "(перезапуска нет)")
+        pool_changed = st.data.get("balancer_sig") != sig
+        # Заморозка нужна ТОЛЬКО против перестановки узлов (чтобы не рвать связь
+        # ради смены состава). Смена НАСТРОЙКИ маршрутизации должна применяться
+        # сразу, не дожидаясь цикла обновления пула.
+        if pool_changed and st.data.get("balancer_sig") and age < freeze_s and not force:
+            lg.info("ensure_balancer: состав пула изменился, но ядро работает — "
+                    f"пул заморожен ещё на {int((freeze_s - age) / 60)} мин "
+                    "(перезапуска нет)")
             return True
+        if not pool_changed:
+            lg.info("ensure_balancer: изменилась настройка маршрутизации (РФ→напрямую) "
+                    "— перегенерирую конфиг ядра и перезапускаю ядро сейчас")
     if not _lock(cfg, "balancer", ttl=240, wait=8):
         lg.warn("ensure_balancer: другое управление ядром уже идёт — пропускаю цикл")
         return True
     restarted = False
     rtt_restart = 0.0
     try:
-        port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
-        listen = cfg.get("client", {}).get("listen", "127.0.0.1")
-        tport = int(client.get("torrent_port",
-                               cfg.get("client", {}).get("torrent_port",
-                                                         DEFAULT_TORRENT_PORT)))
-        conf = build_balancer_config(pool, port, listen=listen,
-                                     ru_direct=ru_direct_enabled(cfg),
-                                     torrent_port=tport)
-        if conf is None:
-            lg.warn("ensure_balancer: пул пуст после сборки outbound'ов")
-            return bool(link)
-        cand_sha = _conf_sha(conf)
         # (а) НОВЫЙ конфиг проверяется ядром ДО остановки рабочего ядра:
         # мёртвый конфиг не должен уносить связь.
         ok_v, err_v = _validate_new_config(client["core"], conf, cfg)
@@ -1740,6 +1757,7 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10,
                     "перезапуска нет")
             st.data["balancer_sig"] = sig
             st.data["balancer_cfg_sha"] = cand_sha
+            st.data["balancer_ru"] = bool(want_ru)
             st.data["balancer_n"] = len(pool)
             st.save()
             return True
@@ -1752,6 +1770,7 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10,
             return False
         restarted, rtt_restart = True, rtt_r
         st.data["balancer_cfg_sha"] = cand_sha
+        st.data["balancer_ru"] = bool(want_ru)
         st.data["balancer_gap_ms"] = gap_ms
         st.save()
     finally:
@@ -1766,6 +1785,7 @@ def ensure_balancer(client: dict, cfg: dict, n: int = 10,
     if ok:
         st.data["balancer_sig"] = sig
         st.data["balancer_n"] = len(pool)
+        st.data["balancer_ru"] = bool(want_ru)
         st.data["balancer_ts"] = time.time()
         st.data["emergency_ts"] = 0
         st.save()

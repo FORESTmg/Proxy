@@ -24,11 +24,45 @@ for process/port queries on Windows.
 | `sources.py` | Subscription sources: GitHub search for fresh repos, freshness by content sha1, fixed-URL refresh, source bodies cached to disk. |
 | `xraytest.py` | Candidate testing through throwaway Xray instances: RTT, TCP pre-filter, speed test, YouTube probe, final verify, plus cleanup of orphaned test cores. |
 | `netfilters.py` | Subnet-diversity selection. |
-| `tray.py` | The tray consumer thread. The visual icon is not implemented yet; the thread consumes the status channel and logs state changes. |
-| `tray_status.py` | The status channel (`state/tray_status.json`): one atomic state + current process description for a future tray icon. |
+| `tray.py` | The tray. **Primary path**: the built-in icon — a layered window (`UpdateLayeredWindow`), a menu with submenus (`tray_menu.py`), state colour inside the user's `app.ico` (`tray_icon.py`). While the Qt helper (`forest-ui`) is alive, this thread waits **in reserve** and takes the interface over if the helper stops. |
+| `tray_icon.py` | The icon itself: reads `app.ico` (own `ICO`/PNG decoder — no Pillow), paints the state colour **inside** the drawing, produces `.ico` data for four states and `HICON` handles for WinAPI. |
+| `tray_menu.py` | Menu semantics with no Win32: commands, state, filters, supervision, notifications, theme; writes `config.json` atomically. Also the **only** place that performs a command — the Qt helper's clicks land here too. |
+| `tray_status.py` | The status channel (`state/tray_status.json`): one atomic state + current process description; the source of the icon colour for both the built-in tray and the helper. |
+| `notify.py` | Windows notifications (the fallback path): a layered window drawn with one `UpdateLayeredWindow` per frame, a **high-resolution waitable timer** with an absolute frame timeline (60 fps, no drift), never takes focus. On Linux it sends `org.freedesktop.Notifications` via `gdbus`, then `notify-send`. |
+| `theme.py` | One source of truth for the light/dark palettes (notification card, tray icon, menu QSS), automatic detection (Windows registry / `gsettings`) and `contrast()`/`state_contrasts()` WCAG checks. |
+| `watchdog.py` | Autonomous supervision: the singleton marker, detached relaunch, Task Scheduler XML (logon trigger + repetition), `apply_watchdog`/`delete_task`, `--watchdog on\|off\|status`. |
+| `ui_cmd.py` | The command bridge between the helper and the program: `state/ui_cmd.json` in, `state/ui_cmd_result.json` out. The supervisor performs each command through `tray_menu` — the helper never touches the core. |
+| `ui_helper.py` | Lifecycle of the helper process: locate `forest-ui(.exe)`, detached launch, heartbeat check (`state/ui_helper.json` + a live pid), stop, `ensure()`; used by `--install`, `--ensure` and the supervisor. |
+| `forest_ui.py` | The helper itself (Qt/PySide6): `QSystemTrayIcon`, `QMenu` with submenus, QSS from our palette, **notification card** (`QPropertyAnimation` slide + fade, 60 fps, never takes focus), the same visuals as the built-in icon, `--selftest`/`--menu-dump`/`--show` for evidence. On Linux notifications go through the system service. |
 | `i18n.py` | Minimal Russian/English string table and language selection. |
 | `log.py` | Logger: UTF-8 file plus a console-safe writer; picks a writable log directory. |
 | `selftest.py` | The self-test suite (`--selftest`): API surface, store round-trip, config generation, mode dispatcher, i18n, first-run config, core discovery. Network-free, touches no system proxy, occupies no real ports. |
+
+## The interface: two processes, one owner of the core
+
+```
+ForestProxyUpdater.exe  (supervisor)                forest-ui.exe  (Qt helper)
+  watch/guard/update threads                          tray icon (colour = state)
+  tray thread ── in reserve while the helper lives     menu with submenus
+  reads  state/ui_cmd.json  ──────────────────────►    writes state/ui_cmd.json
+  applies it via tray_menu.py                          reads  state/tray_status.json
+  writes state/ui_cmd_result.json ◄────────────────     writes state/ui_helper.json (heartbeat)
+  writes state/tray_status.json                        notifications (card / D-Bus)
+```
+
+* The helper is a **separate program** (Qt/PySide6, LGPL-3.0) so the main program
+  stays small and dependency-free. It **never touches the core**.
+* A click in the Qt menu becomes a command record in `state/ui_cmd.json`; the
+  supervisor consumes it (`ui_cmd.consume`) and performs it with exactly the same
+  functions the built-in menu uses (`tray_menu.TrayActions`). The result goes to
+  `state/ui_cmd_result.json` and is shown to the user as a notification.
+* State flows the other way through `state/tray_status.json` (written by the
+  watchdog) — that is where the icon colour and the tooltip come from, for both
+  interfaces.
+* Who owns the interface is decided at runtime: if the helper is alive, the
+  built-in tray thread waits in reserve (no second icon, no duplicate
+  notifications); if the helper stops, the built-in icon takes over within
+  seconds. No helper at all — everything falls back to `tray.py` + `notify.py`.
 
 ## Threads
 

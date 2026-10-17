@@ -68,9 +68,9 @@ if _missing:
 # posix_selftest внутри функций) — перечисляем явно.
 HIDDEN = [
     "clientwrite", "clientwrite_posix", "clientwrite_v2rayn",
-    "config", "i18n", "log", "netfilters", "parser", "selftest",
-    "sources", "tray", "tray_check", "tray_icon", "tray_menu",
-    "tray_status", "v2ray_updater", "watch", "xraytest",
+    "config", "i18n", "log", "netfilters", "notify", "parser", "selftest",
+    "sources", "theme", "tray", "tray_check", "tray_icon", "tray_menu",
+    "tray_status", "v2ray_updater", "watch", "watchdog", "xraytest",
     "posix_platform", "posix_selftest",
 ]
 
