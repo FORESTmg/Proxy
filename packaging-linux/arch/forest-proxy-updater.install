@@ -1,0 +1,42 @@
+# FOREST's Proxy Auto-updater — install-скрипт pacman (Arch Linux).
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Ставит/снимает системную службу. Каталог состояния (/var/lib/forest-proxy-updater)
+# нужен и вне systemd — при ручном запуске программы.
+
+post_install() {
+  mkdir -p /var/lib/forest-proxy-updater
+  chmod 0755 /var/lib/forest-proxy-updater
+  if [ -d /run/systemd/system ]; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now forest-proxy-updater.service >/dev/null 2>&1; then
+      echo "forest-proxy-updater: служба включена и запущена"
+    else
+      echo "forest-proxy-updater: службу запустить не удалось, смотрите:"
+      echo "  journalctl -u forest-proxy-updater.service -n 50 --no-pager"
+    fi
+  else
+    echo "forest-proxy-updater: systemd не используется — автозапуск не настроен."
+    echo "  Ручной запуск: forest-proxy-updater --run"
+  fi
+  echo "forest-proxy-updater: программа даёт доступ ко всем сайтам, включая заблокированные."
+  echo "  Ответственность за соблюдение законов своей юрисдикции лежит на пользователе."
+  echo "  Условия использования: /usr/share/doc/forest-proxy-updater/TERMS.ru.md (English: TERMS.md)."
+}
+
+post_upgrade() {
+  post_install "$@"
+}
+
+pre_remove() {
+  if [ -d /run/systemd/system ]; then
+    systemctl disable --now forest-proxy-updater.service >/dev/null 2>&1 || true
+    systemctl disable --now forest-proxy-updater.timer   >/dev/null 2>&1 || true
+  fi
+}
+
+post_remove() {
+  [ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1 || true
+  rm -rf /var/lib/forest-proxy-updater
+}

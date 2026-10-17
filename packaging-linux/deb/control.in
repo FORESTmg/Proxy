@@ -1,0 +1,27 @@
+Package: forest-proxy-updater
+Version: @VERSION@
+Section: net
+Priority: optional
+Architecture: amd64
+Maintainer: @MAINT@
+Installed-Size: @INSTALLED_SIZE@
+Depends: curl
+Homepage: @HOMEPAGE@
+Description: FOREST's Proxy Auto-updater — автообновляемый прокси на ядре Xray
+ Программа сама скачивает публичные списки прокси-серверов, проверяет их
+ (TCP-предфильтр, RTT, скорость, финальная проверка), поднимает ядро Xray на
+ локальном SOCKS5-порту (по умолчанию 127.0.0.1:10808) и следит за связью:
+ упавший сервер заменяется автоматически, пул серверов обновляется по
+ расписанию.
+ .
+ Ядро Xray и гео-базы (geoip.dat, geosite.dat) ВШИТЫ в бинарник: ничего
+ докладывать не нужно, Python не требуется. Пакет ставит системную службу
+ systemd (forest-proxy-updater.service), которая поднимается при загрузке без
+ входа в систему и без loginctl enable-linger.
+ .
+ Конфиг: /etc/forest-proxy-updater/config.json, состояние и логи:
+ /var/lib/forest-proxy-updater, документация: /usr/share/doc/forest-proxy-updater.
+ Проверка после установки:
+ curl -x http://127.0.0.1:10808 -o /dev/null -w '%{http_code}\n'
+ https://www.gstatic.com/generate_204
+ (ожидается 204; первые минуты уходят на подбор рабочих серверов).

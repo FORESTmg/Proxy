@@ -1,0 +1,25 @@
+#!/bin/sh
+# FOREST's Proxy Auto-updater — postrm (Debian/Ubuntu)
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# После удаления: перечитать юниты (юнит-файлы уже удалены dpkg) и на purge
+# убрать каталог состояния — иначе каталог остаётся «следом» установки.
+set -e
+
+APP=forest-proxy-updater
+STATE=/var/lib/$APP
+
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+fi
+
+case "$1" in
+    purge|remove)
+        # на remove конфиг /etc сохраняется как conffile ровно так, как решает
+        # dpkg; состояние (кэши, логи, pid-файлы) не нужно ни в одном случае
+        rm -rf "$STATE"
+        ;;
+esac
+
+exit 0

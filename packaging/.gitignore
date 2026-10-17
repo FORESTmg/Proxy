@@ -10,6 +10,12 @@ dist/
 # его детерминированно качает `python fetch_core.py` (пин — core.lock.json)
 vendor/
 
+# то же для Linux-сборки: ядро Xray-linux-64 (~63 МиБ) качает
+# `python3 fetch_core_linux.py` (пин — core.lock.linux.json)
+vendor-linux/
+.build-venv-linux/
+build-linux/
+
 # предпросмотры иконки
 icon_preview_*.png
 

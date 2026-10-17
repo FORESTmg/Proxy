@@ -1,0 +1,82 @@
+# Maintainer: FOREST <forest@example.invalid>
+# FOREST's Proxy Auto-updater — PKGBUILD для Arch Linux / Manjaro / EndeavourOS.
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Собирается не из сети: `source` — ЛОКАЛЬНЫЕ файлы, которые рядом с этим
+# PKGBUILD раскладывает `packaging-linux/build-arch.sh` (готовый ELF со вшитым
+# ядром Xray, отрендеренные юниты systemd, конфиг по умолчанию, документация).
+# Тот же набор файлов попадает и в готовый .pkg.tar.zst, поэтому содержимое
+# пакетов .deb / .rpm / Arch не может разъехаться.
+#
+#   cd packaging-linux/arch
+#   makepkg -si          # никогда от root: makepkg это запрещает
+#
+# Контрольные суммы: в репозитории они 'SKIP' (файлы — локальные артефакты
+# сборки, их хеши меняются от релиза к релизу). build-arch.sh дописывает в конец
+# рабочей копии PKGBUILD реальные хеши (`makepkg -g`); ручную сборку можно вести
+# и без них: makepkg -g >> PKGBUILD.
+
+pkgname=forest-proxy-updater
+pkgver=1.0.1
+pkgrel=1
+pkgdesc="Auto-updating proxy supervisor built on top of the Xray core (core and geo bases bundled)"
+arch=('x86_64')
+url="https://github.com/Forest-Proxy/forest-proxy-updater"
+license=('GPL-3.0-only')
+depends=('curl')
+install=forest-proxy-updater.install
+options=('!strip' '!emptydirs' '!debug')
+
+# /etc/.../config.json намеренно НЕ в backup=(): пакет всегда приносит рабочий
+# конфиг по умолчанию, а .pacsave после удаления был бы мусором. Пользовательские
+# правки имеет смысл хранить копией рядом (config.json.local).
+
+source=('forest-proxy-updater'
+        'forest-proxy-updater.service'
+        'forest-proxy-updater-refresh.service'
+        'forest-proxy-updater.timer'
+        'config.json'
+        'README.md'
+        'INSTALL.md'
+        'INSTALL.ru.md'
+        'PACKAGE-README.md'
+        'copyright'
+        'COPYING'
+        'TERMS.md'
+        'TERMS.ru.md'
+        'forest-proxy-updater.install')
+
+sha256sums=('SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
+            'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP' 'SKIP'
+            'SKIP' 'SKIP')
+
+package() {
+  # Программа: PyInstaller-onefile ELF, ядро xray и гео-базы внутри.
+  install -Dm755 "$srcdir/forest-proxy-updater" \
+      "$pkgdir/usr/lib/$pkgname/$pkgname"
+  install -d "$pkgdir/usr/bin"
+  ln -sf "/usr/lib/$pkgname/$pkgname" "$pkgdir/usr/bin/$pkgname"
+
+  # Системная служба (не systemd --user): работает без входа в систему.
+  install -Dm644 "$srcdir/forest-proxy-updater.service" \
+      "$pkgdir/usr/lib/systemd/system/forest-proxy-updater.service"
+  install -Dm644 "$srcdir/forest-proxy-updater-refresh.service" \
+      "$pkgdir/usr/lib/systemd/system/forest-proxy-updater-refresh.service"
+  install -Dm644 "$srcdir/forest-proxy-updater.timer" \
+      "$pkgdir/usr/lib/systemd/system/forest-proxy-updater.timer"
+
+  # Конфиг по умолчанию
+  install -Dm644 "$srcdir/config.json" \
+      "$pkgdir/etc/$pkgname/config.json"
+
+  # Документация и лицензия
+  install -Dm644 "$srcdir/README.md" "$pkgdir/usr/share/doc/$pkgname/README.md"
+  install -Dm644 "$srcdir/INSTALL.md" "$pkgdir/usr/share/doc/$pkgname/INSTALL.md"
+  install -Dm644 "$srcdir/INSTALL.ru.md" "$pkgdir/usr/share/doc/$pkgname/INSTALL.ru.md"
+  install -Dm644 "$srcdir/PACKAGE-README.md" "$pkgdir/usr/share/doc/$pkgname/PACKAGE-README.md"
+  install -Dm644 "$srcdir/copyright" "$pkgdir/usr/share/doc/$pkgname/copyright"
+  install -Dm644 "$srcdir/TERMS.md" "$pkgdir/usr/share/doc/$pkgname/TERMS.md"
+  install -Dm644 "$srcdir/TERMS.ru.md" "$pkgdir/usr/share/doc/$pkgname/TERMS.ru.md"
+  install -Dm644 "$srcdir/COPYING" "$pkgdir/usr/share/licenses/$pkgname/COPYING"
+}

@@ -17,8 +17,10 @@ i18n, первый запуск конфига, поиск ядра. Систе�
 from __future__ import annotations
 
 import os
+import shutil
 import sys
 import tempfile
+import time
 
 _TMP = tempfile.mkdtemp(prefix="forest_selftest_")
 os.environ["FOREST_ROOT"] = _TMP          # не трогаем реальный %LOCALAPPDATA%
@@ -26,7 +28,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import json  # noqa: E402
 
-import clientwrite as CW  # noqa: E402
+# POSIX: проверяем POSIX-бэкенд, иначе тесты не покрывали бы то, чем реально
+# работает Linux-версия.
+if os.name == "nt":
+    import clientwrite as CW  # noqa: E402
+else:
+    import clientwrite_posix as CW  # noqa: E402
 import config as CFG  # noqa: E402
 import i18n  # noqa: E402
 import log  # noqa: E402
@@ -214,7 +221,12 @@ def main() -> int:
     print("=" * 64)
     print("7. Диспетчер режимов (standalone / v2rayn)")
     print("=" * 64)
-    check("_mode_of по client.mode=v2rayn", CW._mode_of({"mode": "v2rayn"}) == "v2rayn")
+    if os.name == "nt":
+        check("_mode_of по client.mode=v2rayn", CW._mode_of({"mode": "v2rayn"}) == "v2rayn")
+    else:
+        # На Linux v2rayN неприменим — диспетчер принудительно уходит в standalone
+        check("_mode_of на POSIX всегда standalone",
+              CW._mode_of({"mode": "v2rayn"}) == "standalone")
     check("_mode_of по cfg.client.mode=standalone",
           CW._mode_of(None, {"client": {"mode": "standalone"}}) == "standalone")
     check("_mode_of по умолчанию standalone", CW._mode_of({}) == "standalone")
@@ -260,7 +272,8 @@ def main() -> int:
     check("find_core берёт явный путь из конфига",
           CFG.find_core({"client": {"core": dummy}}) == dummy)
     check("find_client standalone отдаёт стор и конфиг",
-          "servers.json" in CFG.find_client({"client": {"mode": "standalone"},
+          "servers.json" in CFG.find_client({"client": {"mode": "standalone",
+                                                        "core": dummy},
                                              "paths": cfg2["paths"]})["db"])
     sig1 = CW._pool_sig(pool)
     check("_pool_sig стабилен", sig1 == CW._pool_sig(pool))
@@ -354,6 +367,96 @@ def main() -> int:
     check("после merge-записи чтение видит оба ключа",
           st_c.data.get("k_from_b") == 2 and st_c.data.get("k_from_a") == 1)
 
+    print()
+    print("=" * 64)
+    print("13. Постоянная копия ядра (вне временного _MEI) и уборка распаковок")
+    print("=" * 64)
+    # Ядро, запущенное из каталога распаковки onefile (_MEIPASS), переживает
+    # выход программы, файл занят — уборщик PyInstaller не может снести каталог
+    # (модальное окно). Поэтому ядро и гео-базы обязаны уезжать в ПОСТОЯННЫЙ
+    # каталог. Здесь бандл подделывается: sys._MEIPASS -> _TMP/bundle.
+    bin_name = CFG.core_binary_names()[0]
+    check("core_dir под FOREST_ROOT: <root>/bin/xray",
+          os.path.normcase(CFG.core_dir()) ==
+          os.path.normcase(os.path.join(_TMP, "bin", "xray")), CFG.core_dir())
+    bundle_root = os.path.join(_TMP, "bundle")
+    b_core = os.path.join(bundle_root, "bin", "xray")
+    os.makedirs(b_core, exist_ok=True)
+    payload = {bin_name: b"FAKE-CORE-v1" * 10, "geoip.dat": b"GEOIP-v1" * 5,
+               "geosite.dat": b"GEOSITE-v1" * 5, "LICENSE": b"GPLv3"}
+    for n, body in payload.items():
+        with open(os.path.join(b_core, n), "wb") as f:
+            f.write(body)
+    had_meipass = hasattr(sys, "_MEIPASS")
+    old_meipass = getattr(sys, "_MEIPASS", None)
+    sys._MEIPASS = bundle_root
+    try:
+        check("bundle_core_dir видит bin/xray бандла",
+              os.path.normcase(os.path.abspath(CFG.bundle_core_dir())) ==
+              os.path.normcase(os.path.abspath(b_core)), CFG.bundle_core_dir())
+        got = CFG.ensure_core_installed(force=True)
+        want_core = os.path.join(CFG.core_dir(), bin_name)
+        check("ensure_core_installed вернул постоянный путь",
+              os.path.normcase(got) == os.path.normcase(want_core), str(got))
+        same = all(os.path.isfile(os.path.join(CFG.core_dir(), n)) and
+                   os.path.getsize(os.path.join(CFG.core_dir(), n)) == len(payload[n])
+                   for n in payload)
+        check("ядро + обе гео-базы + LICENSE на месте, размеры совпали", same)
+        h_src = CFG._sha256_file(os.path.join(b_core, bin_name))
+        h_dst = CFG._sha256_file(want_core)
+        check("sha256 ядра совпал (копия побитово та же)", h_src == h_dst)
+        if os.name != "nt":
+            check("на копии выставлен бит исполняемости",
+                  os.access(want_core, os.X_OK))
+        # второй запуск: содержимое то же -> файл НЕ переписывается
+        mt1 = os.stat(want_core).st_mtime_ns
+        time.sleep(0.02)
+        CFG.ensure_core_installed(force=False)
+        check("без изменений в бандле копия не переписывается",
+              os.stat(want_core).st_mtime_ns == mt1)
+        # обновили бандл (размер другой) -> копия обновляется сама
+        with open(os.path.join(b_core, bin_name), "wb") as f:
+            f.write(b"FAKE-CORE-v2-LONGER" * 20)
+        CFG.ensure_core_installed(force=False)
+        check("новая версия в бандле доехала в постоянный каталог",
+              CFG._sha256_file(want_core) ==
+              CFG._sha256_file(os.path.join(b_core, bin_name)))
+        # ГЛАВНОЕ: find_core выбирает постоянную копию, а НЕ путь в _MEIPASS
+        fc = CFG.find_core({"client": {}})
+        check("find_core отдаёт путь вне _MEIPASS",
+              bool(fc) and os.path.normcase(os.path.abspath(fc)).startswith(
+                  os.path.normcase(os.path.abspath(CFG.core_dir()))), str(fc))
+        check("find_core не вернул каталог распаковки",
+              not (fc and os.path.normcase(os.path.abspath(fc)).startswith(
+                  os.path.normcase(os.path.abspath(bundle_root)))), str(fc))
+    finally:
+        if had_meipass:
+            sys._MEIPASS = old_meipass
+        else:
+            try:
+                delattr(sys, "_MEIPASS")
+            except AttributeError:
+                pass
+        shutil.rmtree(bundle_root, ignore_errors=True)
+    # относительный client.core в конфиге больше не обязателен, но поддержан
+    rel = CFG.find_core({"client": {"core": os.path.join("bin", "xray", bin_name)}})
+    check("относительный client.core разрешается от каталога данных",
+          bool(rel) and os.path.normcase(os.path.abspath(rel)) ==
+          os.path.normcase(os.path.join(CFG.core_dir(), bin_name)), str(rel))
+    # уборка своих старых распаковок _MEI*: своя удаляется, чужая — нет
+    mei_root = os.path.join(_TMP, "mei_scan")
+    ours = os.path.join(mei_root, "_MEI_ours_selftest")
+    foreign = os.path.join(mei_root, "_MEI_foreign_selftest")
+    os.makedirs(os.path.join(ours, "bin", "xray"))
+    os.makedirs(os.path.join(foreign, "bin", "other"))
+    with open(os.path.join(ours, "bin", "xray", bin_name), "wb") as f:
+        f.write(b"core")
+    with open(os.path.join(foreign, "bin", "other", "x"), "wb") as f:
+        f.write(b"x")
+    r = CFG.cleanup_stale_bundles(max_age_s=0, tmp_dir=mei_root)
+    check("наша старая распаковка _MEI удалена", not os.path.isdir(ours), str(r))
+    check("чужая распаковка _MEI не тронута", os.path.isdir(foreign), str(r))
+    shutil.rmtree(mei_root, ignore_errors=True)
     print()
     print("=" * 64)
     if FAILED:

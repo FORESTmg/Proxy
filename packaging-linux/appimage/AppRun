@@ -1,0 +1,25 @@
+#!/bin/sh
+# FOREST's Proxy Auto-updater — AppRun
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Точка входа AppImage. Ничего не решает сама: передаёт все аргументы
+# единственному бинарнику внутри AppDir (он самодостаточный ELF: Python, ядро
+# xray и гео-базы внутри).
+#
+#   ./ForestProxyUpdater-x86_64.AppImage --install   # юниты systemd --user
+#   ./ForestProxyUpdater-x86_64.AppImage --run       # запуск без установки
+#   ./ForestProxyUpdater-x86_64.AppImage --selftest  # автотесты
+#
+# В окружении без FUSE (WSL, контейнеры) запускайте с --appimage-extract-and-run.
+set -eu
+
+HERE=$(cd "$(dirname "$0")" && pwd)
+BIN="$HERE/usr/bin/forest-proxy-updater"
+
+if [ ! -x "$BIN" ]; then
+    echo "AppRun: не найден $BIN — повреждён AppImage" >&2
+    exit 127
+fi
+
+exec "$BIN" "$@"

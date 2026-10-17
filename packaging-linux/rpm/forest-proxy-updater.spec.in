@@ -1,0 +1,108 @@
+# FOREST's Proxy Auto-updater — спецификация RPM (Fedora / RHEL / Rocky / Alma / openSUSE)
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Собирается скриптом packaging-linux/build-rpm.sh: он кладёт готовое дерево
+# файлов в каталог источников rpmbuild (SOURCE/payload) — раскладку задаёт
+# packaging-linux/lib/common.sh, одна на все форматы. Здесь только упаковка и
+# скрипты rpm.
+#
+# Почему отключена автоматическая пост-обработка install (brp-strip и debuginfo):
+# полезная нагрузка — уже собранный PyInstaller-onefile ELF, полосовать его не
+# нужно и рискованно (можно испортить однофайловый архив).
+
+%global __os_install_post %{nil}
+%global debug_package %{nil}
+
+Name:           forest-proxy-updater
+Version:        @VERSION@
+Release:        @RELEASE@
+Summary:        @SUMMARY@
+License:        GPL-3.0-only
+URL:            @HOMEPAGE@
+BuildArch:      x86_64
+Requires:       curl
+
+%description
+Программа сама скачивает публичные списки прокси-серверов, проверяет их
+(TCP-предфильтр, RTT, скорость, финальная проверка), поднимает ядро Xray на
+локальном SOCKS5-порту (по умолчанию 127.0.0.1:10808) и следит за связью:
+упавший сервер заменяется автоматически, пул обновляется по расписанию.
+
+Ядро Xray и гео-базы (geoip.dat, geosite.dat) ВШИТЫ в бинарник: докладывать
+ничего не нужно, Python не требуется. Пакет ставит системную службу systemd
+(forest-proxy-updater.service), которая поднимается при загрузке без входа в
+систему и без loginctl enable-linger.
+
+Конфиг: /etc/forest-proxy-updater/config.json, состояние и логи:
+/var/lib/forest-proxy-updater, документация: /usr/share/doc/forest-proxy-updater.
+
+%prep
+
+%build
+
+%install
+rm -rf %{buildroot}
+mkdir -p %{buildroot}
+cp -a %{_sourcedir}/payload/. %{buildroot}/
+
+%files
+# Каталоги объявлены явно (%dir): без этого rpm не считает их своими и
+# оставляет пустые каталоги после удаления пакета.
+%dir /usr/lib/forest-proxy-updater
+%dir /etc/forest-proxy-updater
+%dir /usr/share/doc/forest-proxy-updater
+%dir /usr/share/licenses/forest-proxy-updater
+/usr/lib/forest-proxy-updater/forest-proxy-updater
+/usr/bin/forest-proxy-updater
+/usr/lib/systemd/system/forest-proxy-updater.service
+/usr/lib/systemd/system/forest-proxy-updater-refresh.service
+/usr/lib/systemd/system/forest-proxy-updater.timer
+%config(noreplace) /etc/forest-proxy-updater/config.json
+/usr/share/doc/forest-proxy-updater/README.md
+/usr/share/doc/forest-proxy-updater/INSTALL.md
+/usr/share/doc/forest-proxy-updater/INSTALL.ru.md
+/usr/share/doc/forest-proxy-updater/TERMS.md
+/usr/share/doc/forest-proxy-updater/TERMS.ru.md
+/usr/share/doc/forest-proxy-updater/PACKAGE-README.md
+/usr/share/doc/forest-proxy-updater/copyright
+/usr/share/doc/forest-proxy-updater/COPYING
+/usr/share/licenses/forest-proxy-updater/COPYING
+
+%post
+# Каталог состояния нужен и вне systemd (ручные запуски).
+mkdir -p /var/lib/forest-proxy-updater
+chmod 0755 /var/lib/forest-proxy-updater
+if [ -d /run/systemd/system ]; then
+  systemctl daemon-reload >/dev/null 2>&1 || true
+  if systemctl enable --now forest-proxy-updater.service >/dev/null 2>&1; then
+    echo "forest-proxy-updater: служба включена и запущена"
+  else
+    echo "forest-proxy-updater: службу запустить не удалось, смотрите:"
+    echo "  journalctl -u forest-proxy-updater.service -n 50 --no-pager"
+  fi
+else
+  echo "forest-proxy-updater: systemd не используется — автозапуск не настроен."
+fi
+echo "forest-proxy-updater: программа даёт доступ ко всем сайтам, включая заблокированные."
+echo "  Ответственность за соблюдение законов своей юрисдикции лежит на пользователе."
+echo "  Условия использования: /usr/share/doc/forest-proxy-updater/TERMS.ru.md (English: TERMS.md)."
+
+%preun
+if [ "$1" = "0" ]; then
+  if [ -d /run/systemd/system ]; then
+    systemctl disable --now forest-proxy-updater.service >/dev/null 2>&1 || true
+    systemctl disable --now forest-proxy-updater.timer   >/dev/null 2>&1 || true
+  fi
+fi
+
+%postun
+[ -d /run/systemd/system ] && systemctl daemon-reload >/dev/null 2>&1 || true
+if [ "$1" = "0" ]; then
+  rm -rf /var/lib/forest-proxy-updater
+fi
+
+%changelog
+* Sat Oct 17 2026 FOREST <forest@example.invalid> - @VERSION@-@RELEASE@
+- Первый релиз Linux-пакетов: самодостаточный ELF (ядро и гео-базы внутри),
+  системная служба systemd, таймер планового обновления пула.

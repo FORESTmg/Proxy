@@ -61,9 +61,139 @@ CORE_LOG_NAME = "forest_xray.log"
 
 RU_DIRECT_DOMAINS = ["geosite:category-ru", "geosite:tld-ru",
                      "geosite:category-gov-ru", "geosite:category-bank-ru",
-                     "geosite:category-medicine-ru", "geosite:private"]
+                     # ВНИМАНИЕ: использовать только категории, реально присутствующие во вшитом
+                     # geosite.dat. Проверено ядром: category-gov-ru / category-bank-ru / tld-ru /
+                     # category-ru / private — есть; category-medicine-ru — ОТСУТСТВУЕТ, из-за неё
+                     # ядро отвергало весь конфиг (проверять новые категории через `xray run -test`).
+                     "geosite:private"]
 RU_DIRECT_IPS = ["geoip:ru", "geoip:private"]
 LOCAL_DIRECT_DOMAINS = ["full:retracker.local", "domain:local"]
+
+# «РФ — напрямую»: список выше проверяется по реальному содержимому geosite.dat
+# (см. ru_direct_domains()). Одна несуществующая категория в этом списке валит
+# ВЕСЬ конфиг ядра ("failed to build routing configuration > invalid field rule
+# > failed to parse domain"), и пул не применяется вообще — поэтому неизвестные
+# категории отбрасываются заранее, с предупреждением в лог. Кэш на процесс.
+_RU_DOMAINS_EFFECTIVE = None
+
+
+def _read_varint(buf: bytes, pos: int) -> tuple:
+    """(значение, новая позиция) для protobuf-varint."""
+    shift = 0
+    val = 0
+    while pos < len(buf):
+        b = buf[pos]
+        pos += 1
+        val |= (b & 0x7F) << shift
+        if not (b & 0x80):
+            return val, pos
+        shift += 7
+        if shift > 63:
+            break
+    raise ValueError("bad varint")
+
+
+def geosite_category_names(path: str) -> set:
+    """Имена категорий внутри geosite.dat (минимальный разбор protobuf).
+
+    Формат — обычный protobuf:
+        GeoSiteList { repeated GeoSite entry = 1; }
+        GeoSite     { string country_code = 1; repeated Domain domain = 2; }
+    Полноценный парсер не нужен: идём по length-delimited полям верхнего уровня
+    и читаем в каждом первую строку — это и есть имя категории.
+    """
+    names = set()
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except Exception:
+        return names
+    i, n = 0, len(data)
+    while i < n:
+        try:
+            key, i = _read_varint(data, i)
+        except Exception:
+            break
+        field, wire = key >> 3, key & 7
+        if wire != 2:                      # не length-delimited — дальше не идём
+            break
+        try:
+            ln, i = _read_varint(data, i)
+        except Exception:
+            break
+        chunk = data[i:i + ln]
+        i += ln
+        if field == 1 and chunk:
+            try:
+                k2, p2 = _read_varint(chunk, 0)
+                if (k2 >> 3) == 1 and (k2 & 7) == 2:
+                    l2, p2 = _read_varint(chunk, p2)
+                    names.add(chunk[p2:p2 + l2].decode("utf-8", "replace"))
+            except Exception:
+                pass
+    return names
+
+
+def _geosite_file_candidates() -> list:
+    """Где искать geosite.dat, если каталог гео-баз не передан явно.
+
+    Первым идёт ПОСТОЯННЫЙ каталог ядра (<каталог данных>/bin/xray): ядро и
+    гео-базы копируются туда из бандла (config.ensure_core_installed), и оттуда
+    же запускается ядро. Каталог распаковки onefile (_MEIPASS) — только
+    последняя страховка: читать временный каталог незачем.
+    """
+    out = []
+    env = os.environ.get("XRAY_LOCATION_ASSET")
+    if env:
+        out.append(os.path.join(env, "geosite.dat"))
+    try:
+        import config as CFG
+        out.append(os.path.join(CFG.core_dir(), "geosite.dat"))
+        for base in (getattr(CFG, "PROJECT_DIR", ""),
+                     getattr(CFG, "BASE_DIR", "")):
+            if base:
+                out.append(os.path.join(base, "bin", "xray", "geosite.dat"))
+    except Exception:
+        pass
+    return out
+
+
+def ru_direct_domains(geo_dir: str = "") -> list:
+    """Домены правила «РФ — напрямую», проверенные по вшитому geosite.dat.
+
+    Возвращает только те категории, которые реально есть в файле: остальные
+    отбрасываются с предупреждением. Если geosite.dat прочитать не удалось,
+    список возвращается как есть (тогда конфиг отсечёт проверка ядром).
+    """
+    global _RU_DOMAINS_EFFECTIVE
+    if _RU_DOMAINS_EFFECTIVE is not None:
+        return _RU_DOMAINS_EFFECTIVE
+    path = os.path.join(geo_dir, "geosite.dat") if geo_dir else ""
+    if not path or not os.path.isfile(path):
+        path = ""
+        for cand in _geosite_file_candidates():
+            if os.path.isfile(cand):
+                path = cand
+                break
+    known = {n.upper() for n in geosite_category_names(path)} if path else set()
+    if not known:
+        _RU_DOMAINS_EFFECTIVE = list(RU_DIRECT_DOMAINS)
+        return _RU_DOMAINS_EFFECTIVE
+    out = []
+    for d in RU_DIRECT_DOMAINS:
+        cat = d.split(":", 1)[1] if isinstance(d, str) and d.startswith("geosite:") else ""
+        # имена категорий в geosite.dat — в верхнем регистре, ядро сверяет их
+        # без учёта регистра; сверяем так же
+        if cat and cat.upper() not in known:
+            log.get_logger().warn(
+                "geosite: категории '%s' нет в %s — правило пропущено "
+                "(с ней ядро отвергло бы весь конфиг)" % (cat, path))
+            continue
+        out.append(d)
+    _RU_DOMAINS_EFFECTIVE = out
+    return _RU_DOMAINS_EFFECTIVE
+
+
 REMOVED_OUT_KEYS = {"lowinsecure", "allowinsecure"}
 
 
@@ -444,7 +574,7 @@ def _build_routing(ru_direct: bool) -> dict:
               "balancerTag": "bal"}]
     if ru_direct:
         rules.append({"type": "field", "outboundTag": "direct",
-                      "domain": RU_DIRECT_DOMAINS})
+                      "domain": ru_direct_domains()})
         rules.append({"type": "field", "outboundTag": "direct",
                       "ip": RU_DIRECT_IPS})
     rules.append({"type": "field", "network": "tcp,udp", "balancerTag": "bal"})
@@ -463,9 +593,9 @@ def _build_dns(ru_direct: bool) -> dict:
     return {
         "servers": [
             {"address": "localhost", "domains": LOCAL_DIRECT_DOMAINS},
-            {"address": "77.88.8.8", "domains": RU_DIRECT_DOMAINS,
+            {"address": "77.88.8.8", "domains": ru_direct_domains(),
              "expectIPs": RU_DIRECT_IPS},
-            {"address": "77.88.8.1", "domains": RU_DIRECT_DOMAINS,
+            {"address": "77.88.8.1", "domains": ru_direct_domains(),
              "expectIPs": RU_DIRECT_IPS},
             "1.1.1.1", "8.8.8.8",
         ],
@@ -1414,7 +1544,7 @@ def _routing_single(ru_direct: bool) -> dict:
     rules = [{"type": "field", "outboundTag": "direct", "domain": LOCAL_DIRECT_DOMAINS},
              {"type": "field", "inboundTag": ["torrent-in"], "outboundTag": "proxy"}]
     if ru_direct:
-        rules.append({"type": "field", "outboundTag": "direct", "domain": RU_DIRECT_DOMAINS})
+        rules.append({"type": "field", "outboundTag": "direct", "domain": ru_direct_domains()})
         rules.append({"type": "field", "outboundTag": "direct", "ip": RU_DIRECT_IPS})
     rules.append({"type": "field", "network": "tcp,udp", "outboundTag": "proxy"})
     return {"domainStrategy": "IPIfNonMatch", "rules": rules}

@@ -1,0 +1,95 @@
+# FOREST's Proxy Auto-updater — как устроен этот пакет (Linux)
+
+Короткая шпаргалка для того, кто ставит пакет. Подробно — в `INSTALL.ru.md`
+(русский) и `INSTALL.md` (English) рядом с этим файлом.
+
+## Что уже внутри
+
+Ядро `xray` и гео-базы (`geoip.dat`, `geosite.dat`) **вшиты внутрь бинарника**,
+скачивать и докладывать больше нечего. Python не нужен: программа несёт свой
+интерпретатор. Зависимостей у пакета нет, кроме `curl` для проверок связи.
+
+## Раскладка
+
+| Что | Где |
+| --- | --- |
+| Программа (ELF, ядро и гео-базы внутри) | `/usr/lib/forest-proxy-updater/forest-proxy-updater` |
+| Команда в PATH | `/usr/bin/forest-proxy-updater` (симлинк) |
+| Конфиг | `/etc/forest-proxy-updater/config.json` |
+| Состояние, кэши, сторожевые файлы | `/var/lib/forest-proxy-updater/state/forest-proxy-updater/` |
+| Логи | `/var/lib/forest-proxy-updater/state/forest-proxy-updater/logs/main.log` и journal |
+| Юниты systemd | `/usr/lib/systemd/system/forest-proxy-updater*.{service,timer}` |
+| Лицензия GPL-3.0 | `/usr/share/licenses/forest-proxy-updater/COPYING` |
+| Документация | `/usr/share/doc/forest-proxy-updater/` |
+
+## Служба
+
+Пакет ставит **системную** службу (не `systemctl --user`): она поднимается при
+загрузке независимо от того, вошёл ли кто-то в систему, и не требует
+`loginctl enable-linger`. `postinst` сам делает `systemctl enable --now`.
+
+```sh
+systemctl status  forest-proxy-updater.service
+systemctl restart forest-proxy-updater.service
+journalctl -u forest-proxy-updater -f
+```
+
+Таймер планового обновления пула (`forest-proxy-updater.timer`) ставится, но по
+умолчанию **не** включается: супервизор (`--run`) обновляет пул сам каждые
+`cycle.full_refresh_hours`. Таймер — для тех, кто хочет отдельный расписанный
+прогон `--once`:
+
+```sh
+systemctl enable --now forest-proxy-updater.timer
+```
+
+## Порт
+
+По умолчанию `socks_port = 10808` на `127.0.0.1` (правится в
+`/etc/forest-proxy-updater/config.json`, применяется после
+`systemctl restart forest-proxy-updater`).
+
+## Проверка связи
+
+```sh
+curl -x http://127.0.0.1:10808 -o /dev/null -w '%{http_code}\n' \
+     https://www.gstatic.com/generate_204      # ожидается 204
+```
+
+Первый запуск занимает несколько минут: программа скачивает публичные списки
+серверов, проверяет их и только потом поднимает прокси. До этого момента порт может
+быть закрыт — это нормально.
+
+## Удаление
+
+Пакетным менеджером (`apt purge` / `dnf remove` / `pacman -Rns`) — скрипты
+пакета сами останавливают и снимают службу, делают `daemon-reload` и удаляют
+`/var/lib/forest-proxy-updater`. Либо полностью, вручную, если что-то осталось:
+
+```sh
+sudo systemctl disable --now forest-proxy-updater.service forest-proxy-updater.timer
+sudo rm -rf /var/lib/forest-proxy-updater
+```
+
+## Условия использования
+
+Программа предоставляет доступ ко всем сайтам, включая те, что заблокированы
+средствами сетевой фильтрации; ответственность за соблюдение законов своей
+юрисдикции и правил своего интернет-провайдера лежит на пользователе. Скрипты
+установки печатают это уведомление, а при первом запуске программа пишет его
+один раз в журнал (дальше — молча). Полный текст:
+`/usr/share/doc/forest-proxy-updater/TERMS.ru.md` (English: `TERMS.md`).
+
+## Если systemd недоступен
+
+В контейнере или дистрибутиве без systemd служба не поднимется. Программа
+работает и просто из командной строки:
+
+```sh
+FOREST_ROOT=/var/lib/forest-proxy-updater \
+FOREST_CONFIG=/etc/forest-proxy-updater/config.json \
+/usr/lib/forest-proxy-updater/forest-proxy-updater --run
+```
+
+Проверка установки без запуска прокси: `forest-proxy-updater --selftest`
+(автотесты, ничего не меняет).

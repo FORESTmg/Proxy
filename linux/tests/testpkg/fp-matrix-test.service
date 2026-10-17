@@ -1,0 +1,12 @@
+[Unit]
+Description=ForestProxyUpdater WSL-matrix test proxy (throwaway, not a product component)
+After=network.target
+
+[Service]
+Type=simple
+EnvironmentFile=-/etc/fp-matrix-test.conf
+ExecStart=/usr/bin/env python3 /usr/lib/fp-matrix-test/testproxy.py
+Restart=no
+
+[Install]
+WantedBy=multi-user.target

@@ -1,0 +1,22 @@
+#!/bin/sh
+# FOREST's Proxy Auto-updater — prerm (Debian/Ubuntu)
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Перед удалением/обновлением гасим службу: иначе systemd держит юнит, а ядро
+# xray остаётся с занятым клиентским портом. KillMode=control-group в юните
+# снимает и ядро вместе с супервизором.
+set -e
+
+APP=forest-proxy-updater
+
+case "$1" in
+    remove|purge|deconfigure)
+        if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+            systemctl disable --now "$APP.service"  >/dev/null 2>&1 || true
+            systemctl disable --now "$APP.timer"    >/dev/null 2>&1 || true
+        fi
+        ;;
+esac
+
+exit 0

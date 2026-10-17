@@ -1,9 +1,9 @@
 # FOREST's Proxy Auto-updater
 
-Automatic selection and switching of proxy servers on Windows. The program
-downloads public server lists, tests the servers, picks the working ones and
-keeps your connection going by switching between them — so that a single server
-dying out does not break your internet access.
+Automatic selection and switching of proxy servers on **Windows and Linux**. The
+program downloads public server lists, tests the servers, picks the working ones
+and keeps your connection going by switching between them — so that a single
+server dying out does not break your internet access.
 
 **Standalone by default.** The program does *not* require v2rayN. It keeps its
 own server list, writes the Xray-core config itself, starts and stops
@@ -12,12 +12,19 @@ v2rayN mode is available for people who already use v2rayN.
 
 - License: **GPL-3.0-only** (see [`LICENSE`](LICENSE))
 - Languages: Russian + English (see [`README.ru.md`](README.ru.md))
+- Vibe-coded — written iteratively in close dialogue with an AI assistant, so
+  please verify behaviour yourself before you rely on it
 - No third-party Python dependencies — the standard library only
 - One process (supervisor) instead of three separate scheduled tasks
 
 > **Read the [Security and limitations](#security-and-limitations) section
 > before you run it.** The program changes the Windows system proxy and manages
 > a proxy-core process. That is by design, and it is described plainly there.
+>
+> **By using the program you accept the
+> [Terms of use](docs/TERMS.md)** — it provides access to all websites, including
+> blocked ones, and complying with the laws of your jurisdiction is your
+> responsibility.
 
 ---
 
@@ -105,6 +112,45 @@ provides). This stops the core, **restores the system proxy to the state it had
 before the first run**, removes the autostart entry and the shortcut, and
 deletes `%LOCALAPPDATA%\ForestProxyUpdater`.
 
+## Linux
+
+The same program, packaged for Linux (x86_64): the proxy core is `xray`, service
+management is systemd. **Nothing has to be dropped in by hand** — the Xray core
+and both geo databases (`geoip.dat`, `geosite.dat`) are embedded in the single
+executable, and Python is not required. The only dependency is `curl`.
+
+Every package installs with **one command**:
+
+| Format | Distributions | Install | Root |
+| --- | --- | --- | --- |
+| `.deb` | Debian, Ubuntu, Linux Mint | `sudo apt install ./forest-proxy-updater_1.1.0_amd64.deb` | yes |
+| `.rpm` | Fedora, RHEL, Rocky, Alma, openSUSE | `sudo dnf install ./forest-proxy-updater-1.1.0-1.x86_64.rpm` | yes |
+| `.pkg.tar.zst` | Arch, Manjaro, EndeavourOS | `sudo pacman -U ./forest-proxy-updater-1.1.0-1-x86_64.pkg.tar.zst` | yes |
+| `.AppImage` | any glibc x86_64 | `./ForestProxyUpdater-1.1.0-x86_64.AppImage --install` | **no** |
+| `.tar.gz` | any | `tar xzf forest-proxy-updater-1.1.0-linux-x86_64.tar.gz && cd forest-proxy-updater-1.1.0-linux-x86_64 && sudo ./install.sh` | yes |
+
+Check it once the first selection cycle has finished (a few minutes — the
+program is downloading and testing hundreds of public servers):
+
+```sh
+curl -x http://127.0.0.1:10808 -o /dev/null -w '%{http_code}\n' \
+     https://www.gstatic.com/generate_204          # expect 204
+systemctl status forest-proxy-updater.service
+journalctl -u forest-proxy-updater -f
+```
+
+The packages install a **system** service, so autostart needs no login and no
+`loginctl enable-linger`. The AppImage and `install.sh --user` install
+`systemd --user` units instead and enable linger automatically. Removal is
+handled by the package manager (`apt purge` / `dnf remove` / `pacman -Rns`) or by
+`uninstall.sh` / `--uninstall`.
+
+Full instructions: [`docs/LINUX-INSTALL.md`](docs/LINUX-INSTALL.md) (English) and
+[`docs/LINUX-INSTALL.ru.md`](docs/LINUX-INSTALL.ru.md) (Russian) — install,
+configuration, logs, verification, removal, and what to do when `systemctl --user`
+is unavailable. Internals: [`docs/LINUX-ARCHITECTURE.ru.md`](docs/LINUX-ARCHITECTURE.ru.md)
+(Russian). Packaging from source: [`packaging-linux/README.md`](packaging-linux/README.md).
+
 ## How it works
 
 A single program runs several worker threads (a "supervisor"):
@@ -167,6 +213,16 @@ and can restore them exactly.
 Everything below can be tuned in `config.json`. Defaults are chosen to be safe
 for a new user: the provider-specific switches are **off**.
 
+> ### ⚖️ Terms of use
+>
+> The program provides access to **all** websites, including those blocked by
+> network filtering in a given country or network. **You are responsible for
+> complying with the laws of your jurisdiction** and with your provider's rules.
+> By using the program you confirm that you accept these terms.
+>
+> Full text: [`docs/TERMS.md`](docs/TERMS.md) (Russian:
+> [`docs/TERMS.ru.md`](docs/TERMS.ru.md)).
+
 ### General
 
 | Key | Default | Meaning |
@@ -224,7 +280,6 @@ for a new user: the provider-specific switches are **off**.
 | `watch.youtube_check_every_s` | `300` | YouTube-canary interval; 3 failures in a row trigger a full cycle. |
 | `watch.hotcache_n` | `20` | How many verified servers are kept in the fast-failover cache. |
 | `watch.hotcache_ttl_s` | `3600` | Lifetime of a hot-cache entry. |
-| `watch.ru_direct` | `false` | Route Russian domains/IPs **directly** (not through the proxy). **Off by default** — see security section. |
 
 ### Sources and selection
 
@@ -239,7 +294,6 @@ for a new user: the provider-specific switches are **off**.
 | `diversity.per_subnet_cap` | `1` | Max servers from one /24 subnet. |
 | `diversity.min_pool_after_cap` | `12` | If the cap shrinks the pool below this, the cap is relaxed. |
 | `diversity.max_cap_relax` | `4` | How far the cap may be relaxed. |
-| `blacklist.cloudflare_nodes` | `true` | Drop nodes whose address is inside Cloudflare's ranges. |
 | `activation.prefer_current_if_healthy` | `true` | Keep the current server if it is healthy and competitive. |
 | `activation.max_restart_wait_s` | `40` | Max wait for a core restart during activation. |
 
@@ -325,19 +379,11 @@ often, and sometimes to have no working server at all. This is a property of
 the servers, not of the program. For a stable, fast connection, use a paid
 provider.
 
-**Provider-specific settings are off by default and are your responsibility.**
-Two options exist for particular network conditions and are **disabled in the
-shipped config**:
-
-- `test.gate_urls` (empty by default) — a "gate": extra domains a server must
-  reach, used to reject servers that cannot reach a specific site.
-- `watch.ru_direct` (`false` by default) — routes Russian domains/IPs directly,
-  bypassing the proxy, and requires the geo databases (`geosite.dat`,
-  `geoip.dat`) to be present.
-
-Both change how your traffic is routed on *your* network. If you turn them on,
-you do so on your own responsibility, and you should understand your provider's
-rules.
+**Extra options exist for particular network conditions, and enabling them is
+your responsibility.** `test.gate_urls` (empty by default) is a "gate": extra
+domains a server must reach, used to reject servers that cannot reach a specific
+site. Turning it on changes how your traffic is routed on *your* network — do it
+on your own responsibility.
 
 **Intended use.** The program is meant for lawful use — for example, keeping a
 working connection to servers you are entitled to use. You are responsible for
@@ -364,6 +410,13 @@ Short answers; the full list is in [`docs/FAQ.md`](docs/FAQ.md).
 - [`docs/ARCHITECTURE.md`](docs/ARCHITECTURE.md) — how it is built inside.
 - [`docs/BUILDING.md`](docs/BUILDING.md) — building the `.exe` and releasing.
 - [`docs/FAQ.md`](docs/FAQ.md) — common problems and answers.
+- [`docs/LINUX-INSTALL.md`](docs/LINUX-INSTALL.md) — installing on Linux:
+  `.deb` / `.rpm` / Arch / AppImage / `.tar.gz`, configuration, removal
+  (Russian version: [`docs/LINUX-INSTALL.ru.md`](docs/LINUX-INSTALL.ru.md)).
+- [`docs/TERMS.md`](docs/TERMS.md) — terms of use and disclaimer (Russian:
+  [`docs/TERMS.ru.md`](docs/TERMS.ru.md)).
+- [`packaging-linux/README.md`](packaging-linux/README.md) — building the Linux
+  packages from source.
 
 ## License
 

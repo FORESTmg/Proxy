@@ -1,0 +1,21 @@
+[Unit]
+Description=FOREST's Proxy Auto-updater — scheduled pool refresh (--once)
+Documentation=file:@DOCDIR@/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=@EXEC@ --once
+WorkingDirectory=@WORKDIR@
+Environment=FOREST_ROOT=@ROOT@
+Environment=FOREST_CONFIG=@CONFIG@
+Environment=XDG_STATE_HOME=@STATE_HOME@
+Environment=XDG_DATA_HOME=@DATA_HOME@
+# Цикл управляет тем же ядром, что и супервизор, поэтому не трогаем чужие
+# процессы группы: ядро останется жить (им владеет forest-proxy-updater.service).
+KillMode=process
+TimeoutStartSec=1800
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forest-proxy-updater-cycle

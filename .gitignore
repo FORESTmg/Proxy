@@ -33,6 +33,14 @@ dist/
 packaging/build/
 packaging/dist/
 
+# Linux-пакеты: готовые артефакты и рабочие каталоги сборщиков
+# (артефакты пересобираются: packaging-linux/build-all.sh)
+packaging-linux/out/
+packaging-linux/work/
+
+# логи прогонов стенда linux/tests/run-matrix.sh
+linux/tests/matrix-*/
+
 # редакторы / ОС
 .idea/
 .vscode/

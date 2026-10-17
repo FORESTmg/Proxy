@@ -18,6 +18,7 @@ FOREST's Proxy Auto-updater. Рабочее ядро (клиентский по�
 import concurrent.futures as cf
 import json
 import os
+import signal
 import socket
 import subprocess
 import tempfile
@@ -394,8 +395,37 @@ def cleanup_test_kernels():
     Чужие процессы xray (например, ядро v2rayN или рабочее ядро нашей
     программы) НЕ затрагиваются: фильтр строго по имени нашего временного
     конфига.
+
+    POSIX: обходим /proc и снимаем только процессы с именем xray, у которых
+    в командной строке есть префикс нашего тестового конфига (без pgrep -f,
+    который мог бы совпасть по чужому процессу).
     """
     lg = log.get_logger()
+    if os.name != "nt":
+        killed = []
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    if os.path.basename(os.readlink(f"/proc/{entry}/exe")) not in ("xray", "v2ray"):
+                        continue
+                    with open(f"/proc/{entry}/cmdline", "rb") as f:
+                        cmd = f.read().decode("utf-8", "replace")
+                except Exception:
+                    continue
+                if TEST_CFG_PREFIX in cmd:
+                    try:
+                        os.kill(int(entry), signal.SIGKILL)
+                        killed.append(entry)
+                    except Exception:
+                        pass
+        except Exception as e:
+            lg.warn(f"cleanup_test_kernels: {e}")
+            return 0
+        if killed:
+            lg.warn(f"cleanup_test_kernels: снято тестовых ядер xray: {len(killed)}")
+        return len(killed)
     try:
         ps = ("Get-CimInstance Win32_Process -Filter \"Name='xray.exe'\" | "
               "Where-Object { $_.CommandLine -like '*" + TEST_CFG_PREFIX + "*' } | "

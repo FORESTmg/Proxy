@@ -25,14 +25,21 @@ config.json, без правки кода):
 from __future__ import annotations
 
 import copy
+import hashlib
 import json
 import os
 import shutil
 import subprocess
+import sys
+import tempfile
+import time
 
 import log
 
 APP_NAME = "ForestProxyUpdater"
+# Имя каталогов на POSIX: строчные буквы через дефис (соглашение Linux,
+# совпадает с именами systemd-юнитов forest-proxy-updater.*).
+POSIX_APP_NAME = "forest-proxy-updater"
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))        # .../src
 PROJECT_DIR = os.path.dirname(BASE_DIR)                      # корень репозитория
 
@@ -41,15 +48,62 @@ DEFAULT_TORRENT_PORT = 10820
 
 
 # ─────────────────────────────────────────────────── каталоги ───
-def app_root() -> str:
-    """Корневой каталог программы (состояние/логи/конфиг по умолчанию)."""
-    r = os.environ.get("FOREST_ROOT")
-    if r:
-        return os.path.abspath(r)
+def _xdg(env: str, default_rel: str) -> str:
+    """Каталог по XDG Base Directory Specification."""
+    v = os.environ.get(env)
+    if v and os.path.isabs(v):
+        return v
+    return os.path.join(os.path.expanduser("~"), *default_rel.split("/"))
+
+
+def data_root() -> str:
+    """Каталог ДАННЫХ программы: бинарь, ядро xray, гео-базы.
+
+    Windows: %LOCALAPPDATA%\\ForestProxyUpdater.
+    POSIX:   $XDG_DATA_HOME/forest-proxy-updater (~/.local/share/...).
+    """
+    if os.name != "nt":
+        return os.path.join(_xdg("XDG_DATA_HOME", ".local/share"), POSIX_APP_NAME)
     la = os.environ.get("LOCALAPPDATA")
     if not la:
         la = os.path.join(os.path.expanduser("~"), ".local", "share")
     return os.path.join(la, APP_NAME)
+
+
+def default_state_dir() -> str:
+    """Каталог состояния (state/логи): Windows — <root>\\state, POSIX — XDG state."""
+    if os.name != "nt":
+        return os.path.join(_xdg("XDG_STATE_HOME", ".local/state"), POSIX_APP_NAME)
+    return os.path.join(app_root(), "state")
+
+
+def default_log_dir() -> str:
+    """Каталог логов: Windows — <root>\\logs, POSIX — <state>/logs."""
+    if os.name != "nt":
+        return os.path.join(default_state_dir(), "logs")
+    return os.path.join(app_root(), "logs")
+
+
+def default_config_path() -> str:
+    """Путь конфига по умолчанию: POSIX держит его отдельно от данных (XDG config)."""
+    if os.name != "nt":
+        return os.path.join(_xdg("XDG_CONFIG_HOME", ".config"),
+                            POSIX_APP_NAME, "config.json")
+    return os.path.join(app_root(), "config.json")
+
+
+def app_root() -> str:
+    """Корневой каталог данных программы.
+
+    Приоритет: FOREST_ROOT -> платформенный каталог данных. На POSIX это
+    $XDG_DATA_HOME/forest-proxy-updater, на Windows — прежний
+    %LOCALAPPDATA%\\ForestProxyUpdater (поведение Windows не менялось).
+    """
+    r = os.environ.get("FOREST_ROOT")
+    if r:
+        return os.path.abspath(r)
+    return data_root()
+
 
 
 def example_config_path():
@@ -66,7 +120,7 @@ def config_path() -> str:
     p = os.environ.get("FOREST_CONFIG")
     if p:
         return os.path.abspath(p)
-    installed = os.path.join(app_root(), "config.json")
+    installed = default_config_path()
     dev = os.path.join(PROJECT_DIR, "config.json")
     if os.path.isfile(installed):
         return installed
@@ -164,11 +218,21 @@ def load_config(path: str = None) -> dict:
 
     root = (cfg.get("paths", {}) or {}).get("root") or app_root()
     root = os.path.abspath(root)
+    given = cfg.get("paths", {}) or {}
+    if os.name == "nt":
+        # Windows: поведение не менялось — состояние и логи внутри каталога программы
+        state_dir = os.path.join(root, "state")
+        log_dir = os.path.join(root, "logs")
+    else:
+        # POSIX: состояние и логи — по XDG (состояние отдельно от данных);
+        # явные пути из config.json уважаются
+        state_dir = os.path.abspath(given.get("state_dir") or default_state_dir())
+        log_dir = os.path.abspath(given.get("log_dir") or default_log_dir())
     cfg["paths"] = {
         "root": root,
-        "state_dir": os.path.join(root, "state"),
-        "backup_dir": os.path.join(root, "state", "backups"),
-        "log_dir": os.path.join(root, "logs"),
+        "state_dir": state_dir,
+        "backup_dir": os.path.join(state_dir, "backups"),
+        "log_dir": log_dir,
     }
     for d in (cfg["paths"]["state_dir"], cfg["paths"]["backup_dir"],
               cfg["paths"]["log_dir"]):
@@ -181,33 +245,471 @@ def load_config(path: str = None) -> dict:
 
 
 # ─────────────────────────────────────────────────── поиск ядра ───
-def find_core(cfg: dict):
-    """Путь к бинарю ядра xray (standalone): рядом с программой -> PATH.
+def core_binary_names() -> tuple:
+    """Имена бинаря ядра: на Windows xray.exe, на POSIX xray."""
+    return ("xray.exe", "xray") if os.name == "nt" else ("xray",)
 
-    Порядок: явный путь из конфига -> bin\\xray\\xray.exe рядом с программой
-    -> каталог программы -> PATH. Возвращает None, если ядро не найдено —
-    вызывающий код предложит скачать официальный релиз Xray-core.
+
+# Системные каталоги ядра на POSIX (пакет дистрибутива / ручная установка).
+SYSTEM_CORE_DIRS = ("/usr/local/bin", "/usr/bin", "/opt/xray", "/opt/xray/bin")
+
+
+def _core_exec_ok(path: str) -> bool:
+    """Исполняемость бинаря: на POSIX проверяем бит X, на Windows — как раньше.
+
+    Если бит X потерян (например, onefile-распаковка не сохранила режим),
+    пробуем выставить его сами: файл лежит в нашем каталоге, и без него ядро
+    просто не запустится — «мягкая деградация» здесь неуместна.
+    """
+    if os.name == "nt":
+        return True
+    try:
+        if os.access(path, os.X_OK):
+            return True
+    except Exception:
+        return True
+    try:
+        os.chmod(path, 0o755)
+        log.get_logger().warn(f"ядру возвращён бит исполняемости: {path}")
+        return os.access(path, os.X_OK)
+    except Exception:
+        return False
+
+
+def _explicit_candidates(explicit: str) -> list:
+    """Пути-кандидаты для явного client.core: абсолютный — как есть,
+    относительный — от каталога данных, каталога программы и текущего каталога.
+
+    Относительный путь нужен потому, что машинно-зависимый абсолютный путь в
+    config.json — лишний: «bin/xray/xray(.exe)» одинаков на всех машинах.
+    """
+    explicit = str(explicit)
+    if os.path.isabs(explicit):
+        return [explicit]
+    out = []
+    for base in (app_root(), PROJECT_DIR, os.getcwd()):
+        try:
+            cand = os.path.normpath(os.path.join(base, explicit))
+        except Exception:
+            continue
+        if cand not in out:
+            out.append(cand)
+    return out or [explicit]
+
+
+def find_core(cfg: dict):
+    """Путь к бинарю ядра xray (standalone).
+
+    Порядок (одинаковый на обеих платформах): явный путь из конфига
+    (client.core; относительный считается от каталога данных/программы) ->
+    ПОСТОЯННЫЙ каталог <данные>/bin/xray (копия из бандла, см.
+    ``ensure_core_installed``) -> каталог репозитория (режим разработки) ->
+    системные каталоги (POSIX) -> PATH.
+
+    Каталога распаковки onefile (_MEIPASS) в этом списке НЕТ намеренно: ядро,
+    запущенное из временного каталога, живёт дольше программы (так и задумано),
+    файл занят — уборщик PyInstaller не может снести каталог: показывает
+    модальное окно «Failed to remove temporary directory» и оставляет мусор
+    _MEI* в temp. Из бандла ядро только КОПИРУЕТСЯ в постоянный каталог.
+
+    Возвращает None, если ядро не найдено — вызывающий код подскажет скачать
+    официальный релиз XTLS/Xray-core.
     """
     cl = cfg.get("client", {})
     for key in ("core", "core_rel"):
         explicit = cl.get(key)
-        if explicit and os.path.isfile(explicit):
-            return explicit
-    names = ("xray.exe", "xray")
-    dirs = (os.path.join(BASE_DIR, "bin", "xray"),
-            os.path.join(PROJECT_DIR, "bin", "xray"),
-            os.path.join(app_root(), "bin", "xray"),
-            BASE_DIR, PROJECT_DIR, app_root())
+        if not explicit:
+            continue
+        for p in _explicit_candidates(explicit):
+            if os.path.isfile(p) and _core_exec_ok(p):
+                return p
+    # ПОСТОЯННАЯ копия: сверить с бандлом и, если нужно, скопировать. Вызов
+    # идёт до перебора каталогов, иначе обновление в бандле никогда бы не
+    # доехало до старой копии (стабильный путь нашёлся бы раньше).
+    core = ensure_core_installed_once()
+    if core and _core_exec_ok(core):
+        return core
+    names = core_binary_names()
+    dirs = [os.path.join(PROJECT_DIR, "bin", "xray"), PROJECT_DIR, app_root()]
+    if os.name != "nt":
+        dirs = dirs + list(SYSTEM_CORE_DIRS)
     for d in dirs:
         for n in names:
             p = os.path.join(d, n)
-            if os.path.isfile(p):
+            if os.path.isfile(p) and _core_exec_ok(p):
                 return p
     for n in ("xray", "xray.exe"):
         p = shutil.which(n)
         if p:
             return p
     return None
+
+
+# ─────────────────────── постоянная копия ядра (вне временного _MEI) ───
+# Пакет onefile распаковывается во временный каталог _MEIxxxx. Ядро, запущенное
+# ОТТУДА, переживает выход программы (прокси должен жить), файл в это время
+# занят — уборщик PyInstaller не может снести каталог и показывает модальное
+# окно. Поэтому при первом запуске (или когда в бандле версия новее) ядро и обе
+# гео-базы копируются в ПОСТОЯННЫЙ каталог данных, и ядро запускается только
+# оттуда. Windows: %LOCALAPPDATA%\ForestProxyUpdater\bin\xray (либо
+# <FOREST_ROOT>\bin\xray), Linux: ~/.local/share/forest-proxy-updater/bin/xray.
+CORE_SUBDIR = os.path.join("bin", "xray")
+# Что переносим: ядро (имя платформенное) + обе гео-базы + лицензия.
+CORE_ASSET_NAMES = ("xray", "xray.exe", "geoip.dat", "geosite.dat", "LICENSE")
+MEI_PREFIX = "_MEI"            # имена каталогов распаковки PyInstaller
+MEI_MIN_AGE_S = 120.0          # моложе — не трогаем (может быть жив запуск)
+
+
+def frozen_bundle_root() -> str:
+    """Корень распаковки onefile-пакета (sys._MEIPASS); '' — не из бандла."""
+    mp = getattr(sys, "_MEIPASS", "") or ""
+    try:
+        return mp if (mp and os.path.isdir(mp)) else ""
+    except Exception:
+        return ""
+
+
+def bundle_core_dir() -> str:
+    """Каталог bin/xray ВНУТРИ бандла onefile — источник для копирования."""
+    mp = frozen_bundle_root()
+    if not mp:
+        return ""
+    d = os.path.join(mp, CORE_SUBDIR)
+    return d if os.path.isdir(d) else ""
+
+
+def core_dir() -> str:
+    """ПОСТОЯННЫЙ каталог ядра: <каталог данных программы>/bin/xray."""
+    return os.path.join(app_root(), CORE_SUBDIR)
+
+
+def installed_core() -> str:
+    """Ядро в постоянном каталоге ('' — если его там ещё нет)."""
+    d = core_dir()
+    for n in core_binary_names():
+        p = os.path.join(d, n)
+        if os.path.isfile(p):
+            return p
+    return ""
+
+
+def _sha256_file(path: str, chunk: int = 1 << 20) -> str:
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for block in iter(lambda: f.read(chunk), b""):
+            h.update(block)
+    return h.hexdigest()
+
+
+def _files_same(a: str, b: str) -> bool:
+    """Файлы совпадают? Сначала дешёвый размер, sha256 — только при равенстве."""
+    try:
+        if os.path.getsize(a) != os.path.getsize(b):
+            return False
+        return _sha256_file(a) == _sha256_file(b)
+    except Exception:
+        return False
+
+
+def ensure_core_installed(force: bool = False) -> str:
+    """Копирует ядро и гео-базы из бандла в постоянный каталог.
+
+    Копирование идёт ТОЛЬКО когда файла нет, размер отличается или содержимое
+    (sha256) отличается — иначе запуск ничего не читает и не пишет лишнего
+    (сверка ~65 МБ занимает доли секунды, копирование — секунды).
+
+    Замена атомарная (temp + os.replace): если ядро сейчас запущено и файл
+    занят, копия не портится — старая версия остаётся работать, в лог идёт
+    предупреждение.
+
+    Возвращает путь к ядру в постоянном каталоге ('' — если ни бандла, ни
+    копии нет). Никогда не поднимает исключений: при неудаче ядро просто не
+    найдётся, программа скажет об этом в лог и завершится без окон.
+    """
+    lg = log.get_logger()
+    src_dir = bundle_core_dir()
+    if not src_dir:
+        return installed_core()            # не из бандла (репозиторий/разработка)
+    names = [n for n in CORE_ASSET_NAMES
+             if os.path.isfile(os.path.join(src_dir, n))]
+    if not names:
+        return installed_core()
+    dst_dir = core_dir()
+    try:
+        os.makedirs(dst_dir, exist_ok=True)
+    except Exception as e:
+        lg.error(f"постоянный каталог ядра недоступен ({dst_dir}): {e}")
+        return ""
+    copied, failed = [], []
+    for n in names:
+        src = os.path.join(src_dir, n)
+        dst = os.path.join(dst_dir, n)
+        if not force and os.path.isfile(dst) and _files_same(src, dst):
+            continue
+        tmp = dst + ".new"
+        try:
+            shutil.copy2(src, tmp)
+            if os.name != "nt":
+                os.chmod(tmp, 0o755 if n in core_binary_names() else 0o644)
+            os.replace(tmp, dst)
+            copied.append(n)
+        except Exception as e:
+            failed.append(f"{n} ({e})")
+            try:
+                os.unlink(tmp)
+            except Exception:
+                pass
+    if copied:
+        lg.info("Ядро и гео-базы перенесены в постоянный каталог %s: %s"
+                % (dst_dir, ", ".join(copied)))
+    if failed:
+        lg.warn("ядро в %s не обновлено: %s (запущено? повторится при "
+                "следующем старте)" % (dst_dir, "; ".join(failed)))
+    return installed_core()
+
+
+_CORE_INSTALL_DONE = False
+
+
+def ensure_core_installed_once(force: bool = False) -> str:
+    """ensure_core_installed, но не чаще одного раза за процесс.
+
+    find_core зовут из каждого цикла и каждой самопроверки (на Windows — раз в
+    10 с), а сверка содержимого читает десятки мегабайт: без этого флага была
+    бы лишняя работа на ровном месте.
+    """
+    global _CORE_INSTALL_DONE
+    if _CORE_INSTALL_DONE and not force:
+        return installed_core()
+    try:
+        return ensure_core_installed(force=force)
+    finally:
+        _CORE_INSTALL_DONE = True
+
+
+# ─────────────────────── уборка своих старых распаковок _MEI* ───
+def _proc_image_paths():
+    """Пути исполняемых файлов всех процессов (без прав администратора).
+
+    None — определить не удалось: тогда уборка не делается вовсе (лучше
+    оставить мусор в temp, чем снести каталог работающего ядра).
+    """
+    if os.name != "nt":
+        out = []
+        try:
+            pids = os.listdir("/proc")
+        except Exception:
+            return None
+        for pid in pids:
+            if not pid.isdigit():
+                continue
+            try:
+                out.append(os.readlink(f"/proc/{pid}/exe"))
+            except OSError:
+                continue
+            except Exception:
+                return None
+        return out
+    try:
+        r = subprocess.run(
+            ["powershell.exe", "-NoProfile", "-Command",
+             "Get-CimInstance Win32_Process -ErrorAction SilentlyContinue | "
+             "ForEach-Object { $_.ExecutablePath }"],
+            capture_output=True, text=True, errors="replace", timeout=40,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0))
+        if r.returncode != 0:
+            return None
+        return [l.strip() for l in (r.stdout or "").splitlines() if l.strip()]
+    except Exception:
+        return None
+
+
+def _mei_ancestor(path: str) -> str:
+    """Ближайший каталог _MEI* в пути файла ('' — если такого нет)."""
+    try:
+        d = os.path.dirname(os.path.normpath(path))
+    except Exception:
+        return ""
+    while d and d != os.path.dirname(d):
+        if os.path.basename(d).startswith(MEI_PREFIX):
+            return d
+        d = os.path.dirname(d)
+    return ""
+
+
+def _mei_dirs_in_use(proc_paths=None):
+    """Каталоги _MEI*, из которых запущены процессы (POSIX-проверка).
+
+    На POSIX удалить файлы работающего процесса МОЖНО, поэтому опираемся на
+    список процессов: exe которого лежит внутри каталога. None — список узнать
+    не удалось (тогда уборка не делается вовсе).
+    """
+    paths = _proc_image_paths() if proc_paths is None else proc_paths
+    if paths is None:
+        return None
+    out = set()
+    for p in paths:
+        d = _mei_ancestor(p)
+        if d:
+            out.add(os.path.normcase(os.path.abspath(d)))
+    return out
+
+
+# Файлы, которые работающий процесс держит занятыми (загруженные в память
+# библиотеки/ядро): по ним и проверяем, «живой» ли каталог распаковки.
+_HOT_SUFFIXES = (".dll", ".pyd", ".exe", ".so", ".so.1", "python")
+
+
+def _dir_locked_windows(d: str, limit: int = 80) -> bool:
+    """Windows: занят ли каталог распаковки работающим процессом.
+
+    Запущенный exe/DLL открыт без разрешения на запись, поэтому попытка
+    открыть файл на запись (неразрушающая: open+close) — точный признак того,
+    что из каталога работает процесс. На чтение Windows отдаёт запущенный файл
+    свободно, поэтому проверка на запись, а не на чтение. Ошибка осмотра
+    трактуется как «занят» (лучше оставить мусор, чем снести живой каталог).
+    """
+    hot, rest, total = [], [], 0
+    try:
+        for root, _dirs, files in os.walk(d):
+            for n in files:
+                total += 1
+                p = os.path.join(root, n)
+                low = n.lower()
+                if any(k in low for k in _HOT_SUFFIXES):
+                    hot.append(p)
+                else:
+                    rest.append(p)
+            if total > 4000:
+                break
+    except Exception:
+        return True
+    for p in (hot + rest)[:limit]:
+        try:
+            fd = os.open(p, os.O_RDWR)
+        except PermissionError:
+            return True
+        except Exception:
+            continue
+        else:
+            try:
+                os.close(fd)
+            except Exception:
+                pass
+    return False
+
+
+def _dir_in_use(d: str, proc_paths) -> bool:
+    """Работает ли что-нибудь из этого каталога распаковки."""
+    if os.name == "nt":
+        return _dir_locked_windows(d)
+    if proc_paths is None:
+        return True                      # не смогли узнать процессы — не трогаем
+    key = os.path.normcase(os.path.abspath(d))
+    for p in proc_paths:
+        anc = _mei_ancestor(p)
+        if anc and os.path.normcase(os.path.abspath(anc)) == key:
+            return True
+    return False
+
+
+def _is_our_bundle(d: str) -> bool:
+    """Наша ли распаковка: внутри обязана быть наш bin/xray с ядром."""
+    sub = os.path.join(d, CORE_SUBDIR)
+    if not os.path.isdir(sub):
+        return False
+    return any(os.path.isfile(os.path.join(sub, n)) for n in core_binary_names())
+
+
+def cleanup_stale_bundles(max_age_s: float = MEI_MIN_AGE_S,
+                          dry: bool = False, tmp_dir: str = None) -> dict:
+    """Убирает СВОИ старые каталоги распаковки onefile (_MEI*) в temp.
+
+    Каталог удаляется только если:
+      * в нём лежит НАШ bin/xray с ядром (чужие распаковки не трогаем);
+      * это не каталог текущего процесса (sys._MEIPASS);
+      * он старше max_age_s (защита от одновременного запуска второй копии);
+      * из него НЕ запущен ни один процесс (иначе снос задел бы живое ядро,
+        в том числе работающее ядро пользователя);
+      * список процессов вообще удалось получить (иначе не удаляем ничего).
+
+    ``tmp_dir`` — каталог для обхода (по умолчанию системный temp; параметр
+    нужен автотестам, чтобы не трогать чужой temp).
+
+    Возвращает {"removed": [...], "kept": [...], "in_use": [...],
+    "skipped": [...]}. Исключений не поднимает.
+    """
+    lg = log.get_logger()
+    res = {"removed": [], "kept": [], "in_use": [], "skipped": []}
+    try:
+        tmp = tmp_dir or tempfile.gettempdir()
+        entries = sorted(os.listdir(tmp))
+    except Exception:
+        return res
+    cur = ""
+    try:
+        b = frozen_bundle_root()
+        cur = os.path.normcase(os.path.abspath(b)) if b else ""
+    except Exception:
+        cur = ""
+    if os.name == "nt":
+        # Windows: «занят ли каталог» определяем пробой файлов на запись
+        in_use, proc_paths = set(), []
+    else:
+        proc_paths = _proc_image_paths()
+        in_use = _mei_dirs_in_use(proc_paths)
+    for name in entries:
+        if not name.startswith(MEI_PREFIX):
+            continue
+        d = os.path.join(tmp, name)
+        try:
+            if os.path.islink(d) or not os.path.isdir(d):
+                continue
+        except Exception:
+            continue
+        key = os.path.normcase(os.path.abspath(d))
+        if cur and key == cur:
+            res["skipped"].append(d)          # текущая распаковка
+            continue
+        if not _is_our_bundle(d):
+            res["skipped"].append(d)          # не наша распаковка
+            continue
+        if _dir_in_use(d, proc_paths) or (in_use and key in in_use):
+            res["in_use"].append(d)           # оттуда работает ядро/программа
+            continue
+        try:
+            age = time.time() - os.path.getmtime(d)
+        except Exception:
+            age = 0.0
+        if age < max_age_s:
+            res["skipped"].append(d)          # свежая — возможно, чужой старт
+            continue
+        if dry:
+            res["removed"].append(d)
+            continue
+        shutil.rmtree(d, ignore_errors=True)
+        if os.path.isdir(d):
+            res["kept"].append(d)
+        else:
+            res["removed"].append(d)
+    if res["removed"]:
+        lg.info("Убраны свои старые каталоги распаковки (%d): %s"
+                % (len(res["removed"]),
+                   ", ".join(os.path.basename(x) for x in res["removed"])))
+    if res["kept"]:
+        lg.warn("каталоги распаковки не удалось убрать (заняты?): %s"
+                % ", ".join(res["kept"]))
+    return res
+
+
+def cleanup_stale_bundles_async() -> None:
+    """Уборка старых _MEI* в фоне: не задерживает старт и не мешает ядру."""
+    try:
+        import threading
+        threading.Thread(target=cleanup_stale_bundles,
+                         name="forest-mei-cleanup", daemon=True).start()
+    except Exception:
+        pass
 
 
 def core_pid_path(cfg: dict) -> str:
@@ -221,6 +723,17 @@ def core_running(cfg: dict) -> bool:
         pid = int(open(p, encoding="utf-8").read().strip())
     except Exception:
         return False
+    if os.name != "nt":
+        # POSIX: signal 0 — процесс есть и он наш/доступен
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except Exception:
+            return True
     try:
         import ctypes
         k = ctypes.windll.kernel32
@@ -264,7 +777,7 @@ def _find_client_standalone(cfg: dict) -> dict:
         "service": None,
         "dir": os.path.dirname(core) if core else None,
         "core": core,
-        "exe": core or "xray.exe",
+        "exe": core or ("xray.exe" if os.name == "nt" else "xray"),
         "cfg": os.path.join(state_dir, "xray_config.json"),
         "db": os.path.join(state_dir, "servers.json"),
         "bin_cfg": os.path.join(state_dir, "xray_config.json"),
@@ -273,18 +786,30 @@ def _find_client_standalone(cfg: dict) -> dict:
         "torrent_port": torrent_port,
     }
     if not core:
-        lg.error("Ядро Xray не найдено. Положите bin\\xray\\xray.exe рядом с "
-                 "программой или установите xray в PATH. Скачать официальный "
-                 "релиз: https://github.com/XTLS/Xray-core/releases")
+        if os.name == "nt":
+            lg.error("Ядро Xray не найдено. Положите bin\\xray\\xray.exe рядом с "
+                     "программой или установите xray в PATH. Скачать официальный "
+                     "релиз: https://github.com/XTLS/Xray-core/releases")
+        else:
+            lg.error("Ядро Xray не найдено. Ожидается bin/xray/xray рядом с "
+                     "программой, /usr/bin/xray либо xray в PATH. Скачать "
+                     "официальный релиз: https://github.com/XTLS/Xray-core/releases")
     return info
 
 
 def _find_client_v2rayn(cfg: dict) -> dict:
-    """Определение установки v2rayN (режим совместимости)."""
+    """Определение установки v2rayN (режим совместимости, только Windows)."""
     lg = log.get_logger()
     cl = cfg.get("client", {})
     exe_name = cl.get("exe", "v2rayN.exe")
     socks_port = int(cl.get("socks_port", DEFAULT_SOCKS_PORT))
+    if os.name != "nt":
+        # v2rayN — приложение Windows; на Linux режим неприменим. Работаем
+        # standalone и говорим об этом прямо, а не ищем несуществующее.
+        lg.error("client.mode=v2rayn поддерживается только на Windows; "
+                 "на Linux используется standalone-режим (своё ядро xray).")
+        return {"dir": None, "running": False, "socks_port": socks_port,
+                "is_running_proc": False, "mode": "standalone"}
 
     dir_ = None
     running = False
@@ -328,6 +853,8 @@ def _find_client_v2rayn(cfg: dict) -> dict:
 def _proc_paths_by_name(name: str) -> list:
     """Пути запущенных процессов по имени exe (без администратора)."""
     out = []
+    if os.name != "nt":
+        return out
     try:
         ps = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command",
@@ -347,6 +874,8 @@ def _proc_paths_by_name(name: str) -> list:
 
 def _autodiscover() -> list:
     candidates = []
+    if os.name != "nt":
+        return candidates
     try:
         ps = subprocess.run(
             ["powershell.exe", "-NoProfile", "-Command",

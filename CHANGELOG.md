@@ -4,10 +4,59 @@ All notable changes to **FOREST's Proxy Auto-updater** are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.1.0] — 2026-10-17
+
+### Added
+
+- **Linux packages.** The Linux build now ships as real packages, all built from
+  one shared file layout (`packaging-linux/lib/common.sh`, so the formats cannot
+  drift apart): `.deb` (Debian/Ubuntu/Mint), `.rpm` (Fedora/RHEL/Rocky/Alma/
+  openSUSE), Arch `PKGBUILD` + `.pkg.tar.zst`, a universal `AppImage` and a
+  portable `.tar.gz` with `install.sh` / `uninstall.sh`. Every format installs
+  **one systemd system service** (no logged-in user and no
+  `loginctl enable-linger` required) and needs nothing dropped in by hand: the
+  Xray core and both geo databases are inside the binary. Installation is a
+  single command, removal is the distribution's own (`apt purge` / `dnf remove` /
+  `pacman -Rns`) or `uninstall.sh`. Instructions:
+  `docs/LINUX-INSTALL.md` and `docs/LINUX-INSTALL.ru.md`.
+- **Terms of use and disclaimer** (`docs/TERMS.md`, Russian: `docs/TERMS.ru.md`),
+  linked from both READMEs, printed for a few lines by the package installers
+  (`.deb` / `.rpm` / Arch / `.tar.gz`) and shown once on the first run (plus a
+  line in `--help`). The program gives access to
+  all websites, including blocked ones; complying with the laws of your own
+  jurisdiction is your responsibility. GPL-3.0 is not replaced by this notice —
+  it is added to.
+- **Package matrix bench.** `linux/tests/wsl-matrix.sh` now also handles
+  `.tar.gz`, `.AppImage` and user-mode (`systemctl --user`) installs, waits for
+  the product's real first selection cycle before probing traffic
+  (`--traffic-wait`, minutes not seconds) and steers the payload to a test port
+  through `FOREST_CONFIG` without modifying the shipped config;
+  `linux/tests/run-matrix.sh` runs the whole package × distribution matrix and
+  writes a `summary.csv`. Results of the release run:
+  `docs/LINUX-PACKAGES-PROOF.ru.md`.
 
 ### Fixed
 
+- **Modal window “Failed to remove temporary directory” and leftover `_MEI*`
+  folders.** The app is a PyInstaller onefile bundle, and the Xray core used to
+  be started straight **from the unpacked temp directory** (`_MEIxxxx/bin/xray`).
+  The core outlives the program by design (the proxy must keep running), so the
+  file stayed busy: the PyInstaller cleanup could not delete the directory,
+  showed a modal `Warning` window and left `_MEI*` folders behind (on Windows
+  every run with an empty `client.core`). The core and both geo databases are
+  now **copied once from the bundle into a permanent directory** and the core is
+  started only from there: `%LOCALAPPDATA%\ForestProxyUpdater\bin\xray`
+  (Windows, or `<FOREST_ROOT>\bin\xray`) and
+  `~/.local/share/forest-proxy-updater/bin/xray` (`$XDG_DATA_HOME`) on Linux.
+  The copy is compared by size and SHA-256 and only happens when the file is
+  missing or the bundle is newer, so an ordinary start neither copies nor reads
+  anything extra. `client.core` may now stay empty (or relative —
+  `bin/xray/xray(.exe)` is resolved against the data/program directory); no
+  machine-specific absolute path is required. The program also removes **its
+  own** stale `_MEI*` folders from temp on start (a background thread; only
+  directories that contain our `bin/xray`, never the current unpack directory,
+  never younger than 2 minutes, and never one a process is still running from —
+  on Windows that is decided by a non-destructive write probe on the files).
 - **Installer wrote a broken launch command.** `--install` used to register the
   Start Menu shortcut and the autostart entry as `pythonw.exe "<dev
   folder>\src\v2ray_updater.py" --run`, so clicking the shortcut or rebooting

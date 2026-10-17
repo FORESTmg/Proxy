@@ -1,0 +1,40 @@
+[Unit]
+Description=FOREST's Proxy Auto-updater — supervisor (watchdog + guard + pool refresh)
+Documentation=file:@DOCDIR@/README.md
+Documentation=file:@DOCDIR@/INSTALL.md
+# Ждём сеть, но не блокируем загрузку: программа умеет работать и без неё
+# (переподбор начнётся, как только сеть появится).
+After=network-online.target
+Wants=network-online.target
+# НЕ ограничиваем число перезапусков: связь должна восстанавливаться сама.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=@EXEC@ --run
+WorkingDirectory=@WORKDIR@
+# Пути передаём явно: юнит не зависит от HOME и от переменных окружения.
+# FOREST_ROOT  — корень данных программы (ядро берётся из самого ELF);
+# FOREST_CONFIG — конфиг в /etc, поэтому он один для всех;
+# XDG_STATE_HOME — состояние, кэши, сторожевые файлы и логи.
+Environment=FOREST_ROOT=@ROOT@
+Environment=FOREST_CONFIG=@CONFIG@
+Environment=XDG_STATE_HOME=@STATE_HOME@
+Environment=XDG_DATA_HOME=@DATA_HOME@
+# systemd сам создаст /var/lib/forest-proxy-updater с нужными правами.
+StateDirectory=forest-proxy-updater
+# Ядро xray запускается дочерним процессом супервизора. KillMode=control-group
+# гарантирует, что при остановке службы снимется и ядро (не останется сирот,
+# держащих клиентский порт).
+KillMode=control-group
+TimeoutStopSec=20
+Restart=always
+RestartSec=5
+# Окон и диалогов нет: вывод идёт в journal, программа дополнительно пишет
+# свой лог в каталог состояния (journalctl и файл main.log).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forest-proxy-updater
+
+[Install]
+WantedBy=multi-user.target

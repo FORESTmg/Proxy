@@ -1,0 +1,33 @@
+[Unit]
+Description=FOREST's Proxy Auto-updater (супервизор: сторож + гвард + обновление)
+Documentation=man:forest-proxy-updater(1)
+Documentation=file:@ROOT@/README-LINUX.md
+# Ждём сеть, но не блокируем загрузку: программа умеет работать и без неё
+# (переподбор начнётся, как только сеть появится).
+After=network-online.target
+Wants=network-online.target
+# НЕ ограничиваем число перезапусков: связь должна восстанавливаться сама.
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+ExecStart=@EXEC@ --run
+WorkingDirectory=@ROOT@
+# Пути передаём явно: юнит не зависит от переменных окружения пользователя.
+Environment=FOREST_ROOT=@ROOT@
+Environment=FOREST_CONFIG=@CONFIG@
+Environment=XDG_STATE_HOME=@XDG_STATE@
+# Ядро xray запускается дочерним процессом супервизора. KillMode=control-group
+# гарантирует, что при остановке службы снимется и ядро (не останется сирот,
+# держащих клиентский порт).
+KillMode=control-group
+TimeoutStopSec=20
+Restart=always
+RestartSec=5
+# Никаких окон и диалогов — только лог (journal + файл в каталоге состояния).
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=forest-proxy-updater
+
+[Install]
+WantedBy=default.target

@@ -43,13 +43,7 @@
 - **Трей с меню.** Значок в системном трее (три состояния: зелёный — работает,
   серый — прокси выключен вручную, красный — нет связи) с контекстным меню:
   включить/выключить прокси вручную, показать состояние, обновить серверы
-  сейчас, открыть лог, переключить фильтры, выход.
-- **Два фильтра (переключаются в меню трея и в конфиге):**
-  - **«РФ — напрямую»** (`watch.ru_direct`) — российские домены и IP идут
-    напрямую, минуя прокси. Нужны гео-базы. **По умолчанию выключено.**
-  - **«Cloudflare — обход»** (`blacklist.cloudflare_nodes`) — узлы, чей адрес
-    лежит внутри диапазонов Cloudflare, исключаются из списка серверов.
-    **По умолчанию включено.**
+  сейчас, открыть лог, выход.
 - **Один процесс-супервизор** вместо трёх отдельных задач Планировщика: внутри
   одного процесса — сторож, гвард (быстрая самопроверка), цикл обновления и
   трей.
@@ -142,13 +136,7 @@ The mode is chosen in `config.json` (`client.mode`), with no code changes:
 - **Tray icon with a menu.** A system-tray icon (three states: green — working,
   grey — proxy switched off by hand, red — no connection) with a context menu:
   toggle the proxy by hand, show status, refresh servers now, open the log,
-  toggle the filters, exit.
-- **Two filters (switchable in the tray menu and in the config):**
-  - **"RU — direct"** (`watch.ru_direct`) — Russian domains and IPs go directly,
-    bypassing the proxy. Requires the geo databases. **Off by default.**
-  - **"Cloudflare — bypass"** (`blacklist.cloudflare_nodes`) — nodes whose
-    address lies inside Cloudflare's ranges are dropped from the server list.
-    **On by default.**
+  exit.
 - **A single supervisor process** instead of three separate scheduled tasks: the
   watchdog, the guard (quick self-check), the update loop and the tray run as
   threads inside one program.

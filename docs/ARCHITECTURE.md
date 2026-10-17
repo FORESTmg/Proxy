@@ -23,7 +23,7 @@ for process/port queries on Windows.
 | `parser.py` | Parsing of share links (`vless://`, `vmess://`, `trojan://`, `ss://`) into a unified `Server` dataclass, plus the reverse (`to_share_link`, `to_row_dict`). |
 | `sources.py` | Subscription sources: GitHub search for fresh repos, freshness by content sha1, fixed-URL refresh, source bodies cached to disk. |
 | `xraytest.py` | Candidate testing through throwaway Xray instances: RTT, TCP pre-filter, speed test, YouTube probe, final verify, plus cleanup of orphaned test cores. |
-| `netfilters.py` | Subnet-diversity selection and the Cloudflare-range filter. |
+| `netfilters.py` | Subnet-diversity selection. |
 | `tray.py` | The tray consumer thread. The visual icon is not implemented yet; the thread consumes the status channel and logs state changes. |
 | `tray_status.py` | The status channel (`state/tray_status.json`): one atomic state + current process description for a future tray icon. |
 | `i18n.py` | Minimal Russian/English string table and language selection. |
@@ -57,24 +57,22 @@ duplicates by `state/watch.pid`).
    (they are preserved and never dropped in favour of auto ones), de-duplicate;
    if the pool is small, top it up from the pool cache and cached source bodies;
    cap at `test.max_candidates` (prioritising a few known-good sources).
-5. **Cloudflare filter:** drop nodes whose address is inside Cloudflare ranges
-   (`netfilters.drop_cloudflare`).
-6. **Tests (`xraytest.run_tests`):** TCP pre-filter → RTT per candidate (one
+5. **Tests (`xraytest.run_tests`):** TCP pre-filter → RTT per candidate (one
    throwaway Xray instance each) → jitter filter → `max_rtt_ms` filter →
    diversity-capped top-`top_for_speed` → speed test → `min_speed_kbps` filter →
    `final_verify` (RTT again + YouTube reachability).
-7. **Rank:** by speed (desc) then RTT (asc); apply the blacklist; if the pool is
+6. **Rank:** by speed (desc) then RTT (asc); apply the blacklist; if the pool is
    below `reserve_min`, add back servers that passed RTT.
-8. **Diversity cap:** at most `diversity.per_subnet_cap` servers per /24; if that
+7. **Diversity cap:** at most `diversity.per_subnet_cap` servers per /24; if that
    shrinks the pool below `diversity.min_pool_after_cap`, the cap is relaxed up to
    `diversity.max_cap_relax`.
-9. Update the hot cache; write `subscription_base64.txt`.
-10. **Choose the active server:** keep the current one if it is healthy and not
+8. Update the hot cache; write `subscription_base64.txt`.
+9. **Choose the active server:** keep the current one if it is healthy and not
     clearly beaten (`activation.prefer_current_if_healthy`), otherwise the top
     ranked.
-11. If the proxy was switched off by hand (`proxy_off.flag`), write the store
+10. If the proxy was switched off by hand (`proxy_off.flag`), write the store
     but do not activate.
-12. **Activate** (`clientwrite.activate`): in balancer mode raise the balancer;
+11. **Activate** (`clientwrite.activate`): in balancer mode raise the balancer;
     otherwise write a single-server core config and restart the core; then fall
     back to the emergency "last good" pool if needed.
 
@@ -146,6 +144,7 @@ By default everything lives under `%LOCALAPPDATA%\ForestProxyUpdater`
 | File | Written by | Content |
 |---|---|---|
 | `config.json` | `config.load_config` | The working config (created from `config.example.json` on first run). |
+| `bin/xray/{xray(.exe),geoip.dat,geosite.dat,LICENSE}` | `config.ensure_core_installed` | **Permanent copy of the core and both geo databases** (Windows: `%LOCALAPPDATA%\ForestProxyUpdater\bin\xray`, Linux: `~/.local/share/forest-proxy-updater/bin/xray`). On first run (or when the bundle holds a newer version — size and SHA-256 are compared) the files are copied here out of the unpacked onefile directory (`sys._MEIPASS/bin/xray`), and the core is started **only from here**. The unpack directory `_MEIxxxx` lives until the program exits, while the core deliberately outlives it: started from `_MEI*` it kept the file busy, so the PyInstaller cleanup could not delete the directory (modal “Failed to remove temporary directory” window) and left `_MEI*` junk in temp. Our own stale `_MEI*` folders from temp are removed in the background at startup (`config.cleanup_stale_bundles`) — only those containing our `bin/xray`, never the current one and never one a process is still running from. |
 | `logs/main.log` | `log` | Main log, UTF-8. |
 | `state/servers.json` | `clientwrite` (standalone) | Own server store: `{next_index, active_id, servers:[...]}`. Auto servers are tagged `[AUTO] `. |
 | `state/forest_xray.json` | `clientwrite` | Config of our own core. |
@@ -160,7 +159,6 @@ By default everything lives under `%LOCALAPPDATA%\ForestProxyUpdater`
 | `state/lastgood_servers.json` | `clientwrite` | Last working pool (emergency restore). |
 | `state/proxy_orig.json` | `clientwrite` | System-proxy state saved before the first change. |
 | `state/proxy_off.flag` | `clientwrite` | Present when the proxy was switched off by hand. |
-| `state/cf_ranges.json` | `netfilters` | Cached Cloudflare ranges. |
 | `state/lock.json`, `state/watch.pid`, `*.lock` | lock helpers | Cross-process locks and the watchdog singleton. |
 
 Config writes and most state writes are atomic (`tmp` file + `os.replace`).

@@ -1,0 +1,36 @@
+#!/bin/sh
+# FOREST's Proxy Auto-updater — postinst (Debian/Ubuntu)
+# Copyright (C) 2026 FOREST
+# SPDX-License-Identifier: GPL-3.0-only
+#
+# Задача: создать каталог состояния, поднять системную службу и включить её в
+# автозапуск. Никаких вопросов пользователю и никаких диалогов.
+set -e
+
+APP=forest-proxy-updater
+STATE=/var/lib/$APP
+
+# 1. каталог состояния (нужен и вне systemd: при ручном запуске)
+mkdir -p "$STATE"
+chmod 0755 "$STATE"
+
+# 2. systemd: перечитать юниты и включить службу
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload >/dev/null 2>&1 || true
+    if systemctl enable --now "$APP.service" >/dev/null 2>&1; then
+        echo "$APP: служба включена и запущена (systemctl status $APP.service)"
+    else
+        echo "$APP: не удалось запустить службу — проверьте журнал:"
+        echo "  journalctl -u $APP.service -n 50 --no-pager"
+    fi
+else
+    echo "$APP: systemd не используется (/run/systemd/system отсутствует)."
+    echo "  Автозапуск не настроен. Ручной запуск:"
+    echo "  FOREST_ROOT=$STATE FOREST_CONFIG=/etc/$APP/config.json $APP --run"
+fi
+
+echo "$APP: программа даёт доступ ко всем сайтам, включая заблокированные."
+echo "  Ответственность за соблюдение законов своей юрисдикции лежит на пользователе."
+echo "  Условия использования: /usr/share/doc/$APP/TERMS.ru.md (English: TERMS.md)."
+
+exit 0

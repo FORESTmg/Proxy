@@ -72,21 +72,6 @@ the cap up to `diversity.max_cap_relax` (default `4`), logged as
 clustered, raise `diversity.per_subnet_cap` or lower
 `diversity.min_pool_after_cap`.
 
-## "Nodes behind Cloudflare give me almost no speed"
-
-Many free lists are full of nodes whose address resolves into Cloudflare's
-ranges (the "CDN fronting" trick). Those nodes often pass the RTT probe but carry
-almost no throughput, so the speed stage measures near zero and drops them at
-`test.min_speed_kbps` — and the pool stays thin.
-
-The program filters them out on purpose: step 5 of the cycle calls
-`netfilters.drop_cloudflare`, controlled by `blacklist.cloudflare_nodes`, which
-is **on (`true`) by default**. If you set `blacklist.cloudflare_nodes` to
-`false` in `config.json` (or toggle the tray menu item «Cloudflare — обход»),
-those nodes re-enter the candidate pool — usually not worth it, since they are
-the classic source of "connected but zero speed". Leave it on unless you know
-your network needs it.
-
 ## "There's no internet after I started it"
 
 The program points the Windows system proxy at its local port
@@ -201,12 +186,11 @@ a full cycle without writing anything or starting the core.
   works through your installed v2rayN's database and core (and backs up the
   database before writing).
 
-## Is it using the provider-specific options by default?
+## Is it using the extra network options by default?
 
-No. `test.gate_urls` is empty and `watch.ru_direct` is `false` in the shipped
-config. They exist for particular network conditions and are your
-responsibility to enable — see the security section in
-[`../README.md`](../README.md).
+No. `test.gate_urls` is empty in the shipped config. It exists for particular
+network conditions and is your responsibility to enable — see the security
+section in [`../README.md`](../README.md).
 
 ## Still stuck
 

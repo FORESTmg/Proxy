@@ -5,991 +5,562 @@
 # under the terms of the GNU General Public License as published by the Free
 # Software Foundation, either version 3 of the License, or (at your option)
 # any later version. See LICENSE or <https://www.gnu.org/licenses/gpl-3.0.html>.
-"""clientwrite_posix.py — POSIX-версия standalone-бэкенда (CachyOS / Linux).
+"""clientwrite_posix.py — POSIX (Linux) слой поверх общей клиентской логики.
 
 FOREST's Proxy Auto-updater (GPL-3.0).
 
-Здесь ядро xray — самостоятельный systemd-сервис, поэтому жизненный цикл
-сводится к `write config -> systemctl --user restart xray-proxy -> probe`.
-На Windows тот же standalone-подход реализован в clientwrite.py через
-управление процессом xray.exe. Модуль сохранён для будущего порта на Linux.
+ИДЕЯ. В ``clientwrite.py`` лежит переносимая сердцевина (проверки связи и
+скорости, чёрный список, стор серверов, генерация конфигов ядра, блокировки,
+проверка нового конфига ядром ``xray run -test`` ДО остановки рабочего ядра,
+замер разрыва связи, пул балансировщика, активация, гвард) и ровно два
+ОС-зависимых участка: управление процессами и системный прокси. Поэтому
+здесь НЕ дублируется логика: модуль импортирует ``clientwrite`` (он
+импортируется на Linux без ошибок — все вызовы WinAPI находятся внутри
+функций), подменяет только ОС-зависимые примитивы и раздаёт наружу тот же
+API. Windows-код при этом не меняется.
 
-Заменяет интеграцию с v2rayN на работу с ядром **xray как systemd-сервисом**.
+ПОЧЕМУ ПОДМЕНА ЧЕРЕЗ ``clientwrite.<имя>``. Функции внутри
+``clientwrite`` ищут зависимости в собственном модульном словаре, поэтому
+достаточно присвоить ``clientwrite._kill_pid = _posix_kill_pid`` — и все
+внутренние вызовы (stop_core -> _pid_alive/_kill_pid, ensure_balancer ->
+_restart_core_timed -> stop_core/start_core, restore_system_proxy ->
+_sys_proxy_disable) автоматически пойдут в POSIX-реализацию.
 
-Почему так проще, чем на Windows: там ядро поднимает GUI v2rayN, и скрипт
-вынужден «бороться» с ним за порт 10808 (tasklist/kill/Reload/gui_restart_*).
-На Linux ядро — самостоятельный сервис, поэтому вся эта логика исчезает:
-пишем конфиг → `systemctl --user restart xray-proxy` → проверяем порт.
+ЧТО ИМЕННО ПОДМЕНЯЕТСЯ
+  процессы:     _pid_alive, _port_pid, _our_core_pids, _kill_pid
+  порт:         ensure_port_free
+  прокси:       _sys_proxy_state, _sys_proxy_apply, _sys_proxy_disable
+  гео-базы:     geo_asset_dir  (+ системные каталоги Linux и каталог программы)
+  режим:        _mode_of       (на Linux существует только standalone)
 
-Совместимость: модуль предоставляет ТОТ ЖЕ API, что `clientwrite.py`
-(AUTO_TAG, StateStore, probe_client, activate, guard_cycle, ensure_balancer,
-read_db_rows, read_active_id, bl_filter, row_to_server, measure_speed_kbps…),
-поэтому `v2ray_updater.py` и `watch.py` работают без правок — достаточно
-переключить импорт (см. `switch_to_posix.sh`).
-
-Что переиспользуется из `clientwrite.py` без изменений (переносимые части):
-  probe_client, measure_speed_kbps, port_works, _curl_*, bl_add/bl_active/
-  bl_filter, row_to_server, _json_safe, StateStore, update_hotcache.
+Что НЕ подменяется намеренно: ``start_core``/``restart_core``/
+``_restart_core_timed``/``wait_and_probe``/``_validate_config``/
+``_test_config_by_core``/``_curl_*``. Они запускают ядро дочерним процессом
+через ``subprocess``, а ``creationflags=0`` на POSIX допустим — код работает
+как есть и сохраняет «бесшовность»: валидация нового конфига до снятия
+старого ядра, отсутствие перезапуска при неизменном пуле, замер разрыва
+связи в миллисекундах.
 """
 from __future__ import annotations
 
-import json
 import os
-import shutil
-import re
+import signal
+import socket
 import subprocess
 import time
 
 import log
 
-# переносимые части — из Windows-модуля (без побочных эффектов при импорте)
-from clientwrite import (LOCAL_DIRECT_DOMAINS, AUTO_TAG, PROBE_URL, PROBE_DATA_URL, PROBE_DATA_MIN_BYTES,
-                         _curl_metrics, _curl_speed, measure_speed_kbps, port_works,
-                         probe_client, bl_add, bl_active, bl_filter, row_to_server,
-                         bl_add_pool,
-                         _json_safe, StateStore, update_hotcache,
-                         RU_DIRECT_DOMAINS, RU_DIRECT_IPS, _build_dns)
+# Общая сердцевина. На Linux модуль импортируется: WinAPI вызывается только
+# внутри функций (_pid_alive, _port_pid, _our_core_pids, _kill_pid,
+# _sys_proxy_*), а не на уровне модуля.
+import clientwrite as _cw
+from clientwrite import *          # noqa: F401,F403  (полный API наружу)
+from clientwrite import (          # noqa: F401  (явные имена — для статики)
+    AUTO_TAG, CONFIG_TYPE, CORE_CFG_NAME, CORE_LOG_NAME, CORE_PID_NAME,
+    DEFAULT_SOCKS_PORT, DEFAULT_TORRENT_PORT, LOCAL_DIRECT_DOMAINS,
+    PROBE_DATA_MIN_BYTES, PROBE_DATA_URL, PROBE_URL, PROBE_URL_ALT,
+    REMOVED_OUT_KEYS, RU_DIRECT_DOMAINS, RU_DIRECT_IPS, YOUTUBE_URL,
+    StateStore, _build_dns, _cfg_sha, _conf_sha, _curl_metrics, _curl_speed,
+    _fields_from_err, _json_safe, _pool_sig, _restart_core_timed,
+    _sa_read_active_id, _sanitize_outbound, _store_load, _store_save,
+    _test_config_by_core, _validate_config, _validate_new_config, _v2,
+    _write_json, activate, balancer_pool, bl_active, bl_add, bl_add_pool,
+    bl_filter, build_balancer_config, build_single_config, core_config_path,
+    core_pid_path, ensure_balancer, ensure_system_proxy, guard_cycle,
+    hotcache_switch, kill_kernels, lastgood_path, load_lastgood,
+    measure_speed_kbps, port_busy, port_listening, port_works, probe_client,
+    proxy_off, proxy_off_path, proxy_orig_path, read_active_id, read_db_rows,
+    restart_core, restore_system_proxy, row_to_server, ru_direct_enabled,
+    save_lastgood, save_proxy_orig, server_to_row, set_proxy_off, start_client,
+    start_core, stop_client, stop_core, update_hotcache, wait_and_probe,
+    write_active_id, write_auto_group, write_balancer_config, write_bin_config,
+    write_core_config, youtube_probe,
+)
 
-# POSIX-конфиг (ядро xray, свой store серверов) — читаем каталог состояния из
-# общего config.py, чтобы пути совпадали с остальной программой.
-import config as CFG                                  # type: ignore
+IS_LINUX = os.name != "nt"
 
-# ── соответствие протокол <-> ConfigType (как в v2rayN) ──
-CONFIG_TYPE = {"vless": 5, "vmess": 1, "trojan": 6, "ss": 3}
-CONFIG_TYPE_INV = {v: k for k, v in CONFIG_TYPE.items()}
+# Имена ядра на POSIX (xray из официального релиза XTLS/Xray-core).
+CORE_NAMES = ("xray", "v2ray")
 
-DEFAULT_SOCKS_PORT = 10808
+# Где дистрибутивы кладут geosite.dat/geoip.dat.
+SYSTEM_GEO_DIRS = (
+    "/usr/share/xray", "/usr/local/share/xray", "/usr/share/v2ray",
+    "/usr/local/share/v2ray", "/opt/xray/share", "/opt/xray",
+    "/etc/xray", "/usr/share/Xray-core",
+)
 
 
-# ══════════════════════════════════════════ store серверов (JSON) ═══
-def _store_load(path: str) -> dict:
-    """Читает JSON-store серверов. Формат: {next_index, active_id, servers:[]}."""
-    if not os.path.isfile(path):
-        return {"next_index": 1, "active_id": "", "servers": []}
+# ══════════════════════════════════════════ процессы (POSIX) ═══
+def _proc_state(pid: int) -> str:
+    """Состояние процесса из /proc/<pid>/stat: R/S/D/Z/T… ('' — нет процесса).
+
+    Нужно, потому что zombie (Z) уже МЁРТВ, но os.kill(pid, 0) по нему
+    успешен: без этой проверки снятое ядро считалось бы живым вечно, а его
+    pid-файл — актуальным.
+    """
     try:
-        with open(path, encoding="utf-8") as f:
-            d = json.load(f)
-        if isinstance(d, dict) and "servers" in d:
-            return d
-        if isinstance(d, list):                       # допустим просто список
-            return {"next_index": len(d) + 1, "active_id": "", "servers": d}
+        with open(f"/proc/{int(pid)}/stat", "rb") as f:
+            data = f.read().decode("ascii", "replace")
+        # поле 2 — имя в скобках, поэтому режем по ПОСЛЕДНЕЙ ")" и берём 1-е поле
+        return data.rsplit(")", 1)[1].split()[0]
     except Exception:
-        pass
-    return {"next_index": 1, "active_id": "", "servers": []}
+        return ""
 
 
-def _store_save(path: str, data: dict) -> None:
-    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-    tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-    os.replace(tmp, path)
+def _reap_pid(pid: int) -> None:
+    """Забрать zombie-ребёнка (иначе он висит в таблице процессов).
 
-
-def read_db_rows(db_path: str) -> list:
-    """Аналог чтения guiNDB.db — на Linux читает наш JSON-store серверов."""
-    return list(_store_load(db_path).get("servers") or [])
-
-
-def server_to_row(s) -> dict:
-    """Server -> строка в формате, понятном row_to_server (обратная функция)."""
-    proto = getattr(s, "protocol", "") or ""
-    pe, te = {}, {}
-    if proto == "ss":
-        pe["SsMethod"] = getattr(s, "method", "") or ""
-    elif proto == "vmess":
-        pe["VmessSecurity"] = getattr(s, "method", "auto") or "auto"
-        pe["AlterId"] = str(getattr(s, "alter_id", "0") or "0")
-    pe["Flow"] = getattr(s, "flow", "") or ""
-    net = getattr(s, "network", "raw") or "raw"
-    if net == "raw":
-        te["RawHeaderType"] = getattr(s, "header_type", "none") or "none"
-        te["Host"] = getattr(s, "host", "") or ""
-        te["Path"] = getattr(s, "path", "") or ""
-    elif net in ("ws", "httpupgrade", "xhttp"):
-        te["Host"] = getattr(s, "host", "") or ""
-        te["Path"] = getattr(s, "path", "/") or "/"
-    elif net == "kcp":
-        te["KcpHeaderType"] = getattr(s, "header_type", "none") or "none"
-        te["KcpSeed"] = getattr(s, "kcp_seed", "") or ""
-    elif net == "grpc":
-        te["GrpcAuthority"] = getattr(s, "host", "") or ""
-        te["GrpcServiceName"] = getattr(s, "path", "") or ""
-        te["GrpcMode"] = getattr(s, "header_type", "gun") or "gun"
-    return {
-        "IndexId": str(getattr(s, "_row_index_id", None) or getattr(s, "index_id", "") or ""),
-        "Remarks": (AUTO_TAG + (getattr(s, "remark", "") or "")) if not (
-            getattr(s, "remark", "") or "").startswith(AUTO_TAG) else getattr(s, "remark", ""),
-        "Address": getattr(s, "address", "") or "",
-        "Port": int(getattr(s, "port", 0) or 0),
-        "ConfigType": CONFIG_TYPE.get(proto, 5),
-        "Password": getattr(s, "password", "") or "",
-        "Network": net,
-        "StreamSecurity": getattr(s, "stream_security", "") or "",
-        "Sni": getattr(s, "sni", "") or "",
-        "Alpn": getattr(s, "alpn", "") or "",
-        "Fingerprint": getattr(s, "fingerprint", "") or "",
-        "PublicKey": getattr(s, "public_key", "") or "",
-        "ShortId": getattr(s, "short_id", "") or "",
-        "SpiderX": getattr(s, "spider_x", "") or "",
-        "AllowInsecure": "1" if getattr(s, "allow_insecure", False) else "",
-        # Speed — МБ/с, Delay — мс: тот же формат, что в ProfileExItem у v2rayN,
-        # чтобы row_to_server вернул их обратно. Без этого фильтр по скорости в
-        # пуле был пустышкой и в пул попадали CF-заглушки.
-        "Speed": round(float(getattr(s, "speed_kbps", 0) or 0) / 1024.0, 2),
-        "Delay": int(getattr(s, "rtt_ms", 0) or 0),
-        "ProtoExtra": pe,
-        "TransportExtra": te,
-    }
-
-
-def write_auto_group(db_path: str, servers: list, update_stats: bool = True) -> int:
-    """Пишет [AUTO]-серверы в store. Возвращает число записанных."""
-    data = _store_load(db_path)
-    existing = {str(r.get("IndexId")): r for r in (data.get("servers") or [])
-                if not (r.get("Remarks") or "").startswith(AUTO_TAG)}
-    rows = list(existing.values())
-    nxt = int(data.get("next_index", 1))
-    written = 0
-    for s in servers:
-        row = server_to_row(s)
-        if not row.get("IndexId"):
-            row["IndexId"] = str(nxt)
-            nxt += 1
-        rows.append(row)
-        written += 1
-    data["servers"] = rows
-    data["next_index"] = nxt
-    _store_save(db_path, data)
-    return written
-
-
-def read_active_id(cfg_path: str):
-    """Активный сервер: читаем из store рядом с конфигом ядра."""
-    store = os.path.join(os.path.dirname(cfg_path) or ".", "..", "state", "servers.json")
-    store = os.path.normpath(store)
-    for cand in (store, os.path.join(os.path.dirname(cfg_path) or ".", "servers.json")):
-        if os.path.isfile(cand):
-            return _store_load(cand).get("active_id") or None
-    return None
-
-
-def write_active_id(cfg_path: str, index_id: str) -> None:
-    """Записывает активный сервер в store (совместимо с read_active_id)."""
-    store = os.path.normpath(os.path.join(os.path.dirname(cfg_path) or ".",
-                                          "..", "state", "servers.json"))
-    if not os.path.isfile(store):
-        alt = os.path.join(os.path.dirname(cfg_path) or ".", "servers.json")
-        store = alt if os.path.isfile(alt) else store
-    data = _store_load(store)
-    data["active_id"] = str(index_id)
-    _store_save(store, data)
-
-
-# ══════════════════════════════════════════ процессы / порт (POSIX) ═══
-def _port_pid(port: int):
-    """PID процесса, слушающего порт (ss, fallback lsof)."""
+    Только WNOHANG по КОНКРЕТНОМУ pid: глобальный waitpid(-1) украл бы статус
+    у тестовых ядер xraytest, которые ждут своего Popen.
+    """
     try:
-        r = subprocess.run(["ss", "-lptnH", f"sport = :{port}"],
-                           capture_output=True, text=True, timeout=10)
-        import re
-        m = re.search(r"pid=(\d+)", r.stdout)
-        if m:
-            return m.group(1)
-    except Exception:
+        os.waitpid(int(pid), os.WNOHANG)
+    except (ChildProcessError, OSError, ValueError, TypeError):
         pass
-    try:
-        r = subprocess.run(["lsof", "-ti", f":{port}"], capture_output=True,
-                           text=True, timeout=10)
-        out = (r.stdout or "").strip().splitlines()
-        if out:
-            return out[0].strip()
-    except Exception:
-        pass
-    return None
 
 
-def _pid_alive(pid: int) -> bool:
-    """Жив ли процесс (POSIX: signal 0). Зеркало clientwrite._pid_alive."""
+def _posix_pid_alive(pid: int) -> bool:
+    """Жив ли процесс (POSIX-аналог WaitForSingleObject): signal 0 + /proc.
+
+    Это горячий путь сторожевой петли, поэтому os.kill, а не запуск ps.
+    Zombie считается мёртвым: он не работает и порт не держит.
+    """
     try:
-        os.kill(int(pid), 0)
-        return True
+        pid = int(pid)
+    except (ValueError, OverflowError, TypeError):
+        return False
+    try:
+        os.kill(pid, 0)
     except ProcessLookupError:
         return False
     except PermissionError:
-        return True
+        return True                      # процесс есть, но не наш (EPERM)
     except Exception:
         return True
-
-
-def port_listening(port: int, timeout: float = 0.5) -> bool:
-    """Алиас port_busy: общий watch.py использует имя из clientwrite.py.
-
-    Без него пульс сторожа молча не работал бы на Linux (AttributeError глотался
-    бы в except), и восстановление осталось бы медленным.
-    """
-    return port_busy(port, timeout=timeout)
-
-
-def port_busy(port: int, timeout: float = 0.4) -> bool:
-    import socket
-    try:
-        with socket.create_connection(("127.0.0.1", port), timeout=timeout):
-            return True
-    except OSError:
+    st = _proc_state(pid)
+    if st == "Z":
         return False
-
-
-def kill_kernels(cfg: dict = None, why: str = "") -> None:
-    """Снимает процессы ядра xray/v2ray (pkill). GUI на Linux нет."""
-    lg = log.get_logger()
-    for name in ("xray", "v2ray"):
-        try:
-            r = subprocess.run(["pkill", "-f", name], capture_output=True, timeout=15)
-            if r.returncode == 0:
-                lg.warn(f"kill_kernels{'(' + why + ')' if why else ''}: снят процесс {name}")
-        except Exception as e:
-            lg.warn(f"kill_kernels({name}): {e}")
-    port = DEFAULT_SOCKS_PORT
-    try:
-        port = int((cfg or {}).get("client", {}).get("socks_port", port)) or port
-    except Exception:
-        pass
-    for _ in range(12):
-        if not port_busy(port):
-            return
-        time.sleep(0.5)
-    lg.warn(f"kill_kernels: порт {port} всё ещё занят")
-
-
-def ensure_port_free(client: dict, cfg: dict) -> bool:
-    """На Linux порт принадлежит нашему сервису — просто проверяем занятость."""
-    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
-    if not port_busy(port):
-        return True
-    # занят — значит ядро уже работает; это нормально (не «чужая» программа)
     return True
 
 
-# ══════════════════════════════════════════ конфиг ядра xray ═══
-def _inbound(port: int, listen: str = "127.0.0.1") -> dict:
-    return {"tag": "socks-in", "port": int(port), "listen": listen,
-            "protocol": "mixed", "settings": {"udp": True, "auth": "noauth"}}
+def _read_proc_exe(pid: int) -> str:
+    """Имя исполняемого файла процесса по /proc (без lsof/pgrep)."""
+    try:
+        return os.path.basename(os.readlink(f"/proc/{int(pid)}/exe"))
+    except Exception:
+        return ""
 
 
-# Второй вход — СТРОГО для торрент-клиента (qBittorrent). Трекер-анонсы всегда
-# идут через пул прокси, без RU-исключений (иначе трекер с российским доменом
-# ушёл бы напрямую и остался заблокированным). Слушает только локально.
-# P2P-обмен через него не идёт: клиент не проксирует peer-соединения.
-TORRENT_PORT = 10820
+def _read_proc_cmdline(pid: int) -> str:
+    """Командная строка процесса (NUL -> пробел), '' если недоступна."""
+    try:
+        with open(f"/proc/{int(pid)}/cmdline", "rb") as f:
+            return f.read().decode("utf-8", "replace").replace("\0", " ").strip()
+    except Exception:
+        return ""
 
 
-def _inbound_torrent(port: int = TORRENT_PORT) -> dict:
-    return {"tag": "torrent-in", "port": int(port), "listen": "127.0.0.1",
-            "protocol": "socks", "settings": {"udp": True, "auth": "noauth"}}
+def _posix_port_pid(port: int):
+    """PID процесса, слушающего TCP-порт.
 
-
-# где ищем базы geosite.dat / geoip.dat (нужны для правил geosite:/geoip:)
-GEO_CANDIDATES = ("/usr/share/xray", "/usr/local/share/xray", "/usr/share/v2ray",
-                  "/opt/xray/share", "/opt/xray")
-
-
-def geo_asset_dir() -> str | None:
-    """Каталог с geosite.dat и geoip.dat или None.
-
-    xray ищет базы рядом со своим бинарём либо в XRAY_LOCATION_ASSET; пакеты
-    дистрибутива кладут их в /usr/share/xray.
+    Порядок: /proc/net/tcp -> inode -> /proc/<pid>/fd (без подпроцессов),
+    затем ``ss``, затем ``lsof``. Разбор /proc не требует установленных
+    утилит; ``ss -p`` нужен там, где сокет принадлежит другому пользователю.
     """
+    want = int(port)
+    inode = None
+    for proc_net in ("/proc/net/tcp", "/proc/net/tcp6"):
+        try:
+            with open(proc_net, encoding="ascii", errors="replace") as f:
+                next(f, None)
+                for line in f:
+                    cols = line.split()
+                    if len(cols) < 10 or cols[3] != "0A":    # 0A = LISTEN
+                        continue
+                    try:
+                        if int(cols[1].rsplit(":", 1)[1], 16) == want:
+                            inode = cols[9]
+                            break
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+        if inode:
+            break
+    if inode and inode != "0":
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                fd_dir = f"/proc/{entry}/fd"
+                try:
+                    fds = os.listdir(fd_dir)
+                except Exception:
+                    continue
+                for fd in fds:
+                    try:
+                        if os.readlink(os.path.join(fd_dir, fd)) == f"socket:[{inode}]":
+                            return entry
+                    except Exception:
+                        continue
+        except Exception:
+            pass
+    for cmd in (["ss", "-lptnH", f"sport = :{want}"], ["lsof", "-ti", f":{want}"]):
+        try:
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=8)
+        except Exception:
+            continue
+        for line in (r.stdout or "").splitlines():
+            if "pid=" in line:
+                seg = line.split("pid=")[1].split(",")[0].strip()
+                if seg.isdigit():
+                    return seg
+            if line.strip().isdigit():
+                return line.strip()
+    return None
+
+
+def _posix_our_core_pids(cfg: dict) -> list:
+    """Наши живые ядра xray: имя процесса xray И наш каталог в командной строке.
+
+    Только чтение /proc: PowerShell/CIM на Linux нет, а ``pgrep -f`` дал бы
+    ложные совпадения. Фильтр по имени процесса гарантирует, что чужое ядро
+    (например, из пакета дистрибутива) снято не будет.
+    """
+    if not cfg:
+        return []
+    try:
+        marker = os.path.join(cfg["paths"]["state_dir"], "")
+    except Exception:
+        return []
+    if not marker:
+        return []
+    out = []
+    try:
+        entries = os.listdir("/proc")
+    except Exception:
+        return []
+    for entry in entries:
+        if not entry.isdigit():
+            continue
+        if _read_proc_exe(int(entry)) not in CORE_NAMES:
+            continue
+        if marker in _read_proc_cmdline(int(entry)):
+            out.append(int(entry))
+    return out
+
+
+def _posix_kill_pid(pid, grace: float = 1.5) -> bool:
+    """Завершить процесс: SIGTERM, при необходимости SIGKILL, затем забрать zombie.
+
+    xray корректно закрывает сокеты по SIGTERM, поэтому мягкое завершение
+    быстрее освобождает клиентский порт, чем немедленный SIGKILL — именно на
+    этом держится короткий разрыв связи при переключении пула.
+    """
+    try:
+        pid = int(pid)
+    except Exception:
+        return False
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        _reap_pid(pid)
+        return True
+    except Exception:
+        return False
+    deadline = time.time() + max(0.0, grace)
+    while time.time() < deadline:
+        if not _posix_pid_alive(pid):
+            _reap_pid(pid)
+            return True
+        time.sleep(0.02)
+    try:
+        os.kill(pid, signal.SIGKILL)
+    except ProcessLookupError:
+        _reap_pid(pid)
+        return True
+    except Exception:
+        return False
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        if not _posix_pid_alive(pid):
+            _reap_pid(pid)
+            return True
+        time.sleep(0.02)
+    alive = _posix_pid_alive(pid)
+    if not alive:
+        _reap_pid(pid)
+    return not alive
+
+
+# ══════════════════════════════════════════ гео-базы ═══
+def _posix_geo_asset_dir(core: str = None, cfg: dict = None) -> str:
+    """Каталог с geosite.dat/geoip.dat.
+
+    Порядок: кэш состояния -> XRAY_LOCATION_ASSET -> каталог ядра и его
+    подкаталоги (bin/xray рядом с программой — так собран бандл) -> каталог
+    установки программы -> системные каталоги дистрибутива.
+    """
+    if cfg is not None:
+        try:
+            cached = StateStore(cfg).data.get("geo_asset_dir") or ""
+            if cached and (os.path.isfile(os.path.join(cached, "geoip.dat"))
+                           or os.path.isfile(os.path.join(cached, "geosite.dat"))):
+                return cached
+        except Exception:
+            pass
     cands = []
     env = os.environ.get("XRAY_LOCATION_ASSET")
     if env:
         cands.append(env)
-    core = shutil.which("xray") or shutil.which("v2ray")
     if core:
-        cands.append(os.path.dirname(os.path.realpath(core)))
-    cands.extend(GEO_CANDIDATES)
-    for d in cands:
-        if d and os.path.isfile(os.path.join(d, "geosite.dat")) \
-             and os.path.isfile(os.path.join(d, "geoip.dat")):
-            return d
-    return None
-
-
-def ru_direct_enabled(cfg: dict) -> bool:
-    """Нужна ли маршрутизация «РФ → напрямую».
-
-    Включаем ТОЛЬКО если базы geosite/geoip реально найдены: без них ядро
-    падает с `failed to open geosite.dat` и связи не будет вообще. Если баз нет —
-    работаем как раньше (всё через пул прокси) и пишем предупреждение.
-    """
-    want = bool((cfg or {}).get("watch", {}).get("ru_direct", True))
-    if not want:
-        return False
-    if geo_asset_dir():
-        return True
-    log.get_logger().warn(
-        "ru_direct включён, но geosite.dat/geoip.dat не найдены — "
-        "правила РФ→direct отключены (весь трафик через прокси)")
-    return False
-
-
-def _routing_posix(ru_direct: bool, target: dict, balancer: bool = False) -> dict:
-    """Правила маршрутизации. Порядок КРИТИЧЕН.
-
-    1. торрент-вход — ПЕРВЫМ и всегда в пул прокси (иначе правила РФ→direct
-       перехватят российские трекеры и анонсы уйдут мимо прокси);
-    2. российские домены → direct;
-    3. российские IP → direct;
-    4. всё остальное → target (outboundTag одиночного ядра либо balancerTag).
-    """
-    rules = [{"type": "field", "outboundTag": "direct",
-              "domain": LOCAL_DIRECT_DOMAINS},   # ПЕРВЫМ: локальные имена — напрямую
-             {"type": "field", "inboundTag": ["torrent-in"], **target}]
-    if ru_direct:
-        rules.append({"type": "field", "outboundTag": "direct",
-                      "domain": RU_DIRECT_DOMAINS})
-        rules.append({"type": "field", "outboundTag": "direct",
-                      "ip": RU_DIRECT_IPS})
-    rules.append({"type": "field", "network": "tcp,udp", **target})
-    out: dict = {"domainStrategy": "IPIfNonMatch", "rules": rules}
-    if balancer:
-        out["balancers"] = [{"tag": "auto-bal", "selector": ["proxy"],
-                             "strategy": {"type": "leastPing"}}]
-    return out
-
-
-def write_core_config(client: dict, server, cfg: dict, listen: str = "127.0.0.1") -> bool:
-    """Пишет конфиг ядра с ОДНИМ сервером (аналог write_bin_config)."""
-    import xraytest as XT
-    ob = XT.outbound_json(server)
-    if ob is None:
-        log.get_logger().error("write_core_config: outbound не собрался")
-        return False
-    ob = dict(ob)
-    ob["tag"] = "proxy"
-    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
-    ru = ru_direct_enabled(cfg)
-    conf = {
-        "log": {"loglevel": "warning"},
-        "inbounds": [_inbound(port, listen), _inbound_torrent()],
-        "outbounds": [ob, {"tag": "direct", "protocol": "freedom"}],
-        "dns": _build_dns(ru),
-        "routing": _routing_posix(ru, {"outboundTag": "proxy"}),
-    }
-    return _write_json(client.get("cfg"), conf)
-
-
-def write_balancer_config(client: dict, servers: list, cfg: dict,
-                          listen: str = "127.0.0.1") -> bool:
-    """Пишет конфиг ядра с ПУЛОМ серверов и нативным балансировщиком xray.
-
-    Это Linux-замена «balancer_mode» v2rayN: xray сам распределяет трафик по
-    пулу и сам следит за здоровьем узлов через `observatory`.
-    """
-    import xraytest as XT
-    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
-    outbounds = []
-    for i, s in enumerate(servers):
-        ob = XT.outbound_json(s)
-        if ob is None:
+        d = os.path.dirname(os.path.abspath(core))
+        for _ in range(3):
+            if d and d not in cands:
+                cands.append(d)
+            nd = os.path.dirname(d)
+            if nd == d:
+                break
+            d = nd
+    roots = []
+    if cfg is not None:
+        try:
+            roots.append((cfg.get("paths") or {}).get("root"))
+        except Exception:
+            pass
+    roots.append(os.path.dirname(os.path.abspath(__file__)))
+    for root in roots:
+        if not root:
             continue
-        ob = dict(ob)
-        ob["tag"] = f"proxy-{i}"          # префикс "proxy" ловит selector
-        outbounds.append(ob)
-    if not outbounds:
-        log.get_logger().error("write_balancer_config: пул пуст")
-        return False
-    outbounds.append({"tag": "direct", "protocol": "freedom"})
-    ru = ru_direct_enabled(cfg)
-    conf = {
-        "log": {"loglevel": "warning"},
-        "inbounds": [_inbound(port, listen), _inbound_torrent()],
-        "outbounds": outbounds,
-        "dns": _build_dns(ru),
-        "routing": _routing_posix(ru, {"balancerTag": "auto-bal"}, balancer=True),
-        "observatory": {
-            "subjectSelector": ["proxy"],
-            "probeUrl": PROBE_URL,
-            "probeInterval": "10s",
-        },
-    }
-    return _write_json(client.get("cfg"), conf)
+        for sub in ("", "bin", os.path.join("bin", "xray")):
+            cand = os.path.join(root, sub) if sub else root
+            if cand not in cands:
+                cands.append(cand)
+    for d in SYSTEM_GEO_DIRS:
+        if d not in cands:
+            cands.append(d)
+    for d in cands:
+        if d and (os.path.isfile(os.path.join(d, "geosite.dat"))
+                  or os.path.isfile(os.path.join(d, "geoip.dat"))):
+            if cfg is not None:
+                try:
+                    st = StateStore(cfg)
+                    st.data["geo_asset_dir"] = d
+                    st.save()
+                except Exception:
+                    pass
+            return d
+    return os.path.dirname(os.path.abspath(core)) if core else ""
 
 
-def _write_json(path: str, data: dict) -> bool:
-    if not path:
-        return False
+# ══════════════════════════════════════════ системный прокси (POSIX) ═══
+# На Linux системный прокси — это настройка рабочего стола (GNOME/GSettings)
+# либо переменные окружения. Окон/диалогов нет: при отсутствии gsettings
+# вызовы становятся безвредными no-op, чтобы программа работала и в
+# минимальной среде (сервер, WSL, контейнер) — мягкая деградация.
+_HAS_GSETTINGS = None
+
+
+def _has_gsettings() -> bool:
+    global _HAS_GSETTINGS
+    if _HAS_GSETTINGS is None:
+        import shutil
+        _HAS_GSETTINGS = bool(shutil.which("gsettings"))
+    return bool(_HAS_GSETTINGS)
+
+
+def _gsettings_get(schema: str, key: str) -> str:
     try:
-        os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
-        tmp = path + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-        os.replace(tmp, path)
-        return True
-    except Exception as e:
-        log.get_logger().error(f"_write_json({path}): {e}")
-        return False
+        r = subprocess.run(["gsettings", "get", schema, key],
+                           capture_output=True, text=True, timeout=8)
+        return (r.stdout or "").strip().strip("'")
+    except Exception:
+        return ""
 
 
-def _systemctl(args: list, timeout: int = 30) -> bool:
-    """Обёртка над systemctl --user (POSIX-аналог управления процессом ядра)."""
+def _gsettings_set(schema: str, key: str, value) -> bool:
     try:
-        r = subprocess.run(["systemctl", "--user"] + args, capture_output=True,
-                           timeout=timeout)
+        r = subprocess.run(["gsettings", "set", schema, key, str(value)],
+                           capture_output=True, timeout=8)
         return r.returncode == 0
     except Exception:
         return False
 
 
-def restart_core(cfg: dict) -> bool:
-    """Перезапуск ядра через systemd --user."""
-    svc = cfg.get("client", {}).get("service", "xray-proxy")
-    return _systemctl(["restart", svc])
+def _posix_sys_proxy_state() -> tuple:
+    """(включён, сервер) системного прокси: GSettings, иначе переменные среды."""
+    if _has_gsettings():
+        mode = _gsettings_get("org.gnome.system.proxy", "mode")
+        host = _gsettings_get("org.gnome.system.proxy.socks", "host")
+        prt = _gsettings_get("org.gnome.system.proxy.socks", "port")
+        if mode == "manual":
+            return True, (f"{host}:{prt}" if host else "")
+        return False, ""
+    env = (os.environ.get("https_proxy") or os.environ.get("HTTPS_PROXY")
+           or os.environ.get("all_proxy") or os.environ.get("ALL_PROXY") or "")
+    return bool(env), env
 
 
-def wait_and_probe(client: dict, attempts: int = 6, gap: float = 3.0) -> tuple:
-    """Ждёт подъёма порта и проверяет связь."""
-    lg = log.get_logger()
-    for i in range(attempts):
-        if port_busy(int(client.get("socks_port", DEFAULT_SOCKS_PORT))):
-            ok, rtt = probe_client(client, timeout=8)
-            if ok:
-                return True, rtt
-        if i < attempts - 1:
-            time.sleep(gap)
-    return False, 0.0
+def _posix_sys_proxy_apply(server: str) -> bool:
+    """Поставить системный прокси (GNOME/GSettings), иначе мягкий отказ.
 
-
-# ══════════════════════════════════════════ балансировщик ═══
-def balancer_pool(client: dict, cfg: dict, n: int = 10,
-                  min_speed_kbps: float = 0) -> list:
-    """Топ-N серверов для пула: из hotcache, иначе из [AUTO] в store."""
-    st = StateStore(cfg)
-    cache = st.data.get("hotcache") or []
-    pool = []
-    for e in cache:
-        # скорость 0 = трафик через сервер не шёл (CF-заглушка): в пул нельзя
-        if not e.get("speed_kbps"):
-            continue
-        if min_speed_kbps and e["speed_kbps"] < min_speed_kbps:
-            continue
-        s = _row_to_server_from_cache(e)
-        if s is not None:
-            pool.append(s)
-        if len(pool) >= n:
-            return pool
-    if len(pool) >= n:
-        return pool
-    # добираем из store
-    for r in read_db_rows(client.get("db", "")):
-        if not (r.get("Remarks") or "").startswith(AUTO_TAG):
-            continue
-        s = row_to_server(r)
-        if s is None:
-            continue
-        # без подтверждённой скорости сервер в пул не берём (заглушки)
-        if (getattr(s, "speed_kbps", 0) or 0) <= 0:
-            continue
-        if min_speed_kbps and (s.speed_kbps or 0) < min_speed_kbps:
-            continue
-        pool.append(s)
-        if len(pool) >= n:
-            break
-    return pool[:n]
-
-
-def _row_to_server_from_cache(e: dict):
-    """Собирает Server из записи hotcache (адрес/порт/протокол)."""
-    import parser as P
-    try:
-        s = P.Server(protocol=e.get("protocol", "vless"),
-                     address=e.get("address", ""), port=int(e.get("port", 0)))
-        s.remark = e.get("remark", "")
-        s.rtt_ms = e.get("rtt_ms", 0)
-        s.speed_kbps = e.get("speed_kbps", 0)
-        return s if s.address and s.port > 0 else None
-    except Exception:
-        return None
-
-
-
-def _lock(cfg: dict, name: str, ttl: float = 240.0, wait: float = 0.0) -> bool:
-    """Файловый lock: ядром управляет только один процесс (watch/guard/auto)."""
-    p = os.path.join(cfg["paths"]["state_dir"], f"{name}.lock")
-    deadline = time.time() + wait
-    while True:
-        try:
-            if os.path.isfile(p) and time.time() - os.path.getmtime(p) > ttl:
-                os.unlink(p)
-            fd = os.open(p, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            os.write(fd, str(os.getpid()).encode())
-            os.close(fd)
-            return True
-        except FileExistsError:
-            if time.time() >= deadline:
-                return False
-            time.sleep(0.5)
-        except Exception:
-            return False
-
-
-def _unlock(cfg: dict, name: str) -> None:
-    try:
-        os.unlink(os.path.join(cfg["paths"]["state_dir"], f"{name}.lock"))
-    except Exception:
-        pass
-
-
-def _validate_config(client: dict, cfg: dict) -> tuple:
-    """Проверка конфига ядра ДО перезапуска сервиса: запуск на свободных портах.
-
-    Невалидный конфиг раньше означал: сервис упал, связи нет.
-    """
-    import shutil as _sh
-    import socket
-    import tempfile
-    core = client.get("exe") or "xray"
-    if not os.path.isabs(core):
-        core = _sh.which(core) or core
-    cfg_path = os.path.expanduser(client.get("core_cfg") or DEFAULT_CORE_CFG)
-    try:
-        conf = json.load(open(cfg_path, encoding="utf-8"))
-    except Exception as e:
-        return False, f"конфиг не читается: {e}"
-    test = json.loads(json.dumps(conf))
-    for ib in test.get("inbounds", []):
-        s = socket.socket()
-        try:
-            s.bind(("127.0.0.1", 0))
-            ib["port"] = s.getsockname()[1]
-        finally:
-            s.close()
-        ib["listen"] = "127.0.0.1"
-    fd, tmp = tempfile.mkstemp(suffix=".json", prefix="xray-validate-")
-    with os.fdopen(fd, "w", encoding="utf-8") as f:
-        json.dump(test, f, ensure_ascii=False)
-    log_p = os.path.join(cfg["paths"]["state_dir"], "xray_validate.log")
-    env_v = dict(os.environ)
-    try:
-        adir = geo_asset_dir()
-        if adir:
-            env_v["XRAY_LOCATION_ASSET"] = adir
-    except Exception:
-        pass
-    try:
-        with open(log_p, "w", encoding="utf-8") as lf:
-            pv = subprocess.Popen([core, "run", "-c", tmp], stdout=lf,
-                                  stderr=subprocess.STDOUT, env=env_v)
-            time.sleep(2.0)
-            alive = pv.poll() is None
-            if alive:
-                pv.kill()
-            pv.wait(timeout=10)
-        if alive:
-            return True, ""
-        tail = open(log_p, encoding="utf-8", errors="replace").read()[-300:]
-        m = re.search(r"(failed to[^\n]{0,180})", tail)
-        return False, (m.group(1) if m else tail.strip()[-180:])
-    except Exception as e:
-        return False, f"validate error: {e}"
-    finally:
-        try:
-            os.unlink(tmp)
-        except Exception:
-            pass
-
-
-
-def ensure_system_proxy(client: dict, cfg: dict) -> bool:
-    """Системный прокси (GNOME) должен смотреть на наш балансировщик.
-
-    На Linux нет GUI, который гасит прокси, но режим может быть сброшен вручную
-    или после обновления системы — тогда браузер ходит напрямую, а сторожа
-    честно пишут «связь есть» (они проверяют трафик ЧЕРЕЗ прокси).
+    Возврат False не является ошибкой: на сервере/WSL прокси ОС не
+    управляется, программа продолжает работать на своём порту.
     """
     lg = log.get_logger()
-    if proxy_off(cfg):
-        return False          # выключено вручную: прокси не возвращаем
-    if cfg.get("client", {}).get("manage_system_proxy", True) is False:
-        return True
-    if not shutil.which("gsettings"):
-        return True
-    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
-
-    def gget(schema, key):
-        return subprocess.run(["gsettings", "get", schema, key], capture_output=True,
-                              text=True, timeout=10).stdout.strip().strip("'")
-
+    if not _has_gsettings():
+        lg.info("Системный прокси: gsettings недоступен (нет рабочего стола GNOME) — "
+                "управление прокси ОС пропущено, трафик идёт через порт программы")
+        return False
     try:
-        mode = gget("org.gnome.system.proxy", "mode")
-        host = gget("org.gnome.system.proxy.socks", "host")
-        prt = gget("org.gnome.system.proxy.socks", "port")
-        if mode == "manual" and host in ("127.0.0.1", "localhost") and prt == str(port):
-            return True
-        for schema, key, val in (("org.gnome.system.proxy.socks", "host", "127.0.0.1"),
-                                 ("org.gnome.system.proxy.socks", "port", str(port)),
-                                 ("org.gnome.system.proxy", "mode", "manual")):
-            subprocess.run(["gsettings", "set", schema, key, val], timeout=10)
-        lg.warn(f"Системный прокси (GNOME) был '{mode}' — включил на 127.0.0.1:{port}")
-        return True
+        host, _, prt = str(server).rpartition(":")
+        if not host:
+            host, prt = "127.0.0.1", str(server)
+        _gsettings_set("org.gnome.system.proxy.socks", "host", host)
+        try:
+            _gsettings_set("org.gnome.system.proxy.socks", "port", int(prt))
+        except Exception:
+            _gsettings_set("org.gnome.system.proxy.socks", "port", prt)
+        ok = _gsettings_set("org.gnome.system.proxy", "mode", "manual")
+        if ok:
+            lg.warn(f"Системный прокси (GNOME) установлен на {server}")
+        return ok
     except Exception as e:
         lg.warn(f"системный прокси (GNOME): {e}")
         return False
 
 
+def _posix_sys_proxy_disable() -> bool:
+    """Снять системный прокси (GNOME/GSettings)."""
+    if not _has_gsettings():
+        return False
+    try:
+        return _gsettings_set("org.gnome.system.proxy", "mode", "none")
+    except Exception:
+        return False
 
-def _link_ok(cfg: dict, port: int, fresh_s: float = 45.0) -> bool:
-    """Живость связи по отметкам сторожа (как в clientwrite.py).
 
-    Свежий провал -> False сразу (пересборка не откладывается заморозкой);
-    свежий успех  -> True без сетевой проверки; отметок нет -> probe.
+# ══════════════════════════════════════════ режим и порт ═══
+def _posix_mode_of(client: dict = None, cfg: dict = None) -> str:
+    """На Linux существует только режим standalone.
+
+    ``v2rayn`` — работа через базу и GUI Windows-приложения; на Linux он
+    неприменим, поэтому диспетчер принудительно уходит в standalone-ветку
+    (иначе вызовы попали бы в код, зависящий от v2rayN).
     """
-    now = time.time()
-    try:
-        st = StateStore(cfg)
-        fail_ts = float(st.data.get("last_probe_fail_ts", 0) or 0)
-        if fail_ts and now - fail_ts <= fresh_s:
-            return False
-        ok_ts = float(st.data.get("last_probe_ok_ts", 0) or 0)
-        if ok_ts and now - ok_ts <= fresh_s:
-            return True
-    except Exception:
-        pass
-    try:
-        ok, _rtt = probe_client({"socks_port": int(port)}, timeout=8)
-        return bool(ok)
-    except Exception:
-        return False
+    return "standalone"
 
 
-def proxy_off_path(cfg: dict) -> str:
-    """Флаг РУЧНОГО отключения прокси (ставится вручную/из индикатора)."""
-    return os.path.join(cfg["paths"]["state_dir"], "proxy_off.flag")
-
-
-def proxy_off(cfg: dict) -> bool:
-    """Прокси выключен вручную: автоподъём запрещён во всех циклах."""
-    try:
-        return os.path.isfile(proxy_off_path(cfg))
-    except Exception:
-        return False
-
-
-def lastgood_path(cfg: dict) -> str:
-    return os.path.join(cfg["paths"]["state_dir"], "lastgood_servers.json")
-
-
-def save_lastgood(cfg: dict, servers: list) -> None:
-    """Запомнить последний РАБОЧИЙ состав пула (аварийный конфиг)."""
-    try:
-        import dataclasses
-        _write_json(lastgood_path(cfg),
-                    {"ts": time.time(), "servers": [dataclasses.asdict(s) for s in servers]})
-    except Exception:
-        pass
-
-
-def load_lastgood(cfg: dict) -> list:
-    """Восстановить последний рабочий состав пула."""
-    try:
-        import dataclasses
-        import json as _json
-        import parser as P
-        d = _json.load(open(lastgood_path(cfg), encoding="utf-8"))
-        fields = {f.name for f in dataclasses.fields(P.Server)}
-        out = []
-        for row in (d.get("servers") or []):
-            try:
-                out.append(P.Server(**{k: v for k, v in row.items() if k in fields}))
-            except Exception:
-                pass
-        return out
-    except Exception:
-        return []
-
-
-def _emergency_restore(client: dict, cfg: dict, port: int) -> bool:
-    """Аварийный подъём последнего рабочего состава (POSIX)."""
+def _posix_ensure_port_free(client: dict, cfg: dict) -> bool:
+    """Порт занят нашим ядром — норма (это рестарт), чужим — предупреждаем."""
     lg = log.get_logger()
-    st = StateStore(cfg)
-    if time.time() - float(st.data.get("emergency_ts", 0) or 0) < 120:
-        return False
-    servers = load_lastgood(cfg)
-    if not servers:
-        lg.warn("аварийный конфиг: сохранённого рабочего состава нет")
-        return False
-    st.data["emergency_ts"] = time.time()
-    st.save()
-    lg.warn(f"АВАРИЙНЫЙ КОНФИГ: живых серверов нет — поднимаю последний рабочий "
-            f"состав ({len(servers)} серверов)")
-    if not _lock(cfg, "balancer", ttl=240, wait=8):
-        return False
+    port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
+    if not port_listening(port):
+        return True
+    pid = _posix_port_pid(port)
     try:
-        if not write_balancer_config(client, servers, cfg):
-            return False
-        ok_v, err_v = _validate_config(client, cfg)
-        if not ok_v:
-            lg.error(f"аварийный конфиг невалиден ({err_v})")
-            return False
-        if not restart_core(cfg):
-            return False
-    finally:
-        _unlock(cfg, "balancer")
-    ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
-    if ok:
-        save_lastgood(cfg, servers)
-        lg.info(f"аварийный конфиг: связь поднята (rtt={rtt} мс)")
-    return ok
-
-
-def ensure_balancer(client: dict, cfg: dict, n: int = 10,
-                    force: bool = False) -> bool:
-    """Поднимает пул серверов с балансировщиком xray. True — связь есть."""
-    lg = log.get_logger()
-    socks_port = int(client.get("socks_port", DEFAULT_SOCKS_PORT))
-    if proxy_off(cfg):
-        # РУЧНОЕ отключение: ядро и системный прокси не трогаем
+        ours = _cw._read_core_pid(cfg)
+    except Exception:
+        ours = None
+    if pid and ours and str(pid) == str(ours):
         return True
-    pool = balancer_pool(client, cfg, n=n,
-                         min_speed_kbps=float(cfg.get("watch", {}).get(
-                             "speed_min_kbps", 0) or 0))
-    if not pool:
-        lg.warn("ensure_balancer: пул пуст")
-        # СТРАХОВКА: живых серверов нет и связи нет — последний рабочий состав
-        if not _link_ok(cfg, socks_port) and _emergency_restore(client, cfg, socks_port):
-            return True
-        return False
-    # до всех ранних return: иначе при замороженном пуле прокси не проверялся бы
-    ensure_system_proxy(client, cfg)
-    sig = _pool_sig(pool)
-    st = StateStore(cfg)
-    if not force and st.data.get("balancer_sig") == sig and _link_ok(cfg, socks_port):
+    if pid and str(pid).isdigit() and pid and _read_proc_exe(int(pid)) in CORE_NAMES:
         return True
-    # ЗАМОРОЗКА ПУЛА: ядро живо и связь есть — состав не перетасовываем,
-    # иначе каждый пересчёт скоростей = перезапуск сервиса = разрыв связи.
-    freeze_s = float(cfg.get("watch", {}).get("pool_freeze_s", 10800))
-    age = time.time() - float(st.data.get("balancer_ts", 0) or 0)
-    if st.data.get("balancer_sig") and age < freeze_s and _link_ok(cfg, socks_port):
-        if st.data.get("balancer_sig") != sig:
-            lg.info("ensure_balancer: состав пула изменился, но ядро работает — "
-                    f"пул заморожен ещё на {int((freeze_s - age) / 60)} мин")
-        return True
-    # один управляющий: без lock watch/guard/auto рвали сервис друг за другом
-    if not _lock(cfg, "balancer", ttl=240, wait=8):
-        lg.warn("ensure_balancer: другое управление ядром уже идёт — пропускаю цикл")
-        return True
-    try:
-        if not write_balancer_config(client, pool, cfg):
-            return False
-        ok_v, err_v = _validate_config(client, cfg)
-        if not ok_v:
-            lg.error(f"ensure_balancer: конфиг невалиден ({err_v}) — ядро не трогаю")
-            return False
-        if not restart_core(cfg):
-            lg.error("ensure_balancer: systemctl restart не удался")
-            return False
-    finally:
-        _unlock(cfg, "balancer")
-    ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
-    if ok:
-        st.data["balancer_sig"] = sig
-        st.data["balancer_n"] = len(pool)
-        st.data["emergency_ts"] = 0        # нормальный пул — аварийный режим снят
-        st.save()
-        save_lastgood(cfg, pool)           # страховка: запомнить рабочий состав
-        lg.info(f"Балансировщик поднят: {len(pool)} серверов (rtt={rtt} мс)")
-    else:
-        lg.warn("ensure_balancer: связь не появилась")
-    return ok
+    lg.warn(f"порт {port} занят процессом pid={pid} (не нашим) — не трогаю; "
+            f"смените client.socks_port в config.json, если он конфликтует")
+    return True
 
 
-def _pool_sig(pool: list) -> str:
-    import hashlib
-    key = "|".join(f"{getattr(s, 'address', '')}:{getattr(s, 'port', 0)}" for s in pool)
-    return hashlib.sha1(key.encode()).hexdigest()[:16]
+# ══════════════════════════════════════════ патч общей сердцевины ═══
+_PATCHES = {
+    "_pid_alive": _posix_pid_alive,
+    "_port_pid": _posix_port_pid,
+    "_our_core_pids": _posix_our_core_pids,
+    "_kill_pid": _posix_kill_pid,
+    "geo_asset_dir": _posix_geo_asset_dir,
+    "_sys_proxy_state": _posix_sys_proxy_state,
+    "_sys_proxy_apply": _posix_sys_proxy_apply,
+    "_sys_proxy_disable": _posix_sys_proxy_disable,
+    "_mode_of": _posix_mode_of,
+    "ensure_port_free": _posix_ensure_port_free,
+}
 
 
-# ══════════════════════════════════════════ активация ═══
-def activate(client: dict, servers: list, active_id: str, cfg: dict,
-             active_server=None, update_stats: bool = True, existing: list = None,
-             restart_client: bool = True) -> dict:
-    """Полный цикл активации на Linux: запись store -> конфиг -> restart -> проверка.
+def apply_patches() -> None:
+    """Вживить POSIX-примитивы в общий модуль (идемпотентно).
 
-    Возвращает {"ok":, "switched":, "rtt":, "msg":} — как Windows-версия.
+    На Windows подмена НЕ выполняется: модуль существует ради единого API
+    (его проверяет ``--selftest``), но заменить Windows-реализацию процессов
+    и системного прокси на POSIX нельзя ни при каких обстоятельствах.
     """
-    lg = log.get_logger()
-    switched = str(read_active_id(client["cfg"])) != str(active_id)
-
-    # 1. сохраняем [AUTO]-серверы и активный id
-    try:
-        n = write_auto_group(client["db"], servers, update_stats)
-        write_active_id(client["cfg"], active_id)
-        lg.info(f"Store обновлён: {n} [AUTO]-серверов, активный: {active_id}")
-    except Exception as e:
-        lg.error(f"Запись store не удалась: {e}")
-        return {"ok": False, "switched": switched, "rtt": 0, "msg": f"write_error: {e}"}
-
-    # 2. режим балансировщика — пул вместо одного сервера
-    if bool(cfg.get("watch", {}).get("balancer_mode", False)):
-        if ensure_balancer(client, cfg,
-                           n=int(cfg["watch"].get("balancer_pool_n", 10)),
-                           force=switched):
-            ok2, rtt2 = probe_client(client, timeout=8)
-            if ok2:
-                return {"ok": True, "switched": switched, "rtt": rtt2,
-                        "msg": "balancer_ok"}
-        lg.warn("Балансировщик не дал связи — пробую одиночный сервер")
-
-    # 3. одиночный сервер
-    srv = active_server
-    if srv is None:
-        for r in read_db_rows(client["db"]):
-            if str(r.get("IndexId")) == str(active_id):
-                srv = row_to_server(r)
-                break
-    if srv is None:
-        return {"ok": False, "switched": switched, "rtt": 0, "msg": "server_not_found"}
-
-    if not write_core_config(client, srv, cfg):
-        return {"ok": False, "switched": switched, "rtt": 0, "msg": "config_write_failed"}
-
-    ok, rtt = wait_and_probe(client, attempts=1, gap=0)   # после рестарта — с нуля
-    if restart_core(cfg):
-        ok, rtt = wait_and_probe(client, attempts=6, gap=2.0)
-    if ok:
-        lg.info(f"Активация OK: {active_id} (rtt={rtt} мс)")
-        return {"ok": True, "switched": switched, "rtt": rtt, "msg": "activated"}
-
-    # 4. откат на last_good
-    lg.warn("Связи нет — пробую откат на last-good")
-    st = StateStore(cfg)
-    lg_ = st.data.get("last_good") or {}
-    src = lg_.get("cfg")
-    if src and os.path.isfile(src):
-        try:
-            shutil.copy2(src, client["cfg"])
-            restart_core(cfg)
-            ok2, rtt2 = wait_and_probe(client, attempts=4, gap=2.0)
-            if ok2:
-                lg.info("Откат на last-good удался")
-                return {"ok": True, "switched": switched, "rtt": rtt2,
-                        "msg": "rollback_ok"}
-        except Exception as e:
-            lg.error(f"Откат не удался: {e}")
-    return {"ok": False, "switched": switched, "rtt": 0, "msg": "activate_failed"}
+    if os.name == "nt":
+        log.get_logger().warn("clientwrite_posix импортирован на Windows — "
+                              "подмена примитивов пропущена (Windows-путь цел)")
+        return
+    for name, fn in _PATCHES.items():
+        setattr(_cw, name, fn)
 
 
-# ══════════════════════════════════════════ сторож ═══
-def guard_cycle(client: dict, cfg: dict, probe_timeout: float = 6.0) -> bool:
-    """Быстрый самоконтроль: порт жив? иначе failover по [AUTO]-серверам."""
-    lg = log.get_logger()
-    ok, rtt = probe_client(client, timeout=probe_timeout)
-    if ok:
-        return True
-    st = StateStore(cfg)
-    port = client.get("socks_port", DEFAULT_SOCKS_PORT)
-    lg.warn(f"Порт {port} не отвечает ({rtt} мс); запускаю failover…")
+apply_patches()
 
-    # 1. кандидаты: [AUTO]-серверы из store, минус чёрный список
-    cands = []
-    for r in read_db_rows(client.get("db", "")):
-        if not (r.get("Remarks") or "").startswith(AUTO_TAG):
+# Имена, видные наружу именно как POSIX-версии (``from clientwrite import *``
+# выше скопировал ссылки ДО патча, поэтому переназначаем явно).
+_pid_alive = _posix_pid_alive
+_port_pid = _posix_port_pid
+_our_core_pids = _posix_our_core_pids
+_kill_pid = _posix_kill_pid
+geo_asset_dir = _posix_geo_asset_dir
+_sys_proxy_state = _posix_sys_proxy_state
+_sys_proxy_apply = _posix_sys_proxy_apply
+_sys_proxy_disable = _posix_sys_proxy_disable
+_mode_of = _posix_mode_of
+ensure_port_free = _posix_ensure_port_free
+
+
+# ЗЕРКАЛО НС. ``from clientwrite import *`` не переносит имена с подчёркиванием
+# (``_pid_alive``, ``_sa_read_active_id``, ``_cfg_sha``, ``_is_v2rayn_path``…),
+# а вызывающие модули (watch.py, selftest.py, v2ray_updater.py) ими пользуются.
+# Копируем ОСТАВШИЕСЯ имена из общего модуля — уже после патча, поэтому здесь
+# оказываются именно POSIX-версии примитивов.
+def mirror_module() -> int:
+    n = 0
+    for name, value in list(vars(_cw).items()):
+        if name.startswith("__") or name in globals():
             continue
-        s = row_to_server(r)
-        if s is not None:
-            cands.append(s)
+        globals()[name] = value
+        n += 1
+    return n
+
+
+mirror_module()
+
+
+# ══════════════════════════════════════════ вспомогательное для индикации ═══
+def systemd_available() -> bool:
+    """Работает ли systemd (иначе автозапуск через юниты недоступен)."""
     try:
-        cands = bl_filter(cfg, cands)
+        return os.path.isdir("/run/systemd/system")
     except Exception:
-        pass
-    lg.info(f"Failover: [AUTO]-кандидатов: {len(cands)}")
-
-    if cands:
-        import xraytest as XT
-        pool = XT.PortPool(int(cfg["test"].get("port_start", 10810)),
-                           int(cfg["test"].get("workers", 20)) * 2 + 4)
-        try:
-            cands = XT.tcp_prefilter(cands, cfg)
-        except Exception:
-            pass
-        for s in cands:
-            try:
-                XT.test_rtt(pool, client["core"], s, 6)
-            except Exception:
-                pass
-        alive = [s for s in cands if getattr(s, "ok", False)]
-        alive.sort(key=lambda s: (s.rtt_ms or 9999,
-                                  -(s.speed_kbps or 0)))
-        lg.info(f"Failover: живых [AUTO]: {len(alive)}")
-        for s in alive[:8]:
-            if not write_core_config(client, s, cfg):
-                continue
-            restart_core(cfg)
-            ok2, rtt2 = wait_and_probe(client, attempts=5, gap=2.0)
-            if ok2:
-                sid = getattr(s, "_row_index_id", None) or getattr(s, "index_id", None)
-                if sid:
-                    write_active_id(client["cfg"], sid)
-                lg.info(f"Failover OK: переключились на {s.address}:{s.port} "
-                        f"(rtt={rtt2} мс)")
-                return True
-            try:
-                bl_add(cfg, getattr(s, "_row_index_id", None) or getattr(s, "index_id", ""),
-                       60, "failover_no_connect")
-            except Exception:
-                pass
-    else:
-        lg.warn("Failover: нет [AUTO]-серверов в store")
-
-    # 2. fallback: last_good
-    lg.info("Failover: пробую last-good…")
-    lg_ = st.data.get("last_good") or {}
-    src = lg_.get("cfg")
-    if src and os.path.isfile(src):
-        try:
-            shutil.copy2(src, client["cfg"])
-            restart_core(cfg)
-            ok2, rtt2 = wait_and_probe(client, attempts=5, gap=2.0)
-            if ok2:
-                lg.info(f"Guard OK: восстановлен last-good (rtt={rtt2} мс)")
-                return True
-        except Exception as e:
-            lg.error(f"guard restore: {e}")
-
-    # 3. последняя попытка: активный сервер напрямую
-    act = read_active_id(client["cfg"])
-    for r in read_db_rows(client.get("db", "")):
-        if str(r.get("IndexId")) == str(act):
-            srv = row_to_server(r)
-            if srv is not None and write_core_config(client, srv, cfg):
-                restart_core(cfg)
-                ok2, rtt2 = wait_and_probe(client, attempts=5, gap=2.0)
-                if ok2:
-                    lg.info(f"Guard OK: связь восстановлена (rtt={rtt2} мс)")
-                    return True
-            break
-
-    lg.error("Guard: восстановить связь не удалось")
-    return False
+        return False
 
 
-# ── совместимость: имена, которые могут звать вызывающие ──
-def stop_client(client: dict, wait: float = 20.0):
-    """Остановка ядра (аналог stop_client)."""
+def service_active(name: str = "forest-proxy-updater") -> str:
+    """Состояние systemd --user юнита: active/inactive/failed/unknown."""
     try:
-        subprocess.run(["systemctl", "--user", "stop",
-                        client.get("service", "xray-proxy")],
-                       capture_output=True, timeout=int(wait) + 10)
+        r = subprocess.run(["systemctl", "--user", "is-active", name],
+                           capture_output=True, text=True, timeout=8)
+        return (r.stdout or "").strip() or "unknown"
     except Exception:
-        pass
+        return "unknown"
 
 
-def start_client(client: dict):
-    """Запуск ядра (аналог start_client)."""
+def tcp_open(host: str = "127.0.0.1", port: int = 0, timeout: float = 0.4) -> bool:
+    """Быстрая проверка «в порт можно соединиться» (для индикатора состояния)."""
     try:
-        r = subprocess.run(["systemctl", "--user", "start",
-                            client.get("service", "xray-proxy")],
-                           capture_output=True, timeout=30)
-        return r.returncode == 0
-    except Exception:
+        with socket.create_connection((host, int(port)), timeout=timeout):
+            return True
+    except OSError:
         return False

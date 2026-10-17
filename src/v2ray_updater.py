@@ -36,7 +36,17 @@ import sys
 import threading
 import time
 
-import clientwrite as CW
+# ── Выбор платформенного бэкенда клиента ──────────────────────────────
+# Windows: clientwrite.py — своё ядро xray.exe дочерним процессом, системный
+#          прокси через реестр WinINET, процессы через WinAPI.
+# POSIX:   clientwrite_posix.py — ТОТ ЖЕ API (тот же модуль-сердцевина плюс
+#          POSIX-примитивы: /proc вместо CIM, os.kill вместо TerminateProcess,
+#          GSettings вместо WinINET). Windows-поведение не меняется.
+if os.name == "nt":
+    import clientwrite as CW
+else:
+    import clientwrite_posix as CW
+
 import config as CFG
 import i18n
 import log
@@ -46,6 +56,39 @@ APP_RUN_VALUE = "ForestProxyUpdater"
 
 def _no_window() -> int:
     return getattr(subprocess, "CREATE_NO_WINDOW", 0)
+
+
+# ══════════════════════════════════════════ платформенный слой Linux ═══
+# Модуль linux/posix_platform.py содержит всё, что на Windows делает WinAPI:
+# установку (systemd --user вместо реестра/ярлыка), индикацию (файл состояния
+# + notify-send вместо трея) и разбор «--status». Импортируется лениво, чтобы
+# на Windows этот код не загружался вовсе.
+def linux_dir() -> str:
+    """Каталог linux/ с платформенными модулями: репозиторий либо бандл."""
+    cands = [
+        os.path.join(CFG.PROJECT_DIR, "linux"),
+        os.path.join(getattr(sys, "_MEIPASS", "") or "", "linux"),
+        os.path.join(os.path.dirname(os.path.abspath(__file__)), "linux"),
+    ]
+    for d in cands:
+        if d and os.path.isdir(d):
+            return d
+    return ""
+
+
+def posix_platform():
+    """Ленивый импорт linux/posix_platform.py (None на Windows/если нет модуля)."""
+    if os.name == "nt":
+        return None
+    d = linux_dir()
+    if d and d not in sys.path:
+        sys.path.insert(0, d)
+    try:
+        import posix_platform as _pp
+    except Exception as e:
+        log.get_logger().error(f"Платформенный модуль Linux недоступен: {e}")
+        return None
+    return _pp
 
 
 # ══════════════════════════════════════════ блокировка цикла ═══
@@ -430,8 +473,7 @@ def _reserve_with_speed_check(reserve: list, cfg: dict, core: str, lg) -> list:
 def run_guard(cfg: dict) -> int:
     lg = log.get_logger()
     try:
-        import clientwrite as _CW
-        if _CW.proxy_off(cfg):
+        if CW.proxy_off(cfg):
             lg.info("Guard: прокси выключен вручную — ничего не поднимаю")
             return 0
     except Exception:
@@ -535,14 +577,19 @@ def _update_loop(cfg: dict, stop: threading.Event):
 
 
 def run_supervisor(cfg: dict) -> int:
-    """Один процесс: сторож + гвард + обновление + трей (до остановки)."""
+    """Один процесс: сторож + гвард + обновление + индикация (до остановки).
+
+    Windows: индикация — значок в области уведомлений (tray.py, WinAPI).
+    Linux:   tray.py не работает (WinAPI), поэтому индикация — файл состояния
+             state/tray_status.json плюс notify-send для событий (без окон),
+             см. linux/posix_platform.py::indicators_loop.
+    """
     import watch
-    import tray
     lg = log.get_logger()
     client = CFG.find_client(cfg)
     if not client.get("core"):
-        lg.error("Ядро xray не найдено. Положите bin\\xray\\xray.exe рядом с "
-                 "программой или установите xray в PATH.")
+        lg.error("Ядро xray не найдено — положите xray рядом с программой "
+                 "(bin/xray) или установите в PATH.")
     stop = threading.Event()
 
     def _full_cycle():
@@ -560,11 +607,21 @@ def run_supervisor(cfg: dict) -> int:
                                               "full_cycle": _full_cycle}, daemon=True),
         threading.Thread(target=_guard_loop, name="guard", args=(cfg, stop), daemon=True),
         threading.Thread(target=_update_loop, name="update", args=(cfg, stop), daemon=True),
-        threading.Thread(target=tray.run_tray, name="tray", args=(cfg, stop), daemon=True),
     ]
+    indicators = "tray"
+    if os.name == "nt":
+        import tray
+        threads.append(threading.Thread(target=tray.run_tray, name="tray",
+                                        args=(cfg, stop), daemon=True))
+    else:
+        pp = posix_platform()
+        if pp is not None:
+            threads.append(threading.Thread(target=pp.indicators_loop, name="indicators",
+                                            args=(cfg, stop), daemon=True))
+            indicators = "file+notify-send"
     for t in threads:
         t.start()
-    lg.info("Супервизор запущен: потоки watch/guard/update/tray")
+    lg.info(f"Супервизор запущен: потоки watch/guard/update/индикация ({indicators})")
 
     # ограничение времени работы (для автотестов и демонстраций)
     run_s = os.environ.get("FOREST_RUN_SECONDS")
@@ -996,6 +1053,7 @@ def show_status(cfg: dict) -> int:
     print("=" * 60)
     print(f"{i18n.t('status.mode')}: {client.get('mode')}")
     print(f"{i18n.t('status.core')}: {core or i18n.t('status.core_missing')}")
+    print(f"core dir: {CFG.core_dir()}")
     if core_run:
         print(f"{i18n.t('status.core_running')}: {CFG.core_pid_path(cfg)} -> да")
     else:
@@ -1007,12 +1065,75 @@ def show_status(cfg: dict) -> int:
         print(f"{i18n.t('status.link')}: {link}")
     print(f"config: {cfg.get('_config_path')}")
     print(f"root:   {cfg['paths']['root']}")
+    if os.name != "nt":
+        # Linux: вместо трея — состояние systemd-юнита и файл индикации
+        pp = posix_platform()
+        print(f"state:  {cfg['paths']['state_dir']}")
+        print(f"logs:   {cfg['paths']['log_dir']}")
+        if pp is not None:
+            print(f"systemd: {pp.service_state()}")
+            ind = pp.indicator_path(cfg)
+            if os.path.isfile(ind):
+                print(f"indicator: {ind}")
+            if not pp.notify_available():
+                print("notify-send: недоступен — уведомления только в лог "
+                      "(мягкая деградация)")
     return 0
 
 
 def run_selftest() -> int:
+    """Автотесты. На Linux к общим тестам добавляются POSIX-специфичные."""
     import selftest
-    return selftest.main()
+    rc = selftest.main()
+    if os.name == "nt":
+        return rc
+    pp = posix_platform()
+    if pp is None:
+        return rc
+    try:
+        import posix_selftest
+        rc2 = posix_selftest.main()
+    except Exception as e:
+        log.get_logger().error(f"posix_selftest: {e}")
+        return rc or 1
+    return rc or rc2
+
+
+# ══════════════════════════════════════════ условия использования ═══
+# Оговорка показывается ОДИН РАЗ на установку — в журнал (файл лога + stdout →
+# journal), и никогда не мешает работе: ни окон, ни вопросов, ни пауз. Полный
+# текст лежит рядом с программой: docs/TERMS.ru.md и docs/TERMS.md
+# (в пакетах — /usr/share/doc/forest-proxy-updater/).
+TERMS_NOTICE = (
+    "Условия использования: программа даёт доступ ко всем сайтам, включая "
+    "заблокированные. Ответственность за соблюдение законов своей юрисдикции и "
+    "правил своего интернет-провайдера лежит на пользователе.\n"
+    "Terms of use: the program provides access to all websites, including "
+    "blocked ones; complying with the laws of your jurisdiction is your "
+    "responsibility.\n"
+    "Полный текст: docs/TERMS.ru.md / docs/TERMS.md "
+    "(в установленных пакетах — /usr/share/doc/forest-proxy-updater/)."
+)
+
+
+def show_terms_notice(cfg: dict) -> None:
+    """Один раз на установку пишет оговорку в лог и ставит метку.
+
+    Метка (``terms_notice_seen`` в каталоге состояния) не даёт повторять
+    уведомление при каждом запуске. Любая ошибка здесь не должна влиять на
+    работу программы — поэтому всё под try/except.
+    """
+    try:
+        state = cfg["paths"]["state_dir"]
+        marker = os.path.join(state, "terms_notice_seen")
+        if os.path.isfile(marker):
+            return
+        os.makedirs(state, exist_ok=True)
+        log.get_logger().info(TERMS_NOTICE)
+        with open(marker, "w", encoding="utf-8") as f:
+            f.write(time.strftime("%Y-%m-%d %H:%M:%S") + "\n")
+    except Exception:
+        pass
 
 
 # ══════════════════════════════════════════ main ═══
@@ -1022,7 +1143,11 @@ def main(argv=None) -> int:
     if sys.stderr is None:
         sys.stderr = open(os.devnull, "w")
 
-    ap = argparse.ArgumentParser(description="FOREST's Proxy Auto-updater")
+    ap = argparse.ArgumentParser(
+        description="FOREST's Proxy Auto-updater",
+        epilog="Условия использования (terms of use): docs/TERMS.ru.md / "
+               "docs/TERMS.md; в установленных пакетах — "
+               "/usr/share/doc/forest-proxy-updater/TERMS.ru.md")
     ap.add_argument("--install", action="store_true")
     ap.add_argument("--uninstall", action="store_true")
     ap.add_argument("--run", action="store_true", help="супервизор с треем")
@@ -1047,10 +1172,24 @@ def main(argv=None) -> int:
     lg = log.get_logger()
     lg.info("Запуск FOREST's Proxy Auto-updater (аргументы: %s)"
             % " ".join(a for a in (argv if argv is not None else sys.argv[1:])))
+    # Ядро и гео-базы работают из ПОСТОЯННОГО каталога (копия из бандла при
+    # первом запуске: config.ensure_core_installed — зовётся из find_core).
+    # Свои прошлые каталоги распаковки _MEI* убираем в фоне: иначе они копятся
+    # в temp, а занятое живым ядром ядро не даёт уборщику PyInstaller снести
+    # каталог (модальное окно «Failed to remove temporary directory»).
+    if getattr(sys, "frozen", False):
+        CFG.cleanup_stale_bundles_async()
+    show_terms_notice(cfg)
 
     if args.install:
+        pp = posix_platform()
+        if pp is not None:
+            return pp.install(cfg)
         return install(cfg)
     if args.uninstall:
+        pp = posix_platform()
+        if pp is not None:
+            return pp.uninstall(cfg)
         return uninstall(cfg)
     if args.status:
         return show_status(cfg)

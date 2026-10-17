@@ -25,7 +25,11 @@ import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-import clientwrite as CW
+# POSIX: тот же API, но примитивы процессов/прокси — POSIX (см. clientwrite_posix)
+if os.name == "nt":
+    import clientwrite as CW
+else:
+    import clientwrite_posix as CW
 import config as CFG
 import log
 import tray_status as TS

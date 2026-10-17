@@ -36,14 +36,21 @@ NAME = "tray_status.json"
 
 
 def _cfg_or_default(cfg) -> dict:
-    """cfg может быть None: длинный цикл (xraytest) не знает о трее, а этапы
-    индикации должны продвигаться и оттуда. По умолчанию — каталог программы
-    (%LOCALAPPDATA%\\ForestProxyUpdater\\state), НЕ каталог исходников: иначе
+    """cfg может быть None: длинный цикл (xraytest) не знает об индикации, а
+    этапы индикации должны продвигаться и оттуда. По умолчанию — каталог
+    состояния программы (Windows: %LOCALAPPDATA%\\ForestProxyUpdater\\state,
+    POSIX: $XDG_STATE_HOME/forest-proxy-updater), НЕ каталог исходников: иначе
     в репозитории появлялся бы личный state/."""
     if isinstance(cfg, dict) and cfg.get("paths", {}).get("state_dir"):
         return cfg
     root = os.environ.get("FOREST_ROOT")
     if not root:
+        if os.name != "nt":
+            xdg = os.environ.get("XDG_STATE_HOME")
+            if not xdg or not os.path.isabs(xdg):
+                xdg = os.path.join(os.path.expanduser("~"), ".local", "state")
+            root = os.path.join(xdg, "forest-proxy-updater")
+            return {"paths": {"state_dir": root}}
         la = os.environ.get("LOCALAPPDATA") or os.path.join(os.path.expanduser("~"),
                                                             ".local", "share")
         root = os.path.join(la, "ForestProxyUpdater")

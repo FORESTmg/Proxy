@@ -11,9 +11,13 @@ onefile (библиотеки/данные кладутся прямо в EXE, �
   * весь код из репозиторного ``src/`` (компилируется в PYZ; ``src`` добавлен в
     ``pathex``, потому что модули импортируются по «плоским» именам:
     ``import config``, ``import clientwrite``, …);
-  * ядро и гео-базы как ``bin/xray/{xray.exe,geoip.dat,geosite.dat,LICENSE}`` —
-    именно этот путь ищет ``config.find_core``/``clientwrite.geo_asset_dir``
-    (BASE_DIR == каталог распаковки onefile == sys._MEIPASS);
+  * ядро и гео-базы как ``bin/xray/{xray.exe,geoip.dat,geosite.dat,LICENSE}``.
+    Ядро запускается НЕ отсюда: при первом запуске оно (вместе с обеими
+    гео-базами) копируется в постоянный каталог данных
+    (``config.ensure_core_installed`` -> ``%LOCALAPPDATA%\\ForestProxyUpdater\\
+    bin\\xray``), и только оттуда — иначе живое ядро держало бы файл в
+    распакованном каталоге _MEIxxxx, уборщик PyInstaller не смог бы его снести
+    и показал бы модальное окно «Failed to remove temporary directory»;
   * ``config.example.json`` в корень пакета, чтобы первый запуск без конфига
     и проверка ``example_config_path()`` работали из одного .exe.
 

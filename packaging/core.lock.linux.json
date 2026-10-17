@@ -1,0 +1,26 @@
+{
+  "_comment": "Пин официального релиза XTLS/Xray-core (Linux x64): то, что попадает внутрь ELF-бинарника как bin/xray/. Проверяется fetch_core_linux.py. Тег и гео-базы совпадают с Windows-пином (core.lock.json), поэтому конфиги ядра переносимы между платформами.",
+  "release": "v26.3.27",
+  "asset": "Xray-linux-64.zip",
+  "url": "https://github.com/XTLS/Xray-core/releases/download/v26.3.27/Xray-linux-64.zip",
+  "zip_size": 21136402,
+  "zip_sha256": "23cd9af937744d97776ee35ecad4972cf4b2109d1e0fe6be9930467608f7c8ae",
+  "files": {
+    "xray": {
+      "size": 36577406,
+      "sha256": "8255dd939c34cf966cc91517b6324dd3c8d0bcf49ffac8beca049a38c46845ed"
+    },
+    "geoip.dat": {
+      "size": 19768301,
+      "sha256": "744c97b74c52bae2ac8664fef6ac481d7765cb8432a0df54f0368a88b9b4a354"
+    },
+    "geosite.dat": {
+      "size": 10491954,
+      "sha256": "adf92de0cfc70e458b399f04c5f912bf42d115ed7e37281b30e2f1c68605e4e9"
+    },
+    "LICENSE": {
+      "size": 16725,
+      "sha256": "1f256ecad192880510e84ad60474eab7589218784b9a50bc7ceee34c2b91f1d5"
+    }
+  }
+}

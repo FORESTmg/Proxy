@@ -22,17 +22,25 @@ _BASE = os.path.dirname(os.path.abspath(__file__))
 
 
 def default_log_dir() -> str:
-    """Каталог логов по умолчанию: %LOCALAPPDATA%\\ForestProxyUpdater\\logs.
+    """Каталог логов по умолчанию.
 
-    Переопределяется переменной окружения FOREST_ROOT (используется тестами и
-    установщиком, чтобы писать в отдельный каталог состояния).
+    Windows: %LOCALAPPDATA%\\ForestProxyUpdater\\logs.
+    POSIX:   $XDG_STATE_HOME/forest-proxy-updater/logs (~/.local/state/...).
+    Переопределяется переменной окружения FOREST_ROOT (тесты, установщик,
+    песочница) — тогда каталог логов лежит внутри указанного корня.
     """
     root = os.environ.get("FOREST_ROOT")
-    if not root:
-        la = os.environ.get("LOCALAPPDATA")
-        if not la:
-            la = os.path.join(os.path.expanduser("~"), ".local", "share")
-        root = os.path.join(la, "ForestProxyUpdater")
+    if root:
+        return os.path.join(root, "logs")
+    if os.name != "nt":
+        xdg = os.environ.get("XDG_STATE_HOME")
+        if not xdg or not os.path.isabs(xdg):
+            xdg = os.path.join(os.path.expanduser("~"), ".local", "state")
+        return os.path.join(xdg, "forest-proxy-updater", "logs")
+    la = os.environ.get("LOCALAPPDATA")
+    if not la:
+        la = os.path.join(os.path.expanduser("~"), ".local", "share")
+    root = os.path.join(la, "ForestProxyUpdater")
     return os.path.join(root, "logs")
 
 

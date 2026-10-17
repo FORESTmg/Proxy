@@ -1,0 +1,16 @@
+[Unit]
+Description=FOREST's Proxy Auto-updater — таймер планового обновления пула
+Documentation=man:forest-proxy-updater(1)
+
+[Timer]
+# Первый прогон вскоре после загрузки и далее периодически.
+OnBootSec=5min
+OnUnitActiveSec=6h
+# Пропущенный (выключенный компьютер) прогон выполняется после включения.
+Persistent=true
+# Разносим по времени машины, чтобы не бить по источникам одновременно.
+RandomizedDelaySec=300
+Unit=forest-proxy-updater-refresh.service
+
+[Install]
+WantedBy=timers.target
